@@ -814,3 +814,35 @@ Blockers/Risks:
   - No convex-test integration tests yet
   - LSP phantom errors persist
 ```
+
+### Session 9 — 2026-02-18: Integration tests passing (18/18)
+
+```
+Completed:
+  - 18 integration tests written and ALL PASSING via @packages/convex-test
+  - Tests use @effect/vitest (it.effect with Effect.gen)
+  - Test file: packages/database/githubMirror.test.ts
+  - testing.ts: createConvexTest() helper bakes in schema + modules glob
+  - Test categories:
+    - Webhook Processing (5): issue opened, PR opened, push with commits, ping/no-repo, nonexistent delivery
+    - Idempotency (2): duplicate issue processing → 1 issue, duplicate PR processing → 1 PR
+    - Out-of-Order Handling (2): newer issue preserved over older event, newer PR preserved over older event
+    - Projection Correctness (4): overview/PR list/issue list updated, activity feed entries, push activity, state change updates projections
+    - Projection Queries (3): listRepos, getRepoOverview null case, listActivity
+    - Branch Events (2): create adds branch, delete removes branch
+  - Fixed convex-test module resolution: test file must be at package root (not inside convex/) so import.meta.glob("./convex/**/*.*s") resolves correctly
+  - Saved effect.solutions patterns to personal-notes for future reference
+Definition of Done status:
+  ✅ 1. Newly connected repo fully hydrated via backfill
+  ✅ 2. Repo-level webhook updates reflected (backend works, UI committed)
+  ✅ 3. Failed/missed events repairable via replay/reconcile
+  ✅ 4. UI reads from Convex projections only
+  ✅ 5. Test coverage via @packages/convex-test — 18 tests, all passing
+  ✅ 6. Single admin operation connects repo + triggers bootstrap
+Next Step:
+  - Live test the UI (start Next.js dev server, verify pages render with real Convex data)
+  - Consider adding more edge-case tests (check_run, issue_comment, pr_review)
+Blockers/Risks:
+  - UI not yet live-tested
+  - LSP phantom errors persist (stale cache on deleted guestbook/benchmark/betterAuth files)
+```
