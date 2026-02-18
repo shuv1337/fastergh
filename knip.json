@@ -8,8 +8,6 @@
 		"packages/ui/src/styles/globals.css",
 		"packages/database/convex/public/**",
 		"packages/database/convex/private/**",
-		"packages/database/convex/betterAuth/**",
-		"packages/reacord/**",
 		"packages/confect/**"
 	],
 	"ignoreBinaries": ["wait", "vercel"],

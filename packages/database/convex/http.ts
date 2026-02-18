@@ -1,8 +1,7 @@
 import { httpRouter } from "convex/server";
-import { authComponent, createAuth } from "./shared/betterAuth";
 
 const http = httpRouter();
 
-authComponent.registerRoutes(http, createAuth);
+// GitHub webhook endpoint will be added in Slice 2
 
 export default http;
