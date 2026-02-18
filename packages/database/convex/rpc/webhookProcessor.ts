@@ -1,7 +1,10 @@
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
 import { Effect, Match, Option, Schema } from "effect";
 import { ConfectMutationCtx, confectSchema } from "../confect";
-import { updateAllProjections } from "../shared/projections";
+import {
+	appendActivityFeedEntry,
+	updateAllProjections,
+} from "../shared/projections";
 import { DatabaseRpcTelemetryLayer } from "./telemetry";
 
 const factory = createRpcFactory({ schema: confectSchema });
@@ -599,6 +602,155 @@ const dispatchHandler = (
 	);
 
 // ---------------------------------------------------------------------------
+// Activity feed extraction — build activity entry from webhook payload
+// ---------------------------------------------------------------------------
+
+type ActivityInfo = {
+	activityType: string;
+	title: string;
+	description: string | null;
+	actorLogin: string | null;
+	actorAvatarUrl: string | null;
+	entityNumber: number | null;
+};
+
+/**
+ * Extract activity feed information from a webhook event.
+ * Returns null for events that shouldn't appear in the feed (e.g. unknown events).
+ */
+const extractActivityInfo = (
+	eventName: string,
+	action: string | null,
+	payload: Record<string, unknown>,
+): ActivityInfo | null => {
+	const sender = extractUser(payload.sender);
+	const actorLogin = sender?.login ?? null;
+	const actorAvatarUrl = sender?.avatarUrl ?? null;
+
+	return Match.value(eventName).pipe(
+		Match.when("issues", () => {
+			const issue = obj(payload.issue);
+			const number = num(issue.number);
+			const title = str(issue.title) ?? "";
+			return {
+				activityType: `issue.${action ?? "updated"}`,
+				title,
+				description:
+					action === "opened" ? (str(issue.body)?.slice(0, 200) ?? null) : null,
+				actorLogin,
+				actorAvatarUrl,
+				entityNumber: number,
+			};
+		}),
+		Match.when("pull_request", () => {
+			const pr = obj(payload.pull_request);
+			const number = num(pr.number);
+			const title = str(pr.title) ?? "";
+			return {
+				activityType: `pr.${action ?? "updated"}`,
+				title,
+				description:
+					action === "opened" ? (str(pr.body)?.slice(0, 200) ?? null) : null,
+				actorLogin,
+				actorAvatarUrl,
+				entityNumber: number,
+			};
+		}),
+		Match.when("issue_comment", () => {
+			const issue = obj(payload.issue);
+			const comment = obj(payload.comment);
+			const number = num(issue.number);
+			const isPr = "pull_request" in issue;
+			return {
+				activityType: isPr
+					? `pr_comment.${action ?? "created"}`
+					: `issue_comment.${action ?? "created"}`,
+				title: str(issue.title) ?? "",
+				description: str(comment.body)?.slice(0, 200) ?? null,
+				actorLogin,
+				actorAvatarUrl,
+				entityNumber: number,
+			};
+		}),
+		Match.when("push", () => {
+			const ref = str(payload.ref);
+			const branchName = ref?.startsWith("refs/heads/")
+				? ref.slice("refs/heads/".length)
+				: ref;
+			const commits = Array.isArray(payload.commits) ? payload.commits : [];
+			const commitCount = commits.length;
+			return {
+				activityType: "push",
+				title: `Pushed ${commitCount} commit${commitCount !== 1 ? "s" : ""} to ${branchName ?? "unknown"}`,
+				description:
+					commitCount > 0
+						? (str(obj(commits[0]).message)?.split("\n")[0] ?? null)
+						: null,
+				actorLogin,
+				actorAvatarUrl,
+				entityNumber: null,
+			};
+		}),
+		Match.when("pull_request_review", () => {
+			const pr = obj(payload.pull_request);
+			const review = obj(payload.review);
+			const number = num(pr.number);
+			const state = str(review.state) ?? "commented";
+			return {
+				activityType: `pr_review.${state}`,
+				title: str(pr.title) ?? "",
+				description: null,
+				actorLogin,
+				actorAvatarUrl,
+				entityNumber: number,
+			};
+		}),
+		Match.when("check_run", () => {
+			const checkRun = obj(payload.check_run);
+			const name = str(checkRun.name) ?? "Check";
+			const conclusion = str(checkRun.conclusion);
+			// Only emit activity for completed check runs
+			if (action !== "completed") return null;
+			return {
+				activityType: `check_run.${conclusion ?? "completed"}`,
+				title: name,
+				description: conclusion ? `Conclusion: ${conclusion}` : null,
+				actorLogin,
+				actorAvatarUrl,
+				entityNumber: null,
+			};
+		}),
+		Match.when("create", () => {
+			const refType = str(payload.ref_type);
+			const ref = str(payload.ref);
+			if (refType !== "branch") return null;
+			return {
+				activityType: "branch.created",
+				title: `Created branch ${ref ?? "unknown"}`,
+				description: null,
+				actorLogin,
+				actorAvatarUrl,
+				entityNumber: null,
+			};
+		}),
+		Match.when("delete", () => {
+			const refType = str(payload.ref_type);
+			const ref = str(payload.ref);
+			if (refType !== "branch") return null;
+			return {
+				activityType: "branch.deleted",
+				title: `Deleted branch ${ref ?? "unknown"}`,
+				description: null,
+				actorLogin,
+				actorAvatarUrl,
+				entityNumber: null,
+			};
+		}),
+		Match.orElse(() => null),
+	);
+};
+
+// ---------------------------------------------------------------------------
 // Processor — dispatches raw webhook events to appropriate handlers
 // ---------------------------------------------------------------------------
 
@@ -696,6 +848,25 @@ processWebhookEventDef.implement((args) =>
 				processState: "processed",
 			});
 
+			// Append activity feed entry
+			const activityInfo = extractActivityInfo(
+				event.eventName,
+				event.action,
+				payload,
+			);
+			if (activityInfo !== null) {
+				yield* appendActivityFeedEntry(
+					repositoryId,
+					event.installationId ?? 0,
+					activityInfo.activityType,
+					activityInfo.title,
+					activityInfo.description,
+					activityInfo.actorLogin,
+					activityInfo.actorAvatarUrl,
+					activityInfo.entityNumber,
+				).pipe(Effect.ignoreLogged);
+			}
+
 			// Update projections after successful processing
 			yield* updateAllProjections(repositoryId).pipe(Effect.ignoreLogged);
 		}
@@ -754,6 +925,26 @@ processAllPendingDef.implement(() =>
 				yield* ctx.db.patch(event._id, {
 					processState: "processed",
 				});
+
+				// Append activity feed entry
+				const activityInfo = extractActivityInfo(
+					event.eventName,
+					event.action,
+					payload,
+				);
+				if (activityInfo !== null) {
+					yield* appendActivityFeedEntry(
+						repositoryId,
+						event.installationId ?? 0,
+						activityInfo.activityType,
+						activityInfo.title,
+						activityInfo.description,
+						activityInfo.actorLogin,
+						activityInfo.actorAvatarUrl,
+						activityInfo.entityNumber,
+					).pipe(Effect.ignoreLogged);
+				}
+
 				// Update projections after successful processing
 				yield* updateAllProjections(repositoryId).pipe(Effect.ignoreLogged);
 				processed++;
