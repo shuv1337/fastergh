@@ -752,3 +752,36 @@ Blockers/Risks:
   - Projection rebuild on every webhook may be expensive for high-throughput repos — consider debouncing in future
   - LSP phantom errors persist (stale cache from deleted guestbook/benchmark/betterAuth files)
 ```
+
+### Session 7 — 2026-02-18: Slice 8 complete (replay/reconcile/dead-letter)
+
+```
+Completed:
+  - Slice 8 COMPLETE + E2E VALIDATED:
+    - replayReconcile.ts: 6 endpoints — replayEvent, retryAllFailed, moveToDeadLetter, listFailedEvents, listDeadLetters, reconcileRepo
+    - Investigated Convex built-in workflow/dead-letter support: NONE built-in. External components (@convex-dev/workflow, @convex-dev/workpool) exist but are overkill. Our table-based approach is correct.
+    - Fixed scheduler call: uses makeFunctionReference + Effect.promise pattern (same as repoConnect.ts)
+    - All 6 endpoints tested live:
+      - listFailedEvents: returns [] (no failures) ✅
+      - listDeadLetters: returns [] (no dead letters) ✅
+      - replayEvent with nonexistent ID: {found: false, previousState: null} ✅
+      - retryAllFailed with no failures: {resetCount: 0} ✅
+      - moveToDeadLetter with nonexistent ID: {moved: false} ✅
+      - reconcileRepo for quickhub-test: {scheduled: true, lockKey: "repo-reconcile:0:1161113336"} ✅
+    - Reconcile job ran successfully: state "done", picked up new data (commits 2→5, users 1→3)
+    - Typecheck: 0 errors across all packages
+    - Deployed to Convex dev
+  - ALL BACKEND SLICES (0-6, 8) NOW COMPLETE
+In Progress:
+  - Nothing
+Next Step:
+  - Slice 7: UI pages wired to projections (Next.js frontend)
+  - Tests: convex-test based tests for webhook processing, projections, idempotency
+  - Activity feed: wire appendActivityFeedEntry into webhook handlers
+Next Command:
+  - Start building UI components for Slice 7, or write convex-test tests
+Blockers/Risks:
+  - Activity feed still not populated (appendActivityFeedEntry defined but not wired per event)
+  - No convex-test integration tests yet (all validation has been E2E against live Convex)
+  - LSP phantom errors persist
+```

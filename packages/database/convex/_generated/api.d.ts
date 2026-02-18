@@ -13,6 +13,7 @@ import type * as http from "../http.js";
 import type * as rpc_admin from "../rpc/admin.js";
 import type * as rpc_bootstrapWrite from "../rpc/bootstrapWrite.js";
 import type * as rpc_projectionQueries from "../rpc/projectionQueries.js";
+import type * as rpc_replayReconcile from "../rpc/replayReconcile.js";
 import type * as rpc_repoBootstrap from "../rpc/repoBootstrap.js";
 import type * as rpc_repoBootstrapImpl from "../rpc/repoBootstrapImpl.js";
 import type * as rpc_repoConnect from "../rpc/repoConnect.js";
@@ -36,6 +37,7 @@ declare const fullApi: ApiFromModules<{
   "rpc/admin": typeof rpc_admin;
   "rpc/bootstrapWrite": typeof rpc_bootstrapWrite;
   "rpc/projectionQueries": typeof rpc_projectionQueries;
+  "rpc/replayReconcile": typeof rpc_replayReconcile;
   "rpc/repoBootstrap": typeof rpc_repoBootstrap;
   "rpc/repoBootstrapImpl": typeof rpc_repoBootstrapImpl;
   "rpc/repoConnect": typeof rpc_repoConnect;
