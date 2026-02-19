@@ -9,6 +9,13 @@ const nextConfig: NextConfig = {
 	typescript: {
 		ignoreBuildErrors: true,
 	},
+	// Expose server-side env vars to the client bundle so we don't
+	// need separate NEXT_PUBLIC_ copies of the same values.
+	env: {
+		NEXT_PUBLIC_CONVEX_URL: process.env.CONVEX_URL,
+		NEXT_PUBLIC_CONVEX_SITE_URL: process.env.CONVEX_SITE_URL,
+		NEXT_PUBLIC_GITHUB_APP_SLUG: process.env.GITHUB_APP_SLUG,
+	},
 	transpilePackages: ["@packages/ui", "@packages/database"],
 	images: {
 		remotePatterns: [

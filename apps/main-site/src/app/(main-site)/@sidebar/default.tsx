@@ -112,8 +112,9 @@ function AddRepoForm() {
 		const err = Result.error(addResult);
 		if (Option.isNone(err)) return null;
 		const e = err.value;
-		if ("_tag" in e) {
-			switch (e._tag) {
+		if (typeof e === "object" && e !== null && "_tag" in e) {
+			const tag = (e as { _tag: string })._tag;
+			switch (tag) {
 				case "InvalidRepoUrl":
 					return "Invalid URL. Use owner/repo format.";
 				case "RepoNotFound":
@@ -122,8 +123,20 @@ function AddRepoForm() {
 					return "Repository is already connected.";
 				case "WebhookSetupFailed":
 					return "Added, but webhook setup failed.";
+				case "RpcDefectError": {
+					const defect = (e as { defect: unknown }).defect;
+					if (typeof defect === "string") return defect;
+					if (
+						typeof defect === "object" &&
+						defect !== null &&
+						"message" in defect
+					)
+						return String((defect as { message: unknown }).message);
+					return "An unexpected error occurred.";
+				}
 			}
 		}
+		if (e instanceof Error) return e.message;
 		return "Failed to add repository.";
 	})();
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Effect, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 import { Atom } from "@effect-atom/atom";
 import { createRpcClient, RpcDefectError } from "./client";
 import { createRpcFactory, makeRpcModule } from "./server";
@@ -257,6 +257,176 @@ describe("RPC Client", () => {
 });
 
 
+
+// ---------------------------------------------------------------------------
+// Error round-trip helpers (server encode → client decode)
+// ---------------------------------------------------------------------------
+
+import { Cause, Chunk, Exit, FiberId } from "effect";
+import type { ExitEncoded } from "./server";
+
+class NotFoundError extends Schema.TaggedError<NotFoundError>()(
+	"NotFoundError",
+	{ id: Schema.String },
+) {}
+
+class ForbiddenError extends Schema.TaggedError<ForbiddenError>()(
+	"ForbiddenError",
+	{},
+) {}
+
+const createServerEncoder = (
+	successSchema: Schema.Schema.AnyNoContext,
+	errorSchema: Schema.Schema.AnyNoContext | undefined,
+) => {
+	const exitSchemaVal = Schema.Exit({
+		success: successSchema as Schema.Schema<unknown, unknown, never>,
+		failure: (errorSchema ?? Schema.Never) as Schema.Schema<unknown, unknown, never>,
+		defect: Schema.Defect,
+	});
+	return Schema.encodeSync(exitSchemaVal) as (
+		exit: Exit.Exit<unknown, unknown>,
+	) => ExitEncoded;
+};
+
+type CauseEncoded =
+	| { readonly _tag: "Empty" }
+	| { readonly _tag: "Fail"; readonly error: unknown }
+	| { readonly _tag: "Die"; readonly defect: unknown }
+	| { readonly _tag: "Interrupt"; readonly fiberId: unknown }
+	| {
+			readonly _tag: "Sequential";
+			readonly left: CauseEncoded;
+			readonly right: CauseEncoded;
+	  }
+	| {
+			readonly _tag: "Parallel";
+			readonly left: CauseEncoded;
+			readonly right: CauseEncoded;
+	  };
+
+const decodeCauseTest = (encoded: CauseEncoded): Cause.Cause<unknown> => {
+	switch (encoded._tag) {
+		case "Empty":
+			return Cause.empty;
+		case "Fail":
+			return Cause.fail(encoded.error);
+		case "Die":
+			return Cause.die(encoded.defect);
+		case "Interrupt":
+			return Cause.interrupt(FiberId.none);
+		case "Sequential":
+			return Cause.sequential(
+				decodeCauseTest(encoded.left),
+				decodeCauseTest(encoded.right),
+			);
+		case "Parallel":
+			return Cause.parallel(
+				decodeCauseTest(encoded.left),
+				decodeCauseTest(encoded.right),
+			);
+	}
+};
+
+const decodeExitTest = (encoded: ExitEncoded): Exit.Exit<unknown, unknown> => {
+	if (!encoded || typeof encoded !== "object" || !("_tag" in encoded)) {
+		return Exit.fail(
+			new RpcDefectError({
+				defect: `Unexpected RPC response: ${JSON.stringify(encoded)}`,
+			}),
+		);
+	}
+	if (encoded._tag === "Success") {
+		return Exit.succeed(encoded.value);
+	}
+	if (encoded._tag !== "Failure" || !encoded.cause) {
+		return Exit.fail(
+			new RpcDefectError({
+				defect: `Unexpected exit tag: ${String(encoded._tag)}`,
+			}),
+		);
+	}
+	const cause = decodeCauseTest(encoded.cause as CauseEncoded);
+	const failureOption = Cause.failureOption(cause);
+	if (Option.isSome(failureOption)) {
+		return Exit.fail(failureOption.value);
+	}
+	const defects = Cause.defects(cause);
+	if (Chunk.isNonEmpty(defects)) {
+		return Exit.fail(
+			new RpcDefectError({ defect: Chunk.unsafeHead(defects) }),
+		);
+	}
+	return Exit.fail(new RpcDefectError({ defect: "Empty cause" }));
+};
+
+describe("Error round-trip (server encode → client decode)", () => {
+	it("TaggedError _tag survives server encode → JSON → client decode", () => {
+		const encodeExit = createServerEncoder(
+			Schema.String,
+			Schema.Union(NotFoundError, ForbiddenError),
+		);
+
+		const serverExit = Exit.fail(new NotFoundError({ id: "test-123" }));
+		const encoded = encodeExit(serverExit);
+
+		// Simulate JSON round-trip (Convex sends JSON over the wire)
+		const wire = JSON.parse(JSON.stringify(encoded));
+
+		const clientExit = decodeExitTest(wire);
+
+		expect(Exit.isFailure(clientExit)).toBe(true);
+		if (Exit.isFailure(clientExit)) {
+			const error = Cause.failureOption(clientExit.cause);
+			expect(Option.isSome(error)).toBe(true);
+			if (Option.isSome(error)) {
+				const err = error.value as Record<string, unknown>;
+				expect(err._tag).toBe("NotFoundError");
+				expect(err.id).toBe("test-123");
+			}
+		}
+	});
+
+	it("Union TaggedError _tag is preserved for second variant", () => {
+		const encodeExit = createServerEncoder(
+			Schema.String,
+			Schema.Union(NotFoundError, ForbiddenError),
+		);
+
+		const serverExit = Exit.fail(new ForbiddenError());
+		const encoded = encodeExit(serverExit);
+		const wire = JSON.parse(JSON.stringify(encoded));
+		const clientExit = decodeExitTest(wire);
+
+		expect(Exit.isFailure(clientExit)).toBe(true);
+		if (Exit.isFailure(clientExit)) {
+			const error = Cause.failureOption(clientExit.cause);
+			expect(Option.isSome(error)).toBe(true);
+			if (Option.isSome(error)) {
+				const err = error.value as Record<string, unknown>;
+				expect(err._tag).toBe("ForbiddenError");
+			}
+		}
+	});
+
+	it("defect (Effect.die) is wrapped in RpcDefectError", () => {
+		const encodeExit = createServerEncoder(Schema.String, undefined);
+
+		const serverExit = Exit.die("GitHub API error: 403 Forbidden");
+		const encoded = encodeExit(serverExit);
+		const wire = JSON.parse(JSON.stringify(encoded));
+		const clientExit = decodeExitTest(wire);
+
+		expect(Exit.isFailure(clientExit)).toBe(true);
+		if (Exit.isFailure(clientExit)) {
+			const error = Cause.failureOption(clientExit.cause);
+			expect(Option.isSome(error)).toBe(true);
+			if (Option.isSome(error)) {
+				expect(error.value).toBeInstanceOf(RpcDefectError);
+			}
+		}
+	});
+});
 
 describe("RPC Module", () => {
 	describe("makeRpcModule", () => {

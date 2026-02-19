@@ -471,11 +471,7 @@ syncPullRequestDef.implement((args) =>
 				}
 				return (await res.json()) as Record<string, unknown>;
 			})
-			.pipe(
-				Effect.catchTag("GitHubApiError", (e) =>
-					Effect.die(`GitHub API error: ${e.status} ${e.message}`),
-				),
-			);
+			.pipe(Effect.catchTag("GitHubApiError", () => Effect.succeed(null)));
 
 		if (repoData === null) {
 			return yield* new RepoNotFoundOnGitHub({
@@ -543,11 +539,7 @@ syncPullRequestDef.implement((args) =>
 				}
 				return (await res.json()) as Record<string, unknown>;
 			})
-			.pipe(
-				Effect.catchTag("GitHubApiError", (e) =>
-					Effect.die(`GitHub API error: ${e.status} ${e.message}`),
-				),
-			);
+			.pipe(Effect.catchTag("GitHubApiError", () => Effect.succeed(null)));
 
 		if (prData === null) {
 			return yield* new EntityNotFound({
@@ -813,11 +805,7 @@ syncIssueDef.implement((args) =>
 				}
 				return (await res.json()) as Record<string, unknown>;
 			})
-			.pipe(
-				Effect.catchTag("GitHubApiError", (e) =>
-					Effect.die(`GitHub API error: ${e.status} ${e.message}`),
-				),
-			);
+			.pipe(Effect.catchTag("GitHubApiError", () => Effect.succeed(null)));
 
 		if (repoData === null) {
 			return yield* new RepoNotFoundOnGitHub({
@@ -885,11 +873,7 @@ syncIssueDef.implement((args) =>
 				}
 				return (await res.json()) as Record<string, unknown>;
 			})
-			.pipe(
-				Effect.catchTag("GitHubApiError", (e) =>
-					Effect.die(`GitHub API error: ${e.status} ${e.message}`),
-				),
-			);
+			.pipe(Effect.catchTag("GitHubApiError", () => Effect.succeed(null)));
 
 		if (issueData === null) {
 			return yield* new EntityNotFound({

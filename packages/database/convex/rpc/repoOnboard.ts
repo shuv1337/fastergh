@@ -293,11 +293,7 @@ addRepoByUrlDef.implement((args) =>
 				}
 				return (await res.json()) as Record<string, unknown>;
 			})
-			.pipe(
-				Effect.catchTag("GitHubApiError", (e) =>
-					Effect.die(`GitHub API error: ${e.status} ${e.message}`),
-				),
-			);
+			.pipe(Effect.catchTag("GitHubApiError", () => Effect.succeed(null)));
 
 		if (repoData === null) {
 			return yield* new RepoNotFound({ fullName });
