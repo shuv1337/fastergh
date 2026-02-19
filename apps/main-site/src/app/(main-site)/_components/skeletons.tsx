@@ -5,18 +5,15 @@
 
 export function ListSkeleton() {
 	return (
-		<div className="flex h-full flex-col animate-pulse">
-			<div className="shrink-0 border-b p-3 space-y-2">
-				<div className="h-4 w-24 rounded bg-muted" />
-				<div className="flex gap-2">
-					<div className="h-6 w-12 rounded bg-muted" />
-					<div className="h-6 w-12 rounded bg-muted" />
-					<div className="h-6 w-12 rounded bg-muted" />
-				</div>
+		<div className="animate-pulse p-1.5">
+			<div className="flex gap-0.5 mb-1.5 px-1">
+				<div className="h-6 w-12 rounded bg-muted" />
+				<div className="h-6 w-12 rounded bg-muted" />
+				<div className="h-6 w-12 rounded bg-muted" />
 			</div>
-			<div className="flex-1 p-2 space-y-2">
+			<div className="space-y-2">
 				{Array.from({ length: 8 }, (_, i) => (
-					<div key={i} className="flex gap-2 rounded-md px-2.5 py-2">
+					<div key={i} className="flex gap-2 rounded-md px-2 py-1.5">
 						<div className="size-3.5 rounded-full bg-muted shrink-0 mt-0.5" />
 						<div className="flex-1 space-y-1.5">
 							<div className="h-3 w-3/4 rounded bg-muted" />

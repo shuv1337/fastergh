@@ -5,16 +5,7 @@ import { Badge } from "@packages/ui/components/badge";
 import { Link } from "@packages/ui/components/link";
 import { cn } from "@packages/ui/lib/utils";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
-import {
-	ArrowLeft,
-	CheckCircle2,
-	Circle,
-	GitPullRequest,
-	Loader2,
-	Play,
-	TriangleAlert,
-	XCircle,
-} from "lucide-react";
+import { CheckCircle2, Circle, Loader2, XCircle } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { useMemo } from "react";
 
@@ -63,129 +54,55 @@ export function ActionsListClient({
 	})();
 
 	return (
-		<div className="flex h-full flex-col bg-sidebar">
-			<div className="shrink-0 border-b border-sidebar-border">
-				<div className="flex items-center gap-2 px-3 pt-2 pb-0">
-					<Link
-						href="/"
-						className="text-muted-foreground/60 hover:text-foreground transition-colors no-underline"
-						aria-label="Back to repositories"
-					>
-						<ArrowLeft className="size-3.5" />
-					</Link>
-					<span className="text-xs font-bold text-foreground truncate tracking-tight">
-						{owner}
-						<span className="text-muted-foreground/40 mx-0.5">/</span>
-						{name}
-					</span>
-				</div>
-				<TabBar owner={owner} name={name} activeTab="actions" />
-			</div>
-			<div className="flex-1 overflow-y-auto">
-				<div className="p-1.5">
-					{runs.length === 0 && (
-						<p className="px-2 py-8 text-xs text-muted-foreground text-center">
-							No workflow runs.
-						</p>
+		<div className="p-1.5">
+			{runs.length === 0 && (
+				<p className="px-2 py-8 text-xs text-muted-foreground text-center">
+					No workflow runs.
+				</p>
+			)}
+
+			{runs.map((run) => (
+				<Link
+					key={run.githubRunId}
+					href={`/${owner}/${name}/actions/${run.runNumber}`}
+					className={cn(
+						"flex items-start gap-2 rounded-md px-2 py-1.5 text-sm transition-colors no-underline",
+						activeRunNumber === run.runNumber
+							? "bg-accent text-accent-foreground"
+							: "hover:bg-accent/50",
 					)}
-
-					{runs.map((run) => (
-						<Link
-							key={run.githubRunId}
-							href={`/${owner}/${name}/actions/${run.runNumber}`}
-							className={cn(
-								"flex items-start gap-2 rounded-md px-2 py-1.5 text-sm transition-colors no-underline",
-								activeRunNumber === run.runNumber
-									? "bg-accent text-accent-foreground"
-									: "hover:bg-accent/50",
+				>
+					<RunStatusIcon status={run.status} conclusion={run.conclusion} />
+					<div className="min-w-0 flex-1">
+						<div className="flex items-center gap-1.5">
+							<span className="font-medium text-xs truncate leading-tight">
+								{run.workflowName ?? `Run #${run.runNumber}`}
+							</span>
+							{run.conclusion && (
+								<ConclusionBadge conclusion={run.conclusion} />
 							)}
-						>
-							<RunStatusIcon status={run.status} conclusion={run.conclusion} />
-							<div className="min-w-0 flex-1">
-								<div className="flex items-center gap-1.5">
-									<span className="font-medium text-xs truncate leading-tight">
-										{run.workflowName ?? `Run #${run.runNumber}`}
-									</span>
-									{run.conclusion && (
-										<ConclusionBadge conclusion={run.conclusion} />
-									)}
-								</div>
-								<div className="flex items-center gap-1.5 text-[10px] text-muted-foreground mt-0.5 tabular-nums">
-									<span>#{run.runNumber}</span>
-									{run.headBranch && (
-										<code className="rounded-sm bg-muted px-1 py-0.5 text-[9px] font-mono">
-											{run.headBranch}
-										</code>
-									)}
+						</div>
+						<div className="flex items-center gap-1.5 text-[10px] text-muted-foreground mt-0.5 tabular-nums">
+							<span>#{run.runNumber}</span>
+							{run.headBranch && (
+								<code className="rounded-sm bg-muted px-1 py-0.5 text-[9px] font-mono">
+									{run.headBranch}
+								</code>
+							)}
+							<span className="text-muted-foreground/40">&middot;</span>
+							<span>{run.event}</span>
+							{run.actorLogin && (
+								<>
 									<span className="text-muted-foreground/40">&middot;</span>
-									<span>{run.event}</span>
-									{run.actorLogin && (
-										<>
-											<span className="text-muted-foreground/40">&middot;</span>
-											<span>{run.actorLogin}</span>
-										</>
-									)}
-									<span className="text-muted-foreground/40">&middot;</span>
-									<span>{formatRelative(run.updatedAt)}</span>
-								</div>
-							</div>
-						</Link>
-					))}
-				</div>
-			</div>
-		</div>
-	);
-}
-
-// --- Tab bar ---
-
-function TabBar({
-	owner,
-	name,
-	activeTab,
-}: {
-	owner: string;
-	name: string;
-	activeTab: "pulls" | "issues" | "actions";
-}) {
-	return (
-		<div className="flex px-1 mt-1">
-			<Link
-				href={`/${owner}/${name}/pulls`}
-				className={cn(
-					"flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold border-b-2 -mb-px transition-colors no-underline",
-					activeTab === "pulls"
-						? "border-foreground text-foreground"
-						: "border-transparent text-muted-foreground hover:text-foreground",
-				)}
-			>
-				<GitPullRequest className="size-3" />
-				PRs
-			</Link>
-			<Link
-				href={`/${owner}/${name}/issues`}
-				className={cn(
-					"flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold border-b-2 -mb-px transition-colors no-underline",
-					activeTab === "issues"
-						? "border-foreground text-foreground"
-						: "border-transparent text-muted-foreground hover:text-foreground",
-				)}
-			>
-				<TriangleAlert className="size-3" />
-				Issues
-			</Link>
-			<Link
-				href={`/${owner}/${name}/actions`}
-				className={cn(
-					"flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold border-b-2 -mb-px transition-colors no-underline",
-					activeTab === "actions"
-						? "border-foreground text-foreground"
-						: "border-transparent text-muted-foreground hover:text-foreground",
-				)}
-			>
-				<Play className="size-3" />
-				Actions
-			</Link>
+									<span>{run.actorLogin}</span>
+								</>
+							)}
+							<span className="text-muted-foreground/40">&middot;</span>
+							<span>{formatRelative(run.updatedAt)}</span>
+						</div>
+					</div>
+				</Link>
+			))}
 		</div>
 	);
 }

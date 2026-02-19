@@ -6,15 +6,7 @@ import { Button } from "@packages/ui/components/button";
 import { Link } from "@packages/ui/components/link";
 import { cn } from "@packages/ui/lib/utils";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
-import {
-	ArrowLeft,
-	CheckCircle2,
-	CircleDot,
-	GitPullRequest,
-	MessageCircle,
-	Play,
-	TriangleAlert,
-} from "lucide-react";
+import { CheckCircle2, CircleDot, MessageCircle } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { useMemo, useState } from "react";
 
@@ -62,152 +54,78 @@ export function IssueListClient({
 	})();
 
 	return (
-		<div className="flex h-full flex-col bg-sidebar">
-			<div className="shrink-0 border-b border-sidebar-border">
-				<div className="flex items-center gap-2 px-3 pt-2 pb-0">
-					<Link
-						href="/"
-						className="text-muted-foreground/60 hover:text-foreground transition-colors no-underline"
-						aria-label="Back to repositories"
+		<div className="p-1.5">
+			<div className="flex gap-0.5 mb-1.5 px-1">
+				{(["open", "closed", "all"] as const).map((f) => (
+					<Button
+						key={f}
+						variant={stateFilter === f ? "default" : "ghost"}
+						size="sm"
+						className="h-6 text-[10px] px-2 font-medium"
+						onClick={() => setStateFilter(f)}
 					>
-						<ArrowLeft className="size-3.5" />
-					</Link>
-					<span className="text-xs font-bold text-foreground truncate tracking-tight">
-						{owner}
-						<span className="text-muted-foreground/40 mx-0.5">/</span>
-						{name}
-					</span>
-				</div>
-				<TabBar owner={owner} name={name} activeTab="issues" />
+						{f === "open" ? "Open" : f === "closed" ? "Closed" : "All"}
+					</Button>
+				))}
 			</div>
-			<div className="flex-1 overflow-y-auto">
-				<div className="p-1.5">
-					<div className="flex gap-0.5 mb-1.5 px-1">
-						{(["open", "closed", "all"] as const).map((f) => (
-							<Button
-								key={f}
-								variant={stateFilter === f ? "default" : "ghost"}
-								size="sm"
-								className="h-6 text-[10px] px-2 font-medium"
-								onClick={() => setStateFilter(f)}
-							>
-								{f === "open" ? "Open" : f === "closed" ? "Closed" : "All"}
-							</Button>
-						))}
-					</div>
 
-					{issues.length === 0 && (
-						<p className="px-2 py-8 text-xs text-muted-foreground text-center">
-							No {stateFilter !== "all" ? stateFilter : ""} issues.
-						</p>
+			{issues.length === 0 && (
+				<p className="px-2 py-8 text-xs text-muted-foreground text-center">
+					No {stateFilter !== "all" ? stateFilter : ""} issues.
+				</p>
+			)}
+
+			{issues.map((issue) => (
+				<Link
+					key={issue.number}
+					href={`/${owner}/${name}/issues/${issue.number}`}
+					className={cn(
+						"flex items-start gap-2 rounded-md px-2 py-1.5 text-sm transition-colors no-underline",
+						activeNumber === issue.number
+							? "bg-accent text-accent-foreground"
+							: "hover:bg-accent/50",
 					)}
-
-					{issues.map((issue) => (
-						<Link
-							key={issue.number}
-							href={`/${owner}/${name}/issues/${issue.number}`}
-							className={cn(
-								"flex items-start gap-2 rounded-md px-2 py-1.5 text-sm transition-colors no-underline",
-								activeNumber === issue.number
-									? "bg-accent text-accent-foreground"
-									: "hover:bg-accent/50",
-							)}
-						>
-							<IssueStateIcon state={issue.state} />
-							<div className="min-w-0 flex-1">
-								<div className="flex items-center gap-1.5">
-									<span className="font-medium text-xs truncate leading-tight">
-										{issue.title}
-									</span>
-								</div>
-								<div className="flex items-center gap-1.5 text-[10px] text-muted-foreground mt-0.5 tabular-nums">
-									<span>#{issue.number}</span>
-									{issue.authorLogin && (
-										<>
-											<span className="text-muted-foreground/40">&middot;</span>
-											<span>{issue.authorLogin}</span>
-										</>
-									)}
+				>
+					<IssueStateIcon state={issue.state} />
+					<div className="min-w-0 flex-1">
+						<div className="flex items-center gap-1.5">
+							<span className="font-medium text-xs truncate leading-tight">
+								{issue.title}
+							</span>
+						</div>
+						<div className="flex items-center gap-1.5 text-[10px] text-muted-foreground mt-0.5 tabular-nums">
+							<span>#{issue.number}</span>
+							{issue.authorLogin && (
+								<>
 									<span className="text-muted-foreground/40">&middot;</span>
-									<span>{formatRelative(issue.githubUpdatedAt)}</span>
-									{issue.commentCount > 0 && (
-										<span className="flex items-center gap-0.5">
-											<MessageCircle className="size-2.5" />
-											{issue.commentCount}
-										</span>
-									)}
-								</div>
-								{issue.labelNames.length > 0 && (
-									<div className="flex flex-wrap gap-0.5 mt-1">
-										{issue.labelNames.map((label) => (
-											<Badge
-												key={label}
-												variant="outline"
-												className="text-[9px] px-1 py-0"
-											>
-												{label}
-											</Badge>
-										))}
-									</div>
-								)}
+									<span>{issue.authorLogin}</span>
+								</>
+							)}
+							<span className="text-muted-foreground/40">&middot;</span>
+							<span>{formatRelative(issue.githubUpdatedAt)}</span>
+							{issue.commentCount > 0 && (
+								<span className="flex items-center gap-0.5">
+									<MessageCircle className="size-2.5" />
+									{issue.commentCount}
+								</span>
+							)}
+						</div>
+						{issue.labelNames.length > 0 && (
+							<div className="flex flex-wrap gap-0.5 mt-1">
+								{issue.labelNames.map((label) => (
+									<Badge
+										key={label}
+										variant="outline"
+										className="text-[9px] px-1 py-0"
+									>
+										{label}
+									</Badge>
+								))}
 							</div>
-						</Link>
-					))}
-				</div>
-			</div>
-		</div>
-	);
-}
-
-// --- Tab bar shared between list panels ---
-
-function TabBar({
-	owner,
-	name,
-	activeTab,
-}: {
-	owner: string;
-	name: string;
-	activeTab: "pulls" | "issues" | "actions";
-}) {
-	return (
-		<div className="flex px-1 mt-1">
-			<Link
-				href={`/${owner}/${name}/pulls`}
-				className={cn(
-					"flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold border-b-2 -mb-px transition-colors no-underline",
-					activeTab === "pulls"
-						? "border-foreground text-foreground"
-						: "border-transparent text-muted-foreground hover:text-foreground",
-				)}
-			>
-				<GitPullRequest className="size-3" />
-				PRs
-			</Link>
-			<Link
-				href={`/${owner}/${name}/issues`}
-				className={cn(
-					"flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold border-b-2 -mb-px transition-colors no-underline",
-					activeTab === "issues"
-						? "border-foreground text-foreground"
-						: "border-transparent text-muted-foreground hover:text-foreground",
-				)}
-			>
-				<TriangleAlert className="size-3" />
-				Issues
-			</Link>
-			<Link
-				href={`/${owner}/${name}/actions`}
-				className={cn(
-					"flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold border-b-2 -mb-px transition-colors no-underline",
-					activeTab === "actions"
-						? "border-foreground text-foreground"
-						: "border-transparent text-muted-foreground hover:text-foreground",
-				)}
-			>
-				<Play className="size-3" />
-				Actions
-			</Link>
+						)}
+					</div>
+				</Link>
+			))}
 		</div>
 	);
 }
