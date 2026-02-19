@@ -122,13 +122,7 @@ http.route({
 				}),
 			);
 
-			// 7. Process the event immediately (idempotent — safe on duplicates)
-			yield* Effect.promise(() =>
-				ctx.runMutation(internal.rpc.webhookProcessor.processWebhookEvent, {
-					deliveryId,
-				}),
-			);
-
+			// 7. Return immediately — async worker picks up pending events
 			return jsonResponse({ ok: true, deliveryId }, 200);
 		});
 

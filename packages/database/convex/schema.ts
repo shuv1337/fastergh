@@ -54,8 +54,10 @@ const GitHubWebhookEventRawSchema = Schema.Struct({
 	signatureValid: Schema.Boolean,
 	payloadJson: Schema.String,
 	receivedAt: Schema.Number,
-	processState: Schema.Literal("pending", "processed", "failed"),
+	processState: Schema.Literal("pending", "processed", "failed", "retry"),
 	processError: Schema.NullOr(Schema.String),
+	processAttempts: Schema.Number,
+	nextRetryAt: Schema.NullOr(Schema.Number),
 });
 
 const GitHubDeadLetterSchema = Schema.Struct({
@@ -63,6 +65,38 @@ const GitHubDeadLetterSchema = Schema.Struct({
 	reason: Schema.String,
 	payloadJson: Schema.String,
 	createdAt: Schema.Number,
+});
+
+const GitHubWriteOperationSchema = Schema.Struct({
+	/** Unique client-generated ID for deduplication & correlation */
+	correlationId: Schema.String,
+	/** Type of write operation */
+	operationType: Schema.Literal(
+		"create_issue",
+		"create_comment",
+		"update_issue_state",
+		"merge_pull_request",
+	),
+	/** pending → completed/failed → confirmed (webhook received) */
+	state: Schema.Literal("pending", "completed", "failed", "confirmed"),
+	/** Repo coordinates */
+	repositoryId: Schema.Number,
+	ownerLogin: Schema.String,
+	repoName: Schema.String,
+	/** Original input arguments as JSON */
+	inputPayloadJson: Schema.String,
+	/** Optimistic data the UI can display while pending (e.g. issue title, body preview) */
+	optimisticDataJson: Schema.NullOr(Schema.String),
+	/** GitHub API response data filled on completion */
+	resultDataJson: Schema.NullOr(Schema.String),
+	/** Error message filled on failure */
+	errorMessage: Schema.NullOr(Schema.String),
+	/** HTTP status code from GitHub on failure */
+	errorStatus: Schema.NullOr(Schema.Number),
+	/** GitHub entity number (issue/PR number) — filled on completion, used for webhook matching */
+	githubEntityNumber: Schema.NullOr(Schema.Number),
+	createdAt: Schema.Number,
+	updatedAt: Schema.Number,
 });
 
 // ============================================================
@@ -184,6 +218,32 @@ const GitHubIssueCommentSchema = Schema.Struct({
 	updatedAt: Schema.Number,
 });
 
+const GitHubPullRequestFileSchema = Schema.Struct({
+	repositoryId: Schema.Number,
+	pullRequestNumber: Schema.Number,
+	/** SHA of the PR head at the time files were fetched */
+	headSha: Schema.String,
+	/** File path (e.g. "src/index.ts") */
+	filename: Schema.String,
+	status: Schema.Literal(
+		"added",
+		"removed",
+		"modified",
+		"renamed",
+		"copied",
+		"changed",
+		"unchanged",
+	),
+	additions: Schema.Number,
+	deletions: Schema.Number,
+	changes: Schema.Number,
+	/** Unified diff patch content — null for binary files or GitHub truncation */
+	patch: Schema.NullOr(Schema.String),
+	/** Previous filename for renames/copies */
+	previousFilename: Schema.NullOr(Schema.String),
+	cachedAt: Schema.Number,
+});
+
 const GitHubCheckRunSchema = Schema.Struct({
 	repositoryId: Schema.Number,
 	githubCheckRunId: Schema.Number,
@@ -279,6 +339,7 @@ export const confectSchema = defineSchema({
 	github_webhook_events_raw: defineTable(GitHubWebhookEventRawSchema)
 		.index("by_deliveryId", ["deliveryId"])
 		.index("by_processState_and_receivedAt", ["processState", "receivedAt"])
+		.index("by_processState_and_nextRetryAt", ["processState", "nextRetryAt"])
 		.index("by_installationId_and_receivedAt", [
 			"installationId",
 			"receivedAt",
@@ -288,6 +349,19 @@ export const confectSchema = defineSchema({
 		"by_createdAt",
 		["createdAt"],
 	),
+
+	github_write_operations: defineTable(GitHubWriteOperationSchema)
+		.index("by_correlationId", ["correlationId"])
+		.index("by_repositoryId_and_state_and_createdAt", [
+			"repositoryId",
+			"state",
+			"createdAt",
+		])
+		.index("by_repositoryId_and_operationType_and_githubEntityNumber", [
+			"repositoryId",
+			"operationType",
+			"githubEntityNumber",
+		]),
 
 	// B) Normalized Domain
 	github_users: defineTable(GitHubUserSchema)
@@ -349,6 +423,18 @@ export const confectSchema = defineSchema({
 			"githubCommentId",
 		]),
 
+	github_pull_request_files: defineTable(GitHubPullRequestFileSchema)
+		.index("by_repositoryId_and_pullRequestNumber_and_headSha", [
+			"repositoryId",
+			"pullRequestNumber",
+			"headSha",
+		])
+		.index("by_repositoryId_and_pullRequestNumber_and_filename", [
+			"repositoryId",
+			"pullRequestNumber",
+			"filename",
+		]),
+
 	github_check_runs: defineTable(GitHubCheckRunSchema)
 		.index("by_repositoryId_and_githubCheckRunId", [
 			"repositoryId",
@@ -362,15 +448,21 @@ export const confectSchema = defineSchema({
 		["repositoryId"],
 	),
 
-	view_repo_pull_request_list: defineTable(ViewRepoPullRequestListSchema).index(
-		"by_repositoryId_and_sortUpdated",
-		["repositoryId", "sortUpdated"],
-	),
+	view_repo_pull_request_list: defineTable(ViewRepoPullRequestListSchema)
+		.index("by_repositoryId_and_sortUpdated", ["repositoryId", "sortUpdated"])
+		.index("by_repositoryId_and_state_and_sortUpdated", [
+			"repositoryId",
+			"state",
+			"sortUpdated",
+		]),
 
-	view_repo_issue_list: defineTable(ViewRepoIssueListSchema).index(
-		"by_repositoryId_and_sortUpdated",
-		["repositoryId", "sortUpdated"],
-	),
+	view_repo_issue_list: defineTable(ViewRepoIssueListSchema)
+		.index("by_repositoryId_and_sortUpdated", ["repositoryId", "sortUpdated"])
+		.index("by_repositoryId_and_state_and_sortUpdated", [
+			"repositoryId",
+			"state",
+			"sortUpdated",
+		]),
 
 	view_activity_feed: defineTable(ViewActivityFeedSchema)
 		.index("by_repositoryId_and_createdAt", ["repositoryId", "createdAt"])

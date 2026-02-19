@@ -1,222 +1,163 @@
-# create-epoch-app
+# QuickHub
 
-An opinionated starter template for building full-stack applications with **Effect**, **Convex**, and **Next.js**.
+A fast GitHub mirror UI backed by Convex as a real-time cache/sync layer. GitHub is the source of truth; Convex is the low-latency read model.
 
-e - effect
+## What It Does
 
-p - posthog
+- Streams GitHub webhook events into Convex for real-time updates
+- Backfills historical data from GitHub REST API on repo onboarding
+- Maintains normalized domain tables and denormalized projection views for fast reads
+- Provides a read-optimized UI that never hits the GitHub API on page load
+- Supports write operations (create issues, comments, merge PRs) via optimistic mutations backed by GitHub API
 
-o - otel
+## Architecture
 
-c - convex
+```
+GitHub Webhooks/API  ->  Convex Ingestion  ->  Normalized Tables  ->  Projection Views  ->  Next.js UI
+```
 
-h - help me find something with h to cram in here
+### Sync Modes
 
-## What's Included
+1. **Bootstrap Backfill** - Initial hydration when a repo is connected
+2. **Realtime Webhooks** - Ongoing incremental updates via repo-level webhooks
+3. **Periodic Reconciliation** - Drift and gap repair on a schedule
+4. **Async Processing** - Queued webhook processing with retry/backoff and dead-letter handling
 
-### Apps
+### Data Pipeline
 
-- **`apps/main-site`** - Next.js 15 app with App Router, Tailwind CSS, and shadcn/ui components
-- **`apps/discord-bot`** - Discord bot built with Effect and Reacord (React for Discord)
-
-### Packages
-
-- **`packages/confect`** - Effect + Convex integration layer with type-safe schemas and handlers
-- **`packages/database`** - Convex backend with Better Auth integration
-- **`packages/ui`** - Shared React components built on Radix UI and Tailwind
-- **`packages/reacord`** - React renderer for Discord embeds and interactions
-- **`packages/observability`** - Sentry and OpenTelemetry integration for Effect
-- **`packages/convex-test`** - Testing utilities for Convex functions
+- **Raw ingestion layer** - Webhook events stored verbatim for audit and replay
+- **Normalized domain tables** - Canonical entities (repos, PRs, issues, users, branches, commits, check runs, reviews, comments, PR files)
+- **Projection views** - Pre-computed read views for UI (repo overview, PR list, issue list, activity feed)
 
 ## Tech Stack
 
-- **[Effect](https://effect.website)** - Type-safe functional programming
-- **[Convex](https://convex.dev)** - Backend-as-a-service with real-time sync
-- **[Next.js 15](https://nextjs.org)** - React framework with App Router
-- **[Better Auth](https://better-auth.com)** - Authentication for Convex
-- **[Tailwind CSS](https://tailwindcss.com)** - Utility-first CSS
-- **[Radix UI](https://radix-ui.com)** - Headless UI primitives
-- **[Discord.js](https://discord.js.org)** - Discord API wrapper
+- **[Effect](https://effect.website)** - Type-safe functional programming with services, tagged errors, and structured concurrency
+- **[Convex](https://convex.dev)** - Real-time backend with automatic reactivity
+- **[Confect](packages/confect/)** - Effect + Convex integration (first-party package in this monorepo)
+- **[Next.js](https://nextjs.org)** - React framework with App Router
+- **[nuqs](https://nuqs.47ng.com)** - Type-safe URL query state management
+- **[Tailwind CSS](https://tailwindcss.com)** + **[Radix UI](https://radix-ui.com)** - Styling and UI primitives
 - **[Turbo](https://turbo.build)** - Monorepo build system
-- **[Biome](https://biomejs.dev)** - Fast linter and formatter
+- **[Biome](https://biomejs.dev)** - Linter and formatter
+
+## Project Structure
+
+```
+apps/
+  main-site/              # Next.js frontend
+packages/
+  confect/                # Effect + Convex typed RPC layer
+  convex-test/            # Convex testing utilities
+  database/               # Convex backend (schema, RPC modules, sync pipeline)
+    convex/
+      rpc/                # RPC endpoint modules
+        projectionQueries.ts   # Read queries (list repos, PRs, issues, activity)
+        webhookProcessor.ts    # Webhook event dispatch + retry pipeline
+        githubWrite.ts         # Write operations (create issue/comment, merge PR)
+        githubActions.ts       # GitHub API actions (PR file sync, etc.)
+        admin.ts               # Operational queries (health, status, table counts)
+      shared/
+        projections.ts         # Projection rebuild logic
+        githubApi.ts           # GitHub API client (Effect service)
+      schema.ts                # Full Convex schema (18 tables)
+      http.ts                  # Webhook HTTP endpoint
+      crons.ts                 # Scheduled jobs (process pending, promote retries, repair)
+  observability/           # OpenTelemetry integration for Effect
+  ui/                      # Shared React components (shadcn/ui based)
+```
 
 ## Getting Started
 
 ### Prerequisites
 
 - [Bun](https://bun.sh) >= 1.0
-- [Node.js](https://nodejs.org) >= 18
 - A [Convex](https://convex.dev) account
+- A GitHub PAT with `repo` scope (or `gh auth login`)
 
 ### Setup
 
-1. Clone the repository:
-
-```bash
-git clone https://github.com/your-username/create-epoch-app.git
-cd create-epoch-app
-```
-
-2. Install dependencies:
+1. Install dependencies:
 
 ```bash
 bun install
 ```
 
-3. Copy the environment file and configure it:
+2. Configure environment:
 
 ```bash
 cp .env.example .env
+# Set GITHUB_WEBHOOK_SECRET (generate with: openssl rand -hex 32)
+# Set CONVEX_DEPLOYMENT and NEXT_PUBLIC_CONVEX_URL
 ```
 
-4. Set up Convex:
+3. Set Convex environment variables:
 
 ```bash
 cd packages/database
-bunx convex dev
+bunx convex env set GITHUB_PAT "$(gh auth token)"
+bunx convex env set GITHUB_WEBHOOK_SECRET "<your-webhook-secret>"
 ```
 
-5. Start development:
+4. Start development:
 
 ```bash
 bun dev
 ```
 
-This starts:
+### Connect a Repository
 
-- Next.js app at http://localhost:3000
-- Discord bot (if configured)
-- Convex dev server
+Use the `connectRepo` mutation to onboard a GitHub repository:
 
-## Project Structure
-
-```
-├── apps/
-│   ├── discord-bot/     # Discord bot with Effect + Reacord
-│   └── main-site/       # Next.js frontend
-├── packages/
-│   ├── confect/         # Effect + Convex integration
-│   ├── convex-test/     # Convex testing utilities
-│   ├── database/        # Convex backend + auth
-│   ├── observability/   # Sentry + OpenTelemetry
-│   ├── reacord/         # React for Discord
-│   └── ui/              # Shared UI components
-└── scripts/             # Build and setup scripts
+```bash
+bunx convex run rpc/repoConnect:connectRepo '{
+  "ownerLogin": "your-username",
+  "name": "your-repo",
+  "githubRepoId": 123456789,
+  "installationId": 0
+}'
 ```
 
-## Key Patterns
+Then create a repo-level webhook pointing to your Convex deployment:
 
-### Effect + Convex (Confect RPC)
-
-The `confect` package provides type-safe Convex RPC functions with Effect:
-
-```typescript
-import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
-import { Effect, Schema } from "effect";
-import { ConfectMutationCtx, confectSchema } from "../confect";
-
-const factory = createRpcFactory({ schema: confectSchema });
-
-export const postsModule = makeRpcModule({
-  create: factory.mutation(
-    { payload: { title: Schema.String }, success: Schema.String },
-    (args) =>
-      Effect.gen(function* () {
-        const ctx = yield* ConfectMutationCtx;
-        const id = yield* ctx.db.insert("posts", { title: args.title });
-        return id;
-      }),
-  ),
-});
+```bash
+gh api --method POST /repos/<owner>/<repo>/hooks \
+  -f name=web -f active=true \
+  -f 'events[]=push' -f 'events[]=pull_request' -f 'events[]=issues' \
+  -f 'events[]=issue_comment' -f 'events[]=check_run' \
+  -f 'events[]=pull_request_review' -f 'events[]=create' -f 'events[]=delete' \
+  -f "config[url]=${CONVEX_SITE_URL}/api/github/webhook" \
+  -f 'config[content_type]=json' \
+  -f "config[secret]=${GITHUB_WEBHOOK_SECRET}"
 ```
 
-### Discord Bot with Reacord
+## Testing
 
-Build Discord UIs with React components:
+Tests use `@packages/convex-test` with `@effect/vitest`:
 
-```tsx
-import { Button, Container } from "@packages/reacord";
+```bash
+# Run all tests
+cd packages/database && bunx vitest run --no-watch --pool=forks
 
-function WelcomeMessage({ username }: { username: string }) {
-  return (
-    <Container>
-      <h1>Welcome, {username}!</h1>
-      <Button label="Get Started" onClick={() => console.log("clicked")} />
-    </Container>
-  );
-}
+# Run specific test suites
+bunx vitest run --no-watch --pool=forks githubMirror    # 52 integration tests
+bunx vitest run --no-watch --pool=forks smokeOnboarding # Full onboarding smoke test
 ```
 
-### Better Auth Integration
+### Test Coverage
 
-Authentication is pre-configured with Better Auth for Convex:
-
-```typescript
-import { useSession } from "@packages/ui/components/convex-client-provider";
-
-function Profile() {
-  const { data: session } = useSession();
-  if (!session) return <SignInButton />;
-  return <div>Hello, {session.user.name}</div>;
-}
-```
+- **52 integration tests** covering webhook processing, idempotency, out-of-order handling, projections, pagination, write operations, and all event types
+- **1 smoke test** validating the full onboarding pipeline (repo setup, diverse event processing, projection verification, queue health)
+- Event types tested: issues, pull_request, push, create/delete (branches), check_run, issue_comment (create/edit/delete), pull_request_review (submit/dismiss)
 
 ## Scripts
 
 ```bash
 bun dev          # Start all apps in development
 bun build        # Build all packages
-bun typecheck    # Type check all packages
-bun test         # Run tests
-bun test:otel:e2e # Run OTEL frontend+backend verification tests
-bun run test:otel:convex:local # Run OTEL smoke test against local Convex backend
-bun run otel:process:console # Parse OTEL console span logs from stdin
+bun typecheck    # Type check all packages (uses TypeScript Go)
 bun lint         # Lint with Biome
 bun lint:fix     # Fix lint issues
 ```
-
-## OpenTelemetry Verification
-
-The repo includes end-to-end OTEL tracing tests that verify frontend and Convex spans are linked by trace and parent span IDs.
-
-Run the full OTEL verification suite:
-
-```bash
-bun test:otel:e2e
-```
-
-Run the local Convex smoke test (starts a self-hosted backend container):
-
-```bash
-bun run test:otel:convex:local
-```
-
-This smoke test starts a local self-hosted Convex backend from the official image, deploys this repo's Convex functions into it, performs a mutation + query, and verifies server OTEL span logs from container output.
-
-Prerequisites:
-
-- Docker is installed and running
-- Internet access to pull `ghcr.io/get-convex/convex-backend:latest`
-
-Optional overrides:
-
-- `CONVEX_LOCAL_KEEP_CONTAINER=true` to keep the backend running after the test
-- `CONVEX_LOCAL_BACKEND_PORT` / `CONVEX_LOCAL_SITE_PROXY_PORT` to change ports
-- `CONVEX_LOCAL_IMAGE` to pin a specific backend image tag
-
-If you want a quick summary of JSON console span logs, pipe test output to the processor:
-
-```bash
-bun run --filter @packages/ui test -- otel-tracing.test.tsx 2>&1 | bun run otel:process:console
-```
-
-You can disable payload-based telemetry context fallback (while keeping header-based propagation) with:
-
-```bash
-NEXT_PUBLIC_CONVEX_OTEL_PAYLOAD_FALLBACK=false
-```
-
-When payload fallback is enabled, query payloads also include trace context metadata, which can reduce Convex query dedupe/cache effectiveness for identical logical queries.
 
 ## License
 

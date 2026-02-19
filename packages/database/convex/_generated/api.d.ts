@@ -9,15 +9,18 @@
  */
 
 import type * as confect from "../confect.js";
+import type * as crons from "../crons.js";
 import type * as http from "../http.js";
 import type * as rpc_admin from "../rpc/admin.js";
 import type * as rpc_bootstrapWrite from "../rpc/bootstrapWrite.js";
 import type * as rpc_githubActions from "../rpc/githubActions.js";
+import type * as rpc_githubWrite from "../rpc/githubWrite.js";
 import type * as rpc_projectionQueries from "../rpc/projectionQueries.js";
 import type * as rpc_replayReconcile from "../rpc/replayReconcile.js";
 import type * as rpc_repoBootstrap from "../rpc/repoBootstrap.js";
 import type * as rpc_repoBootstrapImpl from "../rpc/repoBootstrapImpl.js";
 import type * as rpc_repoConnect from "../rpc/repoConnect.js";
+import type * as rpc_repoOnboard from "../rpc/repoOnboard.js";
 import type * as rpc_telemetry from "../rpc/telemetry.js";
 import type * as rpc_webhookIngestion from "../rpc/webhookIngestion.js";
 import type * as rpc_webhookProcessor from "../rpc/webhookProcessor.js";
@@ -34,15 +37,18 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   confect: typeof confect;
+  crons: typeof crons;
   http: typeof http;
   "rpc/admin": typeof rpc_admin;
   "rpc/bootstrapWrite": typeof rpc_bootstrapWrite;
   "rpc/githubActions": typeof rpc_githubActions;
+  "rpc/githubWrite": typeof rpc_githubWrite;
   "rpc/projectionQueries": typeof rpc_projectionQueries;
   "rpc/replayReconcile": typeof rpc_replayReconcile;
   "rpc/repoBootstrap": typeof rpc_repoBootstrap;
   "rpc/repoBootstrapImpl": typeof rpc_repoBootstrapImpl;
   "rpc/repoConnect": typeof rpc_repoConnect;
+  "rpc/repoOnboard": typeof rpc_repoOnboard;
   "rpc/telemetry": typeof rpc_telemetry;
   "rpc/webhookIngestion": typeof rpc_webhookIngestion;
   "rpc/webhookProcessor": typeof rpc_webhookProcessor;

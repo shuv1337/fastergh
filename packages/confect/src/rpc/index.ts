@@ -34,6 +34,8 @@ export {
 
 export {
 	createRpcClient,
+	createServerRpcQuery,
+	useSubscriptionWithInitial,
 	RpcDefectError,
 	type RpcModuleClient,
 	type RpcModuleClientConfig,
@@ -41,4 +43,6 @@ export {
 	type RpcMutationClient,
 	type RpcActionClient,
 	type RpcModuleClientMethods,
+	type ServerRpcModuleClient,
+	type ServerRpcClientConfig,
 } from "./client";

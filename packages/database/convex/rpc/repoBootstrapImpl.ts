@@ -376,6 +376,14 @@ bootstrapRepoDef.implement((args) =>
 				}
 			}
 
+			// Collect open PR info for file sync scheduling
+			const openPrSyncTargets = pullRequests
+				.filter((pr) => pr.state === "open" && pr.headSha !== "")
+				.map((pr) => ({
+					pullRequestNumber: pr.number,
+					headSha: pr.headSha,
+				}));
+
 			return {
 				branches: branches.length,
 				pullRequests: pullRequests.length,
@@ -383,6 +391,7 @@ bootstrapRepoDef.implement((args) =>
 				commits: commits.length,
 				checkRuns: allCheckRuns.length,
 				users: users.length,
+				openPrSyncTargets,
 			};
 		}).pipe(
 			// On failure, mark job as failed, then promote error to defect
@@ -399,6 +408,22 @@ bootstrapRepoDef.implement((args) =>
 			),
 			Effect.orDie,
 		);
+
+		// Schedule file syncs for open PRs so diffs are available immediately
+		const [ownerLogin, repoName] = args.fullName.split("/");
+		if (ownerLogin && repoName) {
+			for (const pr of result.openPrSyncTargets) {
+				yield* Effect.promise(() =>
+					ctx.scheduler.runAfter(0, internal.rpc.githubActions.syncPrFiles, {
+						ownerLogin,
+						name: repoName,
+						repositoryId: args.githubRepoId,
+						pullRequestNumber: pr.pullRequestNumber,
+						headSha: pr.headSha,
+					}),
+				);
+			}
+		}
 
 		// Mark job as done
 		yield* ctx.runMutation(internal.rpc.bootstrapWrite.updateSyncJobState, {

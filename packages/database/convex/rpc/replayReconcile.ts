@@ -8,16 +8,10 @@
  * - reconcileRepo: schedule a full re-bootstrap for a connected repo
  */
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
-import { makeFunctionReference } from "convex/server";
 import { Effect, Option, Schema } from "effect";
+import { internal } from "../_generated/api";
 import { ConfectMutationCtx, ConfectQueryCtx, confectSchema } from "../confect";
 import { DatabaseRpcTelemetryLayer } from "./telemetry";
-
-// Use makeFunctionReference to avoid circular type dependency with api.d.ts
-const bootstrapRepoRef = makeFunctionReference<
-	"action",
-	{ githubRepoId: number; fullName: string; lockKey: string }
->("rpc/repoBootstrap:bootstrapRepo");
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -126,6 +120,8 @@ replayEventDef.implement((args) =>
 		yield* ctx.db.patch(event.value._id, {
 			processState: "pending",
 			processError: null,
+			processAttempts: 0,
+			nextRetryAt: null,
 		});
 
 		return { found: true, previousState };
@@ -148,6 +144,8 @@ retryAllFailedDef.implement((args) =>
 			yield* ctx.db.patch(event._id, {
 				processState: "pending",
 				processError: null,
+				processAttempts: 0,
+				nextRetryAt: null,
 			});
 		}
 
@@ -280,7 +278,7 @@ reconcileRepoDef.implement((args) =>
 
 		// Schedule the bootstrap action to re-fetch everything (it's already idempotent)
 		yield* Effect.promise(() =>
-			ctx.scheduler.runAfter(0, bootstrapRepoRef, {
+			ctx.scheduler.runAfter(0, internal.rpc.repoBootstrap.bootstrapRepo, {
 				githubRepoId: repoDoc.githubRepoId,
 				fullName: repoDoc.fullName,
 				lockKey,

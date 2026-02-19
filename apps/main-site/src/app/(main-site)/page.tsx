@@ -1,18 +1,21 @@
 "use client";
 
-import { Result, useAtomValue } from "@effect-atom/atom-react";
+import { Result, useAtom, useAtomValue } from "@effect-atom/atom-react";
 import { Badge } from "@packages/ui/components/badge";
+import { Button } from "@packages/ui/components/button";
 import {
 	Card,
 	CardDescription,
 	CardHeader,
 	CardTitle,
 } from "@packages/ui/components/card";
+import { Input } from "@packages/ui/components/input";
 import { Link } from "@packages/ui/components/link";
 import { Skeleton } from "@packages/ui/components/skeleton";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
+import { useRepoOnboard } from "@packages/ui/rpc/repo-onboard";
 import { Option } from "effect";
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 
 const EmptyPayload: Record<string, never> = {};
 
@@ -33,6 +36,8 @@ export default function HomePage() {
 				</p>
 			</div>
 
+			<AddRepoForm />
+
 			{Result.isInitial(reposResult) && <RepoListSkeleton />}
 
 			{Result.isFailure(reposResult) && (
@@ -52,15 +57,11 @@ export default function HomePage() {
 
 				if (repos.length === 0) {
 					return (
-						<Card>
+						<Card className="mt-4">
 							<CardHeader>
 								<CardTitle>No repositories connected</CardTitle>
 								<CardDescription>
-									Connect a GitHub repository using the{" "}
-									<code className="rounded bg-muted px-1.5 py-0.5 text-xs font-mono">
-										connectRepo
-									</code>{" "}
-									mutation to get started.
+									Enter a GitHub repository URL above to get started.
 								</CardDescription>
 							</CardHeader>
 						</Card>
@@ -68,7 +69,7 @@ export default function HomePage() {
 				}
 
 				return (
-					<div className="grid gap-4">
+					<div className="mt-4 grid gap-4">
 						{repos.map((repo) => (
 							<Link
 								key={repo.repositoryId}
@@ -116,9 +117,110 @@ export default function HomePage() {
 	);
 }
 
+// ---------------------------------------------------------------------------
+// Add Repo Form
+// ---------------------------------------------------------------------------
+
+function AddRepoForm() {
+	const onboardClient = useRepoOnboard();
+	const [addResult, addRepo] = useAtom(onboardClient.addRepoByUrl.call);
+	const inputRef = useRef<HTMLInputElement>(null);
+
+	const isLoading = Result.isWaiting(addResult);
+
+	const errorMessage = (() => {
+		if (!Result.isFailure(addResult)) return null;
+		const errOpt = Result.error(addResult);
+		if (Option.isNone(errOpt)) return "Unknown error";
+		const err = errOpt.value;
+		if (typeof err === "object" && err !== null && "_tag" in err) {
+			const tagged = err as {
+				_tag: string;
+				fullName?: string;
+				input?: string;
+				reason?: string;
+				message?: string;
+				defect?: unknown;
+			};
+			switch (tagged._tag) {
+				case "InvalidRepoUrl":
+					return `Invalid URL: ${tagged.reason ?? "Could not parse"}`;
+				case "RepoNotFound":
+					return `Repository "${tagged.fullName}" not found on GitHub`;
+				case "AlreadyConnected":
+					return `Repository "${tagged.fullName}" is already connected`;
+				case "WebhookSetupFailed":
+					return `Webhook setup failed for "${tagged.fullName}": ${tagged.reason}`;
+				case "RpcDefectError":
+					return tagged.message ?? `Unexpected error: ${String(tagged.defect)}`;
+				default:
+					return `Error: ${tagged._tag}`;
+			}
+		}
+		return String(err);
+	})();
+
+	const successMessage = (() => {
+		if (!Result.isSuccess(addResult)) return null;
+		const valOpt = Result.value(addResult);
+		if (Option.isNone(valOpt)) return null;
+		const val = valOpt.value;
+		if (typeof val === "object" && val !== null && "fullName" in val) {
+			const result = val as {
+				fullName: string;
+				webhookCreated: boolean;
+				bootstrapScheduled: boolean;
+			};
+			const parts = [];
+			if (result.webhookCreated) parts.push("webhook created");
+			if (result.bootstrapScheduled) parts.push("syncing data...");
+			return `Added ${result.fullName}${parts.length > 0 ? ` (${parts.join(", ")})` : ""}`;
+		}
+		return null;
+	})();
+
+	return (
+		<div className="mb-6">
+			<form
+				className="flex gap-2"
+				onSubmit={(e) => {
+					e.preventDefault();
+					const url = inputRef.current?.value.trim();
+					if (!url || isLoading) return;
+					addRepo({ url });
+				}}
+			>
+				<Input
+					ref={inputRef}
+					placeholder="github.com/owner/repo or owner/repo"
+					disabled={isLoading}
+					className="flex-1"
+				/>
+				<Button type="submit" disabled={isLoading}>
+					{isLoading ? "Syncing..." : "Add Repo"}
+				</Button>
+			</form>
+
+			{errorMessage && (
+				<p className="mt-2 text-sm text-destructive">{errorMessage}</p>
+			)}
+
+			{successMessage && (
+				<p className="mt-2 text-sm text-green-600 dark:text-green-400">
+					{successMessage}
+				</p>
+			)}
+		</div>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Skeletons & helpers
+// ---------------------------------------------------------------------------
+
 function RepoListSkeleton() {
 	return (
-		<div className="grid gap-4">
+		<div className="mt-4 grid gap-4">
 			{[1, 2, 3].map((i) => (
 				<Card key={i}>
 					<CardHeader>

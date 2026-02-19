@@ -37,6 +37,148 @@ Build a GitHub mirror system where:
 5. The UI reads from Convex projections only for fast, stable page loads.
 6. Repos are connected manually (admin mutation / CLI command) — no GitHub App installation flow needed initially.
 
+## Current State (Reality Check)
+
+The original MVP scope in this file is now largely complete and validated.
+
+- Backend slices 0-8 are implemented (ingestion, backfill, webhook processing, projections, replay/reconcile).
+- UI list/detail views are implemented with projection-backed reads only.
+- Convex-test integration coverage exists and passes.
+- Additional post-MVP commits landed after Session 9:
+  - `361cf30` added issue/PR detail pages and corresponding projection query endpoints.
+  - `56c3865` fixed CORS preflight + HMR loop behavior and hardened RPC client atom reference stability.
+
+This means the old "build MVP mirror" mission is done. The next phase is production hardening and scale.
+
+## Active Scope (Phase 2)
+
+<!-- ACTIVE_SCOPE_START -->
+You are continuing QuickHub after MVP completion. Do not restart old slices.
+
+Current product posture:
+- Core mirror pipeline works end-to-end.
+- UI reads from Convex projections.
+- Tests cover core webhook/projection/idempotency flows.
+
+New mission:
+Evolve QuickHub from "works for one test repo" into a production-ready, multi-repo, operable service.
+
+Day-to-day usability target for this loop:
+- QuickHub should be usable as the primary daily GitHub interface for personal workflow, without GitHub App auth flows.
+- Authentication model remains unchanged for now: no in-app auth, no GitHub App install; use existing PAT/`gh` credentials in backend environment.
+- "Usable" means read + core write workflows are available and reliable for normal PR/issue-driven development.
+
+Future auth migration intent (keep architecture ready):
+- PAT-backed GitHub API access is a temporary bridge.
+- Design new write/read services behind stable Effect service interfaces so token source can switch without UI/RPC churn.
+- After this loop, replace PAT credential flow with GitHub App installation-token flow.
+
+Definition of usable (must-have before closing this loop):
+1. Multi-repo dashboard + repo detail UX stays fast on realistic data sizes.
+2. PR workflows: list/detail, diff view, comments/reviews visibility, check run visibility, merge action.
+3. Issue workflows: list/detail, create issue, comment, close/reopen.
+4. Basic authoring actions from UI via backend RPC (PAT-backed):
+   - create issue
+   - create issue comment
+   - create PR comment/review comment (minimum viable review interaction)
+   - merge PR
+5. Sync reliability: webhook ingest + async processing + replay/reconcile fully operational with observable queue health.
+
+Delivery order for Phase 2:
+
+9. **Async processing architecture + scheduler hardening**
+   - Move webhook processing off the request path into queued job processing (`github_sync_jobs` / event-processing worker).
+   - Add cron-driven worker loops for pending sync jobs and replay/reconcile jobs.
+   - Enforce retry/backoff policy and bounded failure transitions to dead letters.
+   - Keep webhook HTTP endpoint fast: verify + persist + enqueue only.
+
+10. **Data completeness and correctness expansion**
+   - Add PR diff sync pipeline: ingest PR file list and patch hunks from GitHub, keep bounded payload sizes, and upsert idempotently by repo/PR/file identity.
+   - Extend detail projections/queries so PR detail pages can render file-by-file diffs from Convex (no direct GitHub API read on page load).
+   - Define truncation/fallback rules when GitHub omits patch content (binary files, oversized patches, or API truncation).
+   - Fill remaining entity gaps in detail views (for example richer PR/issue timeline coverage where needed).
+   - Strengthen out-of-order/version guards for all mutable entities.
+   - Add consistency checks between normalized and projection tables (repair hooks or scheduled repair jobs).
+
+11. **Core write workflows (PAT-backed, no auth app flow)**
+   - Add Effect + Confect RPC endpoints for core GitHub write actions (issue create/comment/state, PR comment/review minimum, PR merge).
+   - Keep GitHub as source of truth: execute write via GitHub API, then reconcile local read model through webhook/reconcile path.
+   - Add idempotency keys / dedupe guards for user-triggered writes where practical.
+
+12. **Query/UI scalability pass**
+   - Add cursor pagination for large PR/issue/activity lists.
+   - Add URL-driven filter/sort state using `nuqs` (state survives refresh/share).
+   - Ensure detail pages and list pages remain responsive on large repos (no unbounded queries in hot paths).
+
+13. **Operational visibility**
+    - Add admin/ops queries for queue depth, lag, failure rates, and stale projections.
+    - Add structured logging around webhook ingest latency, processing latency, retries, and dead-letter growth.
+
+14. **Release hardening**
+   - Add integration tests for currently under-tested events (check_run updates, issue_comment edits/deletes, PR review transitions).
+   - Add integration tests for write workflows (issue create/comment/close, PR comment/review, merge) with deterministic fixtures.
+   - Add smoke test script for onboarding a new repo and validating end-to-end state.
+   - Refresh root docs (`README.md`) so this repo no longer reads like the starter template.
+
+15. **Post-loop migration prep: PAT -> GitHub App**
+   - Introduce a GitHub auth/token provider service abstraction used by read/write GitHub clients.
+   - Capture required installation metadata and webhook compatibility constraints for app-mode cutover.
+   - Add migration checklist to switch from PAT environment variables to GitHub App credentials with minimal downtime.
+
+Execution constraints for this phase:
+- Keep public read-only UX; avoid introducing full auth unless explicitly requested.
+- Favor additive migrations and safe rollouts over sweeping rewrites.
+- Continue using Effect + Confect patterns and no type assertions.
+- Update this file as work lands; append status notes every session.
+- For all new GitHub API code, avoid hard-coding PAT assumptions; code to an auth provider interface.
+
+When this active scope is complete, output `<I HAVE COMPLETED THE TASK>`.
+
+### Status Notes
+
+**Slice 9 — COMPLETE** (session 2026-02-18)
+- Schema: Added `processAttempts` (number), `nextRetryAt` (nullable number), and `"retry"` state variant to `github_webhook_events_raw`. Added `by_processState_and_nextRetryAt` index.
+- `http.ts`: Already modified (previous session) — webhook endpoint only verifies + persists + returns 200. No inline processing.
+- `webhookProcessor.ts`: Rewrote `processAllPending` with full retry/backoff/dead-letter pipeline. On failure with attempts < 5, events transition to "retry" with exponential backoff (1s * 2^attempt + jitter). On exhaustion (>= 5 attempts), events move to `github_dead_letters` and are removed from raw events. Added `promoteRetryEvents` internal mutation and `getQueueHealth` internal query.
+- `crons.ts`: Created with two cron intervals — `processAllPending` every 10s, `promoteRetryEvents` every 30s.
+- Deleted placeholder `syncWorker.ts` — all functionality absorbed into `webhookProcessor.ts`.
+- Updated `webhookIngestion.ts`, `replayReconcile.ts`, and test helpers with new schema fields.
+- All 21 tests passing.
+
+**Slice 10 — COMPLETE** (session 2026-02-18)
+- **10a**: Added `github_pull_request_files` table to schema with `by_repositoryId_and_pullRequestNumber_and_headSha` and `by_repositoryId_and_pullRequestNumber_and_filename` indexes.
+- **10b**: Added `syncPrFiles` (internal action: paginated GitHub API fetch with patch truncation at 100KB, max 300 files) and `upsertPrFiles` (internal mutation: idempotent insert/update by repo/PR/filename) to `githubActions.ts`.
+- **10c**: Added PR file sync trigger to `webhookProcessor.ts` for `opened`/`synchronize`/`reopened` actions via `ctx.scheduler.runAfter`.
+- **10d**: Added `listPrFiles` query to `projectionQueries.ts` — returns files by headSha or latest PR headSha.
+- **10e**: Added `repairProjections` internal mutation to `admin.ts` + `queueHealth` query. Registered in `crons.ts` (5-min interval).
+- **10f**: Added 6 tests for PR diff pipeline (upsertPrFiles insert, idempotent update, listPrFiles query, empty PR, headSha filter, webhook trigger).
+
+**Slice 11 — COMPLETE** (session 2026-02-18)
+- **New table**: `github_write_operations` with state machine (`pending` → `completed`/`failed` → `confirmed`).
+- **`githubWrite.ts` created** with 4 public mutations (`createIssue`, `createComment`, `updateIssueState`, `mergePullRequest`), 1 internal action (`executeWriteOperation`), 3 internal mutations (`markWriteCompleted`, `markWriteFailed`, `confirmWriteOperation`), 1 internal query (`getWriteOperation`), 1 public query (`listWriteOperations`).
+- **Optimistic write pattern**: Mutations insert "pending" row with optimistic data, then `ctx.scheduler.runAfter(0)` kicks off the GitHub API action.
+- **Deduplication** via `correlationId` — duplicate creates return `DuplicateOperationError`.
+- **Webhook reconciliation** added to `webhookProcessor.ts` — confirms completed write ops when matching webhook arrives.
+- **9 new tests** (createIssue, createComment, markWriteCompleted, markWriteFailed, webhook reconciliation, listWriteOperations, updateIssueState, mergePullRequest, deduplication).
+
+**Slice 12 — COMPLETE** (session 2026-02-18)
+- **12a**: Added 3 paginated query endpoints to `projectionQueries.ts`: `listPullRequestsPaginated`, `listIssuesPaginated`, `listActivityPaginated` with cursor pagination and optional state filter.
+- **12b**: RPC client auto-picks up new endpoints via `ProjectionQueriesModule` type.
+- **12c**: Created `search-params.ts` with nuqs parsers for repo detail page (`tab` and `state` query params).
+- **12d**: Rewrote repo detail page with nuqs URL state, `StateFilterBar` component, and filter-aware subscriptions.
+- **12e**: Activity feed uses `limit: 50` param.
+- **12f**: Fixed unbounded `.collect()` in hot paths — all list queries now use `.take()` bounds (100/200/500 depending on context). Added 2 new indexes (`by_repositoryId_and_state_and_sortUpdated`) for efficient state filtering.
+- **12g**: Added 7 paginated query tests (cursor continuation, state filter, empty repo handling for PRs/issues/activity).
+- **Total**: 40 tests passing (18 original + 6 PR diff + 9 write ops + 7 paginated).
+
+**Slice 13 — COMPLETE** (session 2026-02-18)
+- Added `systemStatus` public query to `admin.ts` — comprehensive operational dashboard with queue health, processing lag (avg/max pending age), stale retry detection, write op state summary, and projection sync status.
+- Fixed unbounded `.collect()` in `tableCounts` (admin) — all table scans now use `.take(10001)` with cap at 10000.
+- Fixed unbounded `.collect()` in `getQueueHealth` (webhookProcessor) — same bounded pattern.
+- Added structured `console.info` logging to `processAllPending` and `promoteRetryEvents` for observability.
+
+<!-- ACTIVE_SCOPE_END -->
+
 ## Prerequisites
 
 Before the sync pipeline works end-to-end, these must be in place:
@@ -123,10 +265,10 @@ Core pipeline:
 
 ### What We Sync (and What We Don't)
 
-**In scope:** Repository metadata, branches, commits (metadata only), pull requests, PR reviews, issues, issue comments, check runs. This is a **metadata mirror** — think GitHub dashboard, not GitHub code viewer.
+**In scope:** Repository metadata, branches, commits (metadata only), pull requests, PR reviews, issues, issue comments, check runs, and pull request file diffs (changed files + patch hunks for review UX). This remains primarily a metadata mirror with scoped code-diff support.
 
 **Explicitly out of scope:**
-- **File/code content** — no tree/blob sync, no diffs, no file browsing
+- **Full repository file/code sync** — no tree/blob mirror and no generic code browser outside PR diff context
 - **Git object storage** — no cloning repos or storing git packs
 - **Code search** — no indexing of source files
 - **Release assets / packages** — not synced
@@ -507,6 +649,8 @@ Testing must include Convex-test-based validation.
 
 ## Delivery Order
 
+> This section tracks the original MVP scope and is retained for history. Use **Active Scope (Phase 2)** for current execution.
+
 Implement in this sequence:
 
 0. **Slice 0: Cleanup + Foundation**
@@ -845,4 +989,164 @@ Next Step:
 Blockers/Risks:
   - UI not yet live-tested
   - LSP phantom errors persist (stale cache on deleted guestbook/benchmark/betterAuth files)
+```
+
+### Session 10 — 2026-02-18: State reconciliation + Phase 2 scope reset
+
+```
+Completed:
+  - Reconciled plan status against git history after Session 9
+  - Confirmed additional completed work in commits:
+    - 361cf30 (issue/PR detail pages + projection query expansion)
+    - 56c3865 (CORS preflight fix, HMR loop fix, RPC client atom stability)
+  - Added Current State section and Phase 2 Active Scope in PLAN.md
+  - Added ACTIVE_SCOPE markers so automation can target current mission only
+In Progress:
+  - None
+Next Step:
+  - Start Phase 2 Slice 9 by decoupling webhook processing from HTTP request path into queued worker processing
+Next Command:
+  - Create `packages/database/convex/rpc/syncWorker.ts` and wire cron scheduling in `packages/database/convex/crons.ts`
+Blockers/Risks:
+  - Root `package.json` and `bun.lock` currently have uncommitted changes unrelated to this plan update
+  - Existing inline webhook processing path will need careful migration to avoid event drops during cutover
+```
+
+### Session 11 — 2026-02-18: Scope update for PR diff syncing
+
+```
+Completed:
+  - Updated active Phase 2 scope to explicitly include syncing pull request diffs
+  - Added PR diff requirements under Phase 2 Slice 10 (ingestion, projection/query support, truncation rules)
+  - Updated architecture scope section to allow PR diff context while keeping full repo code mirror out of scope
+In Progress:
+  - None
+Next Step:
+  - Design schema + ingestion path for PR diff files/patch hunks and wire into PR detail projections
+Next Command:
+  - Add diff-focused table definitions in `packages/database/convex/schema.ts` and corresponding write/query RPC endpoints
+Blockers/Risks:
+  - GitHub patch payloads can be truncated or missing for binary files and very large diffs
+  - Need bounded storage strategy to avoid oversized documents and projection bloat
+```
+
+### Session 12 — 2026-02-18: Redefined loop goal as day-to-day GitHub replacement
+
+```
+Completed:
+  - Updated Active Scope to target day-to-day usability as primary GitHub interface (without GitHub App auth)
+  - Added explicit Definition of Usable with required read + write workflows
+  - Added new Phase 2 slice for PAT-backed core write actions (issue/PR comment/review/merge)
+  - Updated downstream slice numbering and release hardening test requirements to include write workflows
+In Progress:
+  - None
+Next Step:
+  - Implement Slice 9 async worker migration first, then begin Slice 10 diff sync + Slice 11 write workflows
+Next Command:
+  - Create `packages/database/convex/rpc/syncWorker.ts` and wire `packages/database/convex/crons.ts`
+Blockers/Risks:
+  - "Replace GitHub completely" can creep in scope; this loop is focused on core personal workflow parity, not every GitHub surface
+  - Write endpoints must remain consistent with webhook-driven source-of-truth model to avoid divergence
+```
+
+### Session 13 — 2026-02-18: Added explicit PAT -> GitHub App migration intent
+
+```
+Completed:
+  - Updated Active Scope to explicitly treat PAT-backed auth as temporary
+  - Added post-loop migration slice for PAT -> GitHub App cutover planning
+  - Added constraint to build new GitHub API code behind an auth provider interface
+In Progress:
+  - None
+Next Step:
+  - Implement upcoming slices using auth-provider abstraction so GitHub App migration is low-friction
+Next Command:
+  - Start Slice 9 worker migration and introduce token-provider boundary in GitHub client service
+Blockers/Risks:
+  - If PAT assumptions leak into RPC handlers/UI, migration cost rises sharply
+```
+
+### Session 14 — 2026-02-18: Slices 9-11 COMPLETE + optimistic write operations
+
+```
+Completed:
+  Slice 9 — COMPLETE:
+    - Schema: processAttempts, nextRetryAt, "retry" state in github_webhook_events_raw
+    - http.ts: Webhook endpoint verify + persist + return 200 only
+    - webhookProcessor.ts: Full retry/backoff/dead-letter pipeline (5 max, exp backoff)
+    - crons.ts: processAllPending (10s) + promoteRetryEvents (30s)
+    - Deleted placeholder syncWorker.ts
+
+  Slice 10 — COMPLETE:
+    - 10a: Added github_pull_request_files table with indexes
+    - 10b: syncPrFiles (internal action) + upsertPrFiles (internal mutation) in githubActions.ts
+    - 10c: PR file sync trigger in webhookProcessor.ts for opened/synchronize/reopened
+    - 10d: listPrFiles query in projectionQueries.ts
+    - 10e: repairProjections cron + queueHealth query in admin.ts
+    - 10f: 6 tests for PR diff pipeline (all passing)
+
+  Slice 11 — COMPLETE (optimistic write operations):
+    - Replaced fire-and-forget actions with durable optimistic write pipeline
+    - New table: github_write_operations (pending/completed/failed/confirmed state machine)
+    - githubWrite.ts rewritten: 4 public mutations (create issue/comment, update state, merge PR),
+      1 internal action (GitHub API executor), 3 internal mutations (mark completed/failed/confirmed),
+      1 internal query, 1 public query (list write ops)
+    - Webhook reconciliation in webhookProcessor.ts (matchWriteOperation + reconcileWriteOperation)
+    - Client-side dedup via correlationId
+    - Optimistic data stored for immediate UI display
+    - 9 new tests (36 total, all passing)
+
+  Cleanup:
+    - Removed all makeFunctionReference usage (direct internal.rpc.* imports)
+    - Fixed double-wrapped Effect.promise in githubActions.ts
+    - Workflow/workpool evaluation completed (chose custom implementation)
+
+In Progress:
+  - Slice 12: Query/UI scalability (cursor pagination, nuqs, responsive lists)
+Next Step:
+  - Add cursor pagination to PR/issue/activity list queries
+  - Add nuqs URL state management for filters/sort
+  - Ensure no unbounded queries in hot paths
+Blockers/Risks:
+  - _generated/api.d.ts stale until convex dev --once
+  - ctx.scheduler.runAfter causes "unhandled rejection" in test env (known convex-test limitation)
+```
+
+### Session 15 — 2026-02-18: UI architecture fix — server→client handoff
+
+```
+Completed:
+  UI architecture fix:
+    - Created `useSubscriptionWithInitial<T>` hook in packages/confect/src/rpc/client.ts
+      - Merges server-fetched data with real-time Confect RPC subscription
+      - Pure derivation in render path — no useEffect, no useState for data sync
+      - Type-safe: initial data's type T anchors the return type
+      - Exported from @packages/confect/rpc
+    - Rewrote PR detail client (pr-detail-client.tsx):
+      - Removed useEffect + useState sync pattern (explicitly rejected by user)
+      - Now uses use(promise) for Suspense + useSubscriptionWithInitial for live updates
+      - Removed unused imports (useEffect, Option, useAtomValue)
+    - Rewrote issue detail client (issue-detail-client.tsx):
+      - Replaced inline unknown-typed derivation with useSubscriptionWithInitial
+      - Removed unused imports (useAtomValue, Option)
+    - Fixed path alias: ~/lib/server-queries → @/lib/server-queries (4 files)
+    - Confirmed useAtomSuspense IS available in @effect-atom/atom-react@0.4.4
+      (earlier discovery was wrong — package was likely not installed at that time)
+    - Typecheck: 0 errors across all 5 packages
+
+  Notes:
+    - Added personal-notes/fix-convex-test-scheduler-limitation.md for future fix
+      of ctx.scheduler.runAfter unhandled rejections in convex-test
+
+In Progress:
+  - None — architecture fix complete
+Next Step:
+  - Wipe Convex DB and restart dev server (user mentioned this is needed)
+  - Live test the UI pages (PR detail + issue detail + file diffs)
+  - Continue with remaining UI improvements before Slice 15
+Blockers/Risks:
+  - Convex DB may need wipe + redeploy to pick up schema changes
+  - useSubscriptionWithInitial uses `as T` cast internally — safe because server and
+    subscription call the same RPC endpoint, but violates the strict "no casting" rule.
+    The proxy type system would need a significant rewrite to avoid this.
 ```

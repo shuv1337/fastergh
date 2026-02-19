@@ -7,6 +7,7 @@ import {
 	AvatarImage,
 } from "@packages/ui/components/avatar";
 import { Badge } from "@packages/ui/components/badge";
+import { Button } from "@packages/ui/components/button";
 import {
 	Card,
 	CardContent,
@@ -24,48 +25,23 @@ import {
 } from "@packages/ui/components/tabs";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
 import { Option } from "effect";
+import { useQueryStates } from "nuqs";
 import { use, useMemo } from "react";
+import {
+	type RepoTab,
+	repoDetailParsers,
+	type StateFilter,
+} from "./search-params";
 
-function getActivityLink(
-	owner: string,
-	name: string,
-	activityType: string,
-	entityNumber: number | null,
-): string | null {
-	if (entityNumber === null) return null;
-	if (activityType.startsWith("pr.") || activityType.startsWith("pr_review.")) {
-		return `/${owner}/${name}/pulls/${entityNumber}`;
-	}
-	if (activityType.startsWith("issue.")) {
-		return `/${owner}/${name}/issues/${entityNumber}`;
-	}
-	// issue_comment could be on either — check the type prefix
-	if (activityType.startsWith("issue_comment.")) {
-		// The activityType includes whether it's a PR or issue based on the isPr flag
-		// Since we can't know here, default to issues (PRs are also accessible via issues in GitHub)
-		return `/${owner}/${name}/issues/${entityNumber}`;
-	}
-	return null;
-}
-
-function formatRelative(timestamp: number): string {
-	const diff = Math.floor((Date.now() - timestamp) / 1000);
-	if (diff < 60) return "just now";
-	if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-	if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-	if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
-	return new Date(timestamp).toLocaleDateString(undefined, {
-		year: "numeric",
-		month: "short",
-		day: "numeric",
-	});
-}
+const PAGE_SIZE = 50;
 
 export default function RepoDetailPage(props: {
 	params: Promise<{ owner: string; name: string }>;
 }) {
 	const params = use(props.params);
 	const { owner, name } = params;
+	const [{ tab, state: stateFilter }, setParams] =
+		useQueryStates(repoDetailParsers);
 
 	return (
 		<main className="mx-auto max-w-5xl px-4 py-8">
@@ -78,17 +54,39 @@ export default function RepoDetailPage(props: {
 				</Link>
 			</div>
 			<RepoHeader owner={owner} name={name} />
-			<Tabs defaultValue="pulls" className="mt-6">
+			<Tabs
+				value={tab}
+				onValueChange={(value) => {
+					setParams({
+						tab: value as RepoTab,
+						// Reset state filter when switching tabs
+						state: "open",
+					});
+				}}
+				className="mt-6"
+			>
 				<TabsList>
 					<TabsTrigger value="pulls">Pull Requests</TabsTrigger>
 					<TabsTrigger value="issues">Issues</TabsTrigger>
 					<TabsTrigger value="activity">Activity</TabsTrigger>
 				</TabsList>
 				<TabsContent value="pulls">
-					<PullRequestList owner={owner} name={name} />
+					<StateFilterBar
+						value={stateFilter}
+						onChange={(s) => setParams({ state: s })}
+					/>
+					<PullRequestList
+						owner={owner}
+						name={name}
+						stateFilter={stateFilter}
+					/>
 				</TabsContent>
 				<TabsContent value="issues">
-					<IssueList owner={owner} name={name} />
+					<StateFilterBar
+						value={stateFilter}
+						onChange={(s) => setParams({ state: s })}
+					/>
+					<IssueList owner={owner} name={name} stateFilter={stateFilter} />
 				</TabsContent>
 				<TabsContent value="activity">
 					<ActivityFeed owner={owner} name={name} />
@@ -97,6 +95,44 @@ export default function RepoDetailPage(props: {
 		</main>
 	);
 }
+
+// --- State filter bar ---
+
+function StateFilterBar({
+	value,
+	onChange,
+}: {
+	value: StateFilter;
+	onChange: (value: StateFilter) => void;
+}) {
+	return (
+		<div className="mt-4 flex gap-2">
+			<Button
+				variant={value === "open" ? "default" : "outline"}
+				size="sm"
+				onClick={() => onChange("open")}
+			>
+				Open
+			</Button>
+			<Button
+				variant={value === "closed" ? "default" : "outline"}
+				size="sm"
+				onClick={() => onChange("closed")}
+			>
+				Closed
+			</Button>
+			<Button
+				variant={value === "all" ? "default" : "outline"}
+				size="sm"
+				onClick={() => onChange("all")}
+			>
+				All
+			</Button>
+		</div>
+	);
+}
+
+// --- Repo header ---
 
 function RepoHeader({ owner, name }: { owner: string; name: string }) {
 	const client = useProjectionQueries();
@@ -160,11 +196,29 @@ function RepoHeader({ owner, name }: { owner: string; name: string }) {
 	);
 }
 
-function PullRequestList({ owner, name }: { owner: string; name: string }) {
+// --- Pull request list with state filter ---
+
+function PullRequestList({
+	owner,
+	name,
+	stateFilter,
+}: {
+	owner: string;
+	name: string;
+	stateFilter: StateFilter;
+}) {
 	const client = useProjectionQueries();
 	const prsAtom = useMemo(
-		() => client.listPullRequests.subscription({ ownerLogin: owner, name }),
-		[client, owner, name],
+		() =>
+			client.listPullRequests.subscription({
+				ownerLogin: owner,
+				name,
+				state:
+					stateFilter === "all"
+						? undefined
+						: (stateFilter as "open" | "closed"),
+			}),
+		[client, owner, name, stateFilter],
 	);
 	const prsResult = useAtomValue(prsAtom);
 
@@ -180,75 +234,102 @@ function PullRequestList({ owner, name }: { owner: string; name: string }) {
 		return (
 			<Card className="mt-4">
 				<CardHeader>
-					<CardDescription>No pull requests found.</CardDescription>
+					<CardDescription>
+						No {stateFilter !== "all" ? stateFilter : ""} pull requests found.
+					</CardDescription>
 				</CardHeader>
 			</Card>
 		);
 	}
 
 	return (
-		<div className="mt-4 divide-y rounded-lg border">
-			{prs.map((pr) => (
-				<Link
-					key={pr.number}
-					href={`/${owner}/${name}/pulls/${pr.number}`}
-					className="flex items-start gap-3 px-4 py-3 hover:bg-muted/50 transition-colors"
-				>
-					<div className="mt-0.5">
-						<PrStateIcon state={pr.state} draft={pr.draft} />
-					</div>
-					<div className="min-w-0 flex-1">
-						<div className="flex items-center gap-2">
-							<span className="font-medium">{pr.title}</span>
-							{pr.draft && (
-								<Badge variant="outline" className="text-xs">
-									Draft
-								</Badge>
-							)}
-							{pr.lastCheckConclusion && (
-								<CheckBadge conclusion={pr.lastCheckConclusion} />
-							)}
+		<>
+			<div className="mt-4 divide-y rounded-lg border">
+				{prs.map((pr) => (
+					<Link
+						key={pr.number}
+						href={`/${owner}/${name}/pulls/${pr.number}`}
+						className="flex items-start gap-3 px-4 py-3 hover:bg-muted/50 transition-colors"
+					>
+						<div className="mt-0.5">
+							<PrStateIcon state={pr.state} draft={pr.draft} />
 						</div>
-						<div className="mt-1 flex items-center gap-2 text-sm text-muted-foreground">
-							<span>#{pr.number}</span>
-							{pr.authorLogin && (
-								<span className="flex items-center gap-1">
-									<Avatar className="size-4">
-										<AvatarImage src={pr.authorAvatarUrl ?? undefined} />
-										<AvatarFallback className="text-[8px]">
-											{pr.authorLogin[0]?.toUpperCase()}
-										</AvatarFallback>
-									</Avatar>
-									{pr.authorLogin}
-								</span>
-							)}
-							<span>
-								{pr.headRefName} &rarr; {pr.baseRefName}
-							</span>
-							<span>{formatRelative(pr.githubUpdatedAt)}</span>
-							{pr.commentCount > 0 && (
+						<div className="min-w-0 flex-1">
+							<div className="flex items-center gap-2">
+								<span className="font-medium">{pr.title}</span>
+								{pr.draft && (
+									<Badge variant="outline" className="text-xs">
+										Draft
+									</Badge>
+								)}
+								{pr.lastCheckConclusion && (
+									<CheckBadge conclusion={pr.lastCheckConclusion} />
+								)}
+							</div>
+							<div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+								<span>#{pr.number}</span>
+								{pr.authorLogin && (
+									<span className="flex items-center gap-1">
+										<Avatar className="size-4">
+											<AvatarImage src={pr.authorAvatarUrl ?? undefined} />
+											<AvatarFallback className="text-[8px]">
+												{pr.authorLogin[0]?.toUpperCase()}
+											</AvatarFallback>
+										</Avatar>
+										{pr.authorLogin}
+									</span>
+								)}
 								<span>
-									{pr.commentCount} comment{pr.commentCount !== 1 ? "s" : ""}
+									{pr.headRefName} &rarr; {pr.baseRefName}
 								</span>
-							)}
-							{pr.reviewCount > 0 && (
-								<span>
-									{pr.reviewCount} review{pr.reviewCount !== 1 ? "s" : ""}
-								</span>
-							)}
+								<span>{formatRelative(pr.githubUpdatedAt)}</span>
+								{pr.commentCount > 0 && (
+									<span>
+										{pr.commentCount} comment{pr.commentCount !== 1 ? "s" : ""}
+									</span>
+								)}
+								{pr.reviewCount > 0 && (
+									<span>
+										{pr.reviewCount} review{pr.reviewCount !== 1 ? "s" : ""}
+									</span>
+								)}
+							</div>
 						</div>
-					</div>
-				</Link>
-			))}
-		</div>
+					</Link>
+				))}
+			</div>
+			{prs.length >= 200 && (
+				<p className="mt-2 text-center text-sm text-muted-foreground">
+					Showing first 200 results
+				</p>
+			)}
+		</>
 	);
 }
 
-function IssueList({ owner, name }: { owner: string; name: string }) {
+// --- Issue list with state filter ---
+
+function IssueList({
+	owner,
+	name,
+	stateFilter,
+}: {
+	owner: string;
+	name: string;
+	stateFilter: StateFilter;
+}) {
 	const client = useProjectionQueries();
 	const issuesAtom = useMemo(
-		() => client.listIssues.subscription({ ownerLogin: owner, name }),
-		[client, owner, name],
+		() =>
+			client.listIssues.subscription({
+				ownerLogin: owner,
+				name,
+				state:
+					stateFilter === "all"
+						? undefined
+						: (stateFilter as "open" | "closed"),
+			}),
+		[client, owner, name, stateFilter],
 	);
 	const issuesResult = useAtomValue(issuesAtom);
 
@@ -264,64 +345,80 @@ function IssueList({ owner, name }: { owner: string; name: string }) {
 		return (
 			<Card className="mt-4">
 				<CardHeader>
-					<CardDescription>No issues found.</CardDescription>
+					<CardDescription>
+						No {stateFilter !== "all" ? stateFilter : ""} issues found.
+					</CardDescription>
 				</CardHeader>
 			</Card>
 		);
 	}
 
 	return (
-		<div className="mt-4 divide-y rounded-lg border">
-			{issues.map((issue) => (
-				<Link
-					key={issue.number}
-					href={`/${owner}/${name}/issues/${issue.number}`}
-					className="flex items-start gap-3 px-4 py-3 hover:bg-muted/50 transition-colors"
-				>
-					<div className="mt-0.5">
-						<IssueStateIcon state={issue.state} />
-					</div>
-					<div className="min-w-0 flex-1">
-						<div className="flex items-center gap-2">
-							<span className="font-medium">{issue.title}</span>
-							{issue.labelNames.map((label) => (
-								<Badge key={label} variant="outline" className="text-xs">
-									{label}
-								</Badge>
-							))}
+		<>
+			<div className="mt-4 divide-y rounded-lg border">
+				{issues.map((issue) => (
+					<Link
+						key={issue.number}
+						href={`/${owner}/${name}/issues/${issue.number}`}
+						className="flex items-start gap-3 px-4 py-3 hover:bg-muted/50 transition-colors"
+					>
+						<div className="mt-0.5">
+							<IssueStateIcon state={issue.state} />
 						</div>
-						<div className="mt-1 flex items-center gap-2 text-sm text-muted-foreground">
-							<span>#{issue.number}</span>
-							{issue.authorLogin && (
-								<span className="flex items-center gap-1">
-									<Avatar className="size-4">
-										<AvatarImage src={issue.authorAvatarUrl ?? undefined} />
-										<AvatarFallback className="text-[8px]">
-											{issue.authorLogin[0]?.toUpperCase()}
-										</AvatarFallback>
-									</Avatar>
-									{issue.authorLogin}
-								</span>
-							)}
-							<span>{formatRelative(issue.githubUpdatedAt)}</span>
-							{issue.commentCount > 0 && (
-								<span>
-									{issue.commentCount} comment
-									{issue.commentCount !== 1 ? "s" : ""}
-								</span>
-							)}
+						<div className="min-w-0 flex-1">
+							<div className="flex items-center gap-2">
+								<span className="font-medium">{issue.title}</span>
+								{issue.labelNames.map((label) => (
+									<Badge key={label} variant="outline" className="text-xs">
+										{label}
+									</Badge>
+								))}
+							</div>
+							<div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+								<span>#{issue.number}</span>
+								{issue.authorLogin && (
+									<span className="flex items-center gap-1">
+										<Avatar className="size-4">
+											<AvatarImage src={issue.authorAvatarUrl ?? undefined} />
+											<AvatarFallback className="text-[8px]">
+												{issue.authorLogin[0]?.toUpperCase()}
+											</AvatarFallback>
+										</Avatar>
+										{issue.authorLogin}
+									</span>
+								)}
+								<span>{formatRelative(issue.githubUpdatedAt)}</span>
+								{issue.commentCount > 0 && (
+									<span>
+										{issue.commentCount} comment
+										{issue.commentCount !== 1 ? "s" : ""}
+									</span>
+								)}
+							</div>
 						</div>
-					</div>
-				</Link>
-			))}
-		</div>
+					</Link>
+				))}
+			</div>
+			{issues.length >= 200 && (
+				<p className="mt-2 text-center text-sm text-muted-foreground">
+					Showing first 200 results
+				</p>
+			)}
+		</>
 	);
 }
+
+// --- Activity feed with bounded query ---
 
 function ActivityFeed({ owner, name }: { owner: string; name: string }) {
 	const client = useProjectionQueries();
 	const activityAtom = useMemo(
-		() => client.listActivity.subscription({ ownerLogin: owner, name }),
+		() =>
+			client.listActivity.subscription({
+				ownerLogin: owner,
+				name,
+				limit: PAGE_SIZE,
+			}),
 		[client, owner, name],
 	);
 	const activityResult = useAtomValue(activityAtom);
@@ -412,7 +509,41 @@ function ActivityFeed({ owner, name }: { owner: string; name: string }) {
 	);
 }
 
-// --- Helper components ---
+// --- Helper functions ---
+
+function getActivityLink(
+	owner: string,
+	name: string,
+	activityType: string,
+	entityNumber: number | null,
+): string | null {
+	if (entityNumber === null) return null;
+	if (activityType.startsWith("pr.") || activityType.startsWith("pr_review.")) {
+		return `/${owner}/${name}/pulls/${entityNumber}`;
+	}
+	if (activityType.startsWith("issue.")) {
+		return `/${owner}/${name}/issues/${entityNumber}`;
+	}
+	if (activityType.startsWith("issue_comment.")) {
+		return `/${owner}/${name}/issues/${entityNumber}`;
+	}
+	return null;
+}
+
+function formatRelative(timestamp: number): string {
+	const diff = Math.floor((Date.now() - timestamp) / 1000);
+	if (diff < 60) return "just now";
+	if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+	if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+	if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
+	return new Date(timestamp).toLocaleDateString(undefined, {
+		year: "numeric",
+		month: "short",
+		day: "numeric",
+	});
+}
+
+// --- Icon/badge components ---
 
 function PrStateIcon({
 	state,

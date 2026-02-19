@@ -34,7 +34,7 @@ export {
 	type LooseIndexRangeBuilder,
 } from "./ctx";
 
-export { ConvexClient, ConvexClientLayer, type ConvexClientService } from "./client";
+export { ConvexClient, ConvexClientLayer, ConvexHttpClientLayer, type ConvexClientService } from "./client";
 
 export {
 	Cursor,

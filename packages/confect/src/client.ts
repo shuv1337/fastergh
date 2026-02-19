@@ -104,3 +104,51 @@ export const ConvexClientLayer = (
 
 	return Layer.succeed(ConvexClient, service);
 };
+
+/**
+ * Server-only layer that uses only `ConvexHttpClient` (no WebSocket).
+ * Safe for use in Next.js server components, route handlers, and server actions.
+ * Subscriptions are not supported and will fail with a defect if called.
+ */
+export const ConvexHttpClientLayer = (
+	url: string,
+): Layer.Layer<ConvexClient> => {
+	const httpClient = new ConvexHttpClient(url);
+
+	const service: ConvexClientService = {
+		query: <Query extends FunctionReference<"query">>(
+			query: Query,
+			args: Query["_args"],
+			_requestMetadata?: ConvexRequestMetadata,
+		): Effect.Effect<FunctionReturnType<Query>> =>
+			Effect.promise(() => httpClient.query(query, args)),
+
+		mutation: <Mutation extends FunctionReference<"mutation">>(
+			mutation: Mutation,
+			args: Mutation["_args"],
+			_requestMetadata?: ConvexRequestMetadata,
+		): Effect.Effect<FunctionReturnType<Mutation>> =>
+			Effect.promise(() => httpClient.mutation(mutation, args)),
+
+		action: <Action extends FunctionReference<"action">>(
+			action: Action,
+			args: Action["_args"],
+			_requestMetadata?: ConvexRequestMetadata,
+		): Effect.Effect<FunctionReturnType<Action>> =>
+			Effect.promise(() => httpClient.action(action, args)),
+
+		subscribe: <Query extends FunctionReference<"query">>(
+			_query: Query,
+			_args: Query["_args"],
+		): Stream.Stream<FunctionReturnType<Query>> =>
+			Stream.fromEffect(
+				Effect.die(
+					new Error(
+						"ConvexHttpClientLayer does not support subscriptions. Use ConvexClientLayer (with WebSocket) for real-time subscriptions.",
+					),
+				),
+			),
+	};
+
+	return Layer.succeed(ConvexClient, service);
+};

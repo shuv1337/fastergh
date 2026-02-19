@@ -53,6 +53,8 @@ storeRawEventDef.implement((args) =>
 			receivedAt: args.receivedAt,
 			processState: "pending",
 			processError: null,
+			processAttempts: 0,
+			nextRetryAt: null,
 		});
 
 		return { stored: true, deliveryId: args.deliveryId };

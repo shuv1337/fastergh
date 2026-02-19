@@ -1,5 +1,10 @@
+import {
+	Cursor,
+	PaginationOptionsSchema,
+	PaginationResultSchema,
+} from "@packages/confect";
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
-import { Array as Arr, Effect, Option, Predicate, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 import { ConfectQueryCtx, confectSchema } from "../confect";
 import { DatabaseRpcTelemetryLayer } from "./telemetry";
 
@@ -123,6 +128,120 @@ const listActivityDef = factory.query({
 	),
 });
 
+/**
+ * Get files changed in a pull request (for diff view).
+ * Returns files for the given PR, optionally filtered by headSha.
+ * If no headSha is given, returns the most recently cached set.
+ */
+const listPrFilesDef = factory.query({
+	payload: {
+		ownerLogin: Schema.String,
+		name: Schema.String,
+		number: Schema.Number,
+		headSha: Schema.optional(Schema.String),
+	},
+	success: Schema.Struct({
+		headSha: Schema.NullOr(Schema.String),
+		files: Schema.Array(
+			Schema.Struct({
+				filename: Schema.String,
+				status: Schema.Literal(
+					"added",
+					"removed",
+					"modified",
+					"renamed",
+					"copied",
+					"changed",
+					"unchanged",
+				),
+				additions: Schema.Number,
+				deletions: Schema.Number,
+				changes: Schema.Number,
+				patch: Schema.NullOr(Schema.String),
+				previousFilename: Schema.NullOr(Schema.String),
+			}),
+		),
+	}),
+});
+
+// ---------------------------------------------------------------------------
+// Paginated list endpoint definitions
+// ---------------------------------------------------------------------------
+
+const PrListItem = Schema.Struct({
+	number: Schema.Number,
+	state: Schema.Literal("open", "closed"),
+	draft: Schema.Boolean,
+	title: Schema.String,
+	authorLogin: Schema.NullOr(Schema.String),
+	authorAvatarUrl: Schema.NullOr(Schema.String),
+	headRefName: Schema.String,
+	baseRefName: Schema.String,
+	commentCount: Schema.Number,
+	reviewCount: Schema.Number,
+	lastCheckConclusion: Schema.NullOr(Schema.String),
+	githubUpdatedAt: Schema.Number,
+});
+
+const IssueListItem = Schema.Struct({
+	number: Schema.Number,
+	state: Schema.Literal("open", "closed"),
+	title: Schema.String,
+	authorLogin: Schema.NullOr(Schema.String),
+	authorAvatarUrl: Schema.NullOr(Schema.String),
+	labelNames: Schema.Array(Schema.String),
+	commentCount: Schema.Number,
+	githubUpdatedAt: Schema.Number,
+});
+
+const ActivityListItem = Schema.Struct({
+	activityType: Schema.String,
+	title: Schema.String,
+	description: Schema.NullOr(Schema.String),
+	actorLogin: Schema.NullOr(Schema.String),
+	actorAvatarUrl: Schema.NullOr(Schema.String),
+	entityNumber: Schema.NullOr(Schema.Number),
+	createdAt: Schema.Number,
+});
+
+/**
+ * Paginated pull request list with optional state filter.
+ */
+const listPullRequestsPaginatedDef = factory.query({
+	payload: {
+		ownerLogin: Schema.String,
+		name: Schema.String,
+		state: Schema.optional(Schema.Literal("open", "closed")),
+		...PaginationOptionsSchema.fields,
+	},
+	success: PaginationResultSchema(PrListItem),
+});
+
+/**
+ * Paginated issue list with optional state filter.
+ */
+const listIssuesPaginatedDef = factory.query({
+	payload: {
+		ownerLogin: Schema.String,
+		name: Schema.String,
+		state: Schema.optional(Schema.Literal("open", "closed")),
+		...PaginationOptionsSchema.fields,
+	},
+	success: PaginationResultSchema(IssueListItem),
+});
+
+/**
+ * Paginated activity feed.
+ */
+const listActivityPaginatedDef = factory.query({
+	payload: {
+		ownerLogin: Schema.String,
+		name: Schema.String,
+		...PaginationOptionsSchema.fields,
+	},
+	success: PaginationResultSchema(ActivityListItem),
+});
+
 // -- Shared sub-schemas for detail views ------------------------------------
 
 const CommentSchema = Schema.Struct({
@@ -161,6 +280,7 @@ const getIssueDetailDef = factory.query({
 	},
 	success: Schema.NullOr(
 		Schema.Struct({
+			repositoryId: Schema.Number,
 			number: Schema.Number,
 			state: Schema.Literal("open", "closed"),
 			title: Schema.String,
@@ -187,6 +307,7 @@ const getPullRequestDetailDef = factory.query({
 	},
 	success: Schema.NullOr(
 		Schema.Struct({
+			repositoryId: Schema.Number,
 			number: Schema.Number,
 			state: Schema.Literal("open", "closed"),
 			draft: Schema.Boolean,
@@ -215,7 +336,8 @@ const getPullRequestDetailDef = factory.query({
 listReposDef.implement(() =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectQueryCtx;
-		const overviews = yield* ctx.db.query("view_repo_overview").collect();
+		// Bounded — personal dashboard should have <100 repos
+		const overviews = yield* ctx.db.query("view_repo_overview").take(100);
 		return overviews.map((o) => ({
 			repositoryId: o.repositoryId,
 			fullName: o.fullName,
@@ -270,32 +392,31 @@ getRepoOverviewDef.implement((args) =>
 
 listPullRequestsDef.implement((args) =>
 	Effect.gen(function* () {
+		const repositoryId = yield* findRepo(args.ownerLogin, args.name);
+		if (repositoryId === null) return [];
+
 		const ctx = yield* ConfectQueryCtx;
 
-		const repo = yield* ctx.db
-			.query("github_repositories")
-			.withIndex("by_ownerLogin_and_name", (q) =>
-				q.eq("ownerLogin", args.ownerLogin).eq("name", args.name),
-			)
-			.first();
+		const state = args.state;
+		const query =
+			state !== undefined
+				? ctx.db
+						.query("view_repo_pull_request_list")
+						.withIndex("by_repositoryId_and_state_and_sortUpdated", (q) =>
+							q.eq("repositoryId", repositoryId).eq("state", state),
+						)
+						.order("desc")
+				: ctx.db
+						.query("view_repo_pull_request_list")
+						.withIndex("by_repositoryId_and_sortUpdated", (q) =>
+							q.eq("repositoryId", repositoryId),
+						)
+						.order("desc");
 
-		if (Option.isNone(repo)) return [];
+		// Bounded to prevent unbounded queries on large repos
+		const prs = yield* query.take(200);
 
-		const repositoryId = repo.value.githubRepoId;
-		const allPrs = yield* ctx.db
-			.query("view_repo_pull_request_list")
-			.withIndex("by_repositoryId_and_sortUpdated", (q) =>
-				q.eq("repositoryId", repositoryId),
-			)
-			.order("desc")
-			.collect();
-
-		const filtered =
-			args.state !== undefined
-				? allPrs.filter((pr) => pr.state === args.state)
-				: allPrs;
-
-		return filtered.map((pr) => ({
+		return prs.map((pr) => ({
 			number: pr.number,
 			state: pr.state,
 			draft: pr.draft,
@@ -314,32 +435,31 @@ listPullRequestsDef.implement((args) =>
 
 listIssuesDef.implement((args) =>
 	Effect.gen(function* () {
+		const repositoryId = yield* findRepo(args.ownerLogin, args.name);
+		if (repositoryId === null) return [];
+
 		const ctx = yield* ConfectQueryCtx;
 
-		const repo = yield* ctx.db
-			.query("github_repositories")
-			.withIndex("by_ownerLogin_and_name", (q) =>
-				q.eq("ownerLogin", args.ownerLogin).eq("name", args.name),
-			)
-			.first();
+		const state = args.state;
+		const query =
+			state !== undefined
+				? ctx.db
+						.query("view_repo_issue_list")
+						.withIndex("by_repositoryId_and_state_and_sortUpdated", (q) =>
+							q.eq("repositoryId", repositoryId).eq("state", state),
+						)
+						.order("desc")
+				: ctx.db
+						.query("view_repo_issue_list")
+						.withIndex("by_repositoryId_and_sortUpdated", (q) =>
+							q.eq("repositoryId", repositoryId),
+						)
+						.order("desc");
 
-		if (Option.isNone(repo)) return [];
+		// Bounded to prevent unbounded queries on large repos
+		const issues = yield* query.take(200);
 
-		const repositoryId = repo.value.githubRepoId;
-		const allIssues = yield* ctx.db
-			.query("view_repo_issue_list")
-			.withIndex("by_repositoryId_and_sortUpdated", (q) =>
-				q.eq("repositoryId", repositoryId),
-			)
-			.order("desc")
-			.collect();
-
-		const filtered =
-			args.state !== undefined
-				? allIssues.filter((i) => i.state === args.state)
-				: allIssues;
-
-		return filtered.map((i) => ({
+		return issues.map((i) => ({
 			number: i.number,
 			state: i.state,
 			title: i.title,
@@ -437,13 +557,13 @@ getIssueDetailDef.implement((args) =>
 		// Resolve author
 		const author = yield* resolveUser(issue.authorUserId);
 
-		// Get comments
+		// Get comments (bounded to 500 — practical limit for a single issue)
 		const rawComments = yield* ctx.db
 			.query("github_issue_comments")
 			.withIndex("by_repositoryId_and_issueNumber", (q) =>
 				q.eq("repositoryId", repositoryId).eq("issueNumber", args.number),
 			)
-			.collect();
+			.take(500);
 
 		// Resolve comment authors
 		const comments = yield* Effect.all(
@@ -464,6 +584,7 @@ getIssueDetailDef.implement((args) =>
 		);
 
 		return {
+			repositoryId,
 			number: issue.number,
 			state: issue.state,
 			title: issue.title,
@@ -500,13 +621,13 @@ getPullRequestDetailDef.implement((args) =>
 		// Resolve author
 		const author = yield* resolveUser(pr.authorUserId);
 
-		// Get comments (issue comments also cover PR comments in GitHub API)
+		// Get comments (bounded — a PR rarely has >500 comments)
 		const rawComments = yield* ctx.db
 			.query("github_issue_comments")
 			.withIndex("by_repositoryId_and_issueNumber", (q) =>
 				q.eq("repositoryId", repositoryId).eq("issueNumber", args.number),
 			)
-			.collect();
+			.take(500);
 
 		const comments = yield* Effect.all(
 			rawComments.map((c) =>
@@ -525,13 +646,13 @@ getPullRequestDetailDef.implement((args) =>
 			{ concurrency: "unbounded" },
 		);
 
-		// Get reviews
+		// Get reviews (bounded — a PR rarely has >200 reviews)
 		const rawReviews = yield* ctx.db
 			.query("github_pull_request_reviews")
 			.withIndex("by_repositoryId_and_pullRequestNumber", (q) =>
 				q.eq("repositoryId", repositoryId).eq("pullRequestNumber", args.number),
 			)
-			.collect();
+			.take(200);
 
 		const reviews = yield* Effect.all(
 			rawReviews.map((r) =>
@@ -549,15 +670,16 @@ getPullRequestDetailDef.implement((args) =>
 			{ concurrency: "unbounded" },
 		);
 
-		// Get check runs for this PR's head SHA
+		// Get check runs for this PR's head SHA (bounded)
 		const checkRuns = yield* ctx.db
 			.query("github_check_runs")
 			.withIndex("by_repositoryId_and_headSha", (q) =>
 				q.eq("repositoryId", repositoryId).eq("headSha", pr.headSha),
 			)
-			.collect();
+			.take(200);
 
 		return {
+			repositoryId,
 			number: pr.number,
 			state: pr.state,
 			draft: pr.draft,
@@ -585,6 +707,230 @@ getPullRequestDetailDef.implement((args) =>
 	}),
 );
 
+listPrFilesDef.implement((args) =>
+	Effect.gen(function* () {
+		const repositoryId = yield* findRepo(args.ownerLogin, args.name);
+		if (repositoryId === null) return { headSha: null, files: [] };
+
+		const ctx = yield* ConfectQueryCtx;
+
+		if (args.headSha !== undefined) {
+			const sha = args.headSha;
+			// Fetch files for a specific headSha
+			const files = yield* ctx.db
+				.query("github_pull_request_files")
+				.withIndex("by_repositoryId_and_pullRequestNumber_and_headSha", (q) =>
+					q
+						.eq("repositoryId", repositoryId)
+						.eq("pullRequestNumber", args.number)
+						.eq("headSha", sha),
+				)
+				.collect();
+
+			return {
+				headSha: sha,
+				files: files.map((f) => ({
+					filename: f.filename,
+					status: f.status,
+					additions: f.additions,
+					deletions: f.deletions,
+					changes: f.changes,
+					patch: f.patch,
+					previousFilename: f.previousFilename,
+				})),
+			};
+		}
+
+		// No headSha specified — find the most recently cached set.
+		// Look up the PR to get its current headSha.
+		const prOpt = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_repositoryId_and_number", (q) =>
+				q.eq("repositoryId", repositoryId).eq("number", args.number),
+			)
+			.first();
+
+		if (Option.isNone(prOpt)) return { headSha: null, files: [] };
+
+		const headSha = prOpt.value.headSha;
+		const files = yield* ctx.db
+			.query("github_pull_request_files")
+			.withIndex("by_repositoryId_and_pullRequestNumber_and_headSha", (q) =>
+				q
+					.eq("repositoryId", repositoryId)
+					.eq("pullRequestNumber", args.number)
+					.eq("headSha", headSha),
+			)
+			.collect();
+
+		return {
+			headSha,
+			files: files.map((f) => ({
+				filename: f.filename,
+				status: f.status,
+				additions: f.additions,
+				deletions: f.deletions,
+				changes: f.changes,
+				patch: f.patch,
+				previousFilename: f.previousFilename,
+			})),
+		};
+	}),
+);
+
+// ---------------------------------------------------------------------------
+// Paginated list implementations
+// ---------------------------------------------------------------------------
+
+listPullRequestsPaginatedDef.implement((args) =>
+	Effect.gen(function* () {
+		const repositoryId = yield* findRepo(args.ownerLogin, args.name);
+		if (repositoryId === null) {
+			return {
+				page: [],
+				isDone: true,
+				continueCursor: Cursor.make(""),
+			};
+		}
+
+		const ctx = yield* ConfectQueryCtx;
+		const paginationOpts = {
+			cursor: args.cursor ?? null,
+			numItems: args.numItems,
+		};
+
+		const state = args.state;
+		const query =
+			state !== undefined
+				? ctx.db
+						.query("view_repo_pull_request_list")
+						.withIndex("by_repositoryId_and_state_and_sortUpdated", (q) =>
+							q.eq("repositoryId", repositoryId).eq("state", state),
+						)
+						.order("desc")
+				: ctx.db
+						.query("view_repo_pull_request_list")
+						.withIndex("by_repositoryId_and_sortUpdated", (q) =>
+							q.eq("repositoryId", repositoryId),
+						)
+						.order("desc");
+
+		const result = yield* query.paginate(paginationOpts);
+
+		return {
+			page: result.page.map((pr) => ({
+				number: pr.number,
+				state: pr.state,
+				draft: pr.draft,
+				title: pr.title,
+				authorLogin: pr.authorLogin,
+				authorAvatarUrl: pr.authorAvatarUrl,
+				headRefName: pr.headRefName,
+				baseRefName: pr.baseRefName,
+				commentCount: pr.commentCount,
+				reviewCount: pr.reviewCount,
+				lastCheckConclusion: pr.lastCheckConclusion,
+				githubUpdatedAt: pr.githubUpdatedAt,
+			})),
+			isDone: result.isDone,
+			continueCursor: Cursor.make(result.continueCursor),
+		};
+	}),
+);
+
+listIssuesPaginatedDef.implement((args) =>
+	Effect.gen(function* () {
+		const repositoryId = yield* findRepo(args.ownerLogin, args.name);
+		if (repositoryId === null) {
+			return {
+				page: [],
+				isDone: true,
+				continueCursor: Cursor.make(""),
+			};
+		}
+
+		const ctx = yield* ConfectQueryCtx;
+		const paginationOpts = {
+			cursor: args.cursor ?? null,
+			numItems: args.numItems,
+		};
+
+		const state = args.state;
+		const query =
+			state !== undefined
+				? ctx.db
+						.query("view_repo_issue_list")
+						.withIndex("by_repositoryId_and_state_and_sortUpdated", (q) =>
+							q.eq("repositoryId", repositoryId).eq("state", state),
+						)
+						.order("desc")
+				: ctx.db
+						.query("view_repo_issue_list")
+						.withIndex("by_repositoryId_and_sortUpdated", (q) =>
+							q.eq("repositoryId", repositoryId),
+						)
+						.order("desc");
+
+		const result = yield* query.paginate(paginationOpts);
+
+		return {
+			page: result.page.map((i) => ({
+				number: i.number,
+				state: i.state,
+				title: i.title,
+				authorLogin: i.authorLogin,
+				authorAvatarUrl: i.authorAvatarUrl,
+				labelNames: [...i.labelNames],
+				commentCount: i.commentCount,
+				githubUpdatedAt: i.githubUpdatedAt,
+			})),
+			isDone: result.isDone,
+			continueCursor: Cursor.make(result.continueCursor),
+		};
+	}),
+);
+
+listActivityPaginatedDef.implement((args) =>
+	Effect.gen(function* () {
+		const repositoryId = yield* findRepo(args.ownerLogin, args.name);
+		if (repositoryId === null) {
+			return {
+				page: [],
+				isDone: true,
+				continueCursor: Cursor.make(""),
+			};
+		}
+
+		const ctx = yield* ConfectQueryCtx;
+		const paginationOpts = {
+			cursor: args.cursor ?? null,
+			numItems: args.numItems,
+		};
+
+		const result = yield* ctx.db
+			.query("view_activity_feed")
+			.withIndex("by_repositoryId_and_createdAt", (q) =>
+				q.eq("repositoryId", repositoryId),
+			)
+			.order("desc")
+			.paginate(paginationOpts);
+
+		return {
+			page: result.page.map((a) => ({
+				activityType: a.activityType,
+				title: a.title,
+				description: a.description,
+				actorLogin: a.actorLogin,
+				actorAvatarUrl: a.actorAvatarUrl,
+				entityNumber: a.entityNumber,
+				createdAt: a.createdAt,
+			})),
+			isDone: result.isDone,
+			continueCursor: Cursor.make(result.continueCursor),
+		};
+	}),
+);
+
 // ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
@@ -596,8 +942,12 @@ const projectionQueriesModule = makeRpcModule(
 		listPullRequests: listPullRequestsDef,
 		listIssues: listIssuesDef,
 		listActivity: listActivityDef,
+		listPullRequestsPaginated: listPullRequestsPaginatedDef,
+		listIssuesPaginated: listIssuesPaginatedDef,
+		listActivityPaginated: listActivityPaginatedDef,
 		getIssueDetail: getIssueDetailDef,
 		getPullRequestDetail: getPullRequestDetailDef,
+		listPrFiles: listPrFilesDef,
 	},
 	{ middlewares: DatabaseRpcTelemetryLayer },
 );
@@ -608,8 +958,12 @@ export const {
 	listPullRequests,
 	listIssues,
 	listActivity,
+	listPullRequestsPaginated,
+	listIssuesPaginated,
+	listActivityPaginated,
 	getIssueDetail,
 	getPullRequestDetail,
+	listPrFiles,
 } = projectionQueriesModule.handlers;
 export { projectionQueriesModule };
 export type ProjectionQueriesModule = typeof projectionQueriesModule;

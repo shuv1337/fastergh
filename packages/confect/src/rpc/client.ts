@@ -6,12 +6,14 @@ import type {
 	RegisteredAction,
 } from "convex/server";
 import { Atom, Result } from "@effect-atom/atom";
+import { Result as ResultModule, useAtomValue } from "@effect-atom/atom-react";
 import * as Cause from "effect/Cause";
 import { Chunk, Data, Effect, Exit, FiberId, Layer, Option, Stream } from "effect";
 
 import {
 	ConvexClient,
 	ConvexClientLayer,
+	ConvexHttpClientLayer,
 	type ConvexRequestMetadata,
 } from "../client";
 import type { AnyRpcModule, ExitEncoded, RpcEndpoint } from "./server";
@@ -23,7 +25,33 @@ import {
 
 export class RpcDefectError extends Data.TaggedError("RpcDefectError")<{
 	readonly defect: unknown;
-}> {}
+}> {
+	get message(): string {
+		return `RpcDefectError: ${extractDefectMessage(this.defect)}`;
+	}
+}
+
+/** Best-effort extraction of a human-readable message from an opaque defect. */
+const extractDefectMessage = (defect: unknown): string => {
+	if (defect === null || defect === undefined) return "Unknown defect";
+	if (typeof defect === "string") return defect;
+	if (defect instanceof Error) return defect.message;
+	if (typeof defect === "object") {
+		const obj = defect as Record<string, unknown>;
+		// TaggedError / Data.TaggedError
+		if (typeof obj._tag === "string" && typeof obj.message === "string") {
+			return `[${obj._tag}] ${obj.message}`;
+		}
+		if (typeof obj._tag === "string") return obj._tag;
+		if (typeof obj.message === "string") return obj.message;
+		try {
+			return JSON.stringify(defect);
+		} catch {
+			return String(defect);
+		}
+	}
+	return String(defect);
+};
 
 type EndpointPayload<E> = E extends RpcEndpoint<infer _Tag, infer R, infer _ConvexFn>
 	? Rpc.Payload<R>
@@ -179,8 +207,23 @@ const decodeCause = (encoded: CauseEncoded): Cause.Cause<unknown> => {
 };
 
 const decodeExit = (encoded: ExitEncoded): Exit.Exit<unknown, unknown> => {
+	// Safety: if the response isn't a valid ExitEncoded, wrap as defect
+	if (
+		!encoded ||
+		typeof encoded !== "object" ||
+		!("_tag" in encoded)
+	) {
+		return Exit.fail(
+			new RpcDefectError({ defect: `Unexpected RPC response: ${JSON.stringify(encoded)}` }),
+		);
+	}
 	if (encoded._tag === "Success") {
 		return Exit.succeed(encoded.value);
+	}
+	if (encoded._tag !== "Failure" || !encoded.cause) {
+		return Exit.fail(
+			new RpcDefectError({ defect: `Unexpected exit tag: ${String(encoded._tag)}` }),
+		);
 	}
 	const cause = decodeCause(encoded.cause);
 	const failureOption = Cause.failureOption(cause);
@@ -627,4 +670,137 @@ export function createRpcClient<
 	});
 
 	return proxy as unknown as RpcModuleClient<TModule, Shared>;
+}
+
+// ---------------------------------------------------------------------------
+// Server-side RPC query client (HTTP-only, no WebSocket, no atoms)
+// ---------------------------------------------------------------------------
+
+type ServerQueryEndpoint<Payload, Success> = {
+	readonly queryPromise: (payload: Payload) => Promise<Success>;
+};
+
+type ServerDecorateEndpoint<E, Shared extends Record<string, unknown> = {}> =
+	EndpointKind<E> extends "query"
+		? ServerQueryEndpoint<
+				Omit<EndpointPayload<E>, keyof Shared>,
+				EndpointSuccess<E>
+			>
+		: never;
+
+export type ServerRpcModuleClient<
+	TModule extends AnyRpcModule,
+	Shared extends Record<string, unknown> = {},
+> = {
+	readonly [K in keyof TModule as TModule[K] extends RpcEndpoint<string, Rpc.Any, unknown>
+		? EndpointKind<TModule[K]> extends "query"
+			? K
+			: never
+		: never]: ServerDecorateEndpoint<TModule[K], Shared>;
+};
+
+export interface ServerRpcClientConfig {
+	readonly url: string;
+}
+
+/**
+ * Create a server-side RPC client that only supports query promises.
+ * Uses `ConvexHttpClientLayer` (HTTP only, no WebSocket).
+ * Intended for use in Next.js server components and route handlers.
+ *
+ * Only query endpoints are exposed (mutations/actions are excluded).
+ * Each endpoint has a single method: `queryPromise(payload) => Promise<Success>`.
+ */
+export function createServerRpcQuery<
+	TModule extends AnyRpcModule,
+	Shared extends Record<string, unknown> = {},
+>(
+	convexApi: ConvexApiModule,
+	config: ServerRpcClientConfig,
+	getShared: () => Shared = () => ({}) as Shared,
+): ServerRpcModuleClient<TModule, Shared> {
+	const httpLayer = ConvexHttpClientLayer(config.url);
+
+	const cache = new Map<string, ServerQueryEndpoint<unknown, unknown>>();
+
+	const getEndpoint = (prop: string): ServerQueryEndpoint<unknown, unknown> => {
+		let endpoint = cache.get(prop);
+		if (!endpoint) {
+			const convexFn = convexApi[prop];
+			if (!convexFn) {
+				throw new Error(`No Convex function found for endpoint "${prop}"`);
+			}
+			endpoint = {
+				queryPromise: (payload: unknown) => {
+					const fullPayload = { ...getShared(), ...(payload as object) };
+					const effect = createQueryEffect(
+						prop,
+						convexFn as FunctionReference<"query">,
+						fullPayload,
+						false,
+					).pipe(Effect.provide(httpLayer));
+					return Effect.runPromise(effect);
+				},
+			};
+			cache.set(prop, endpoint);
+		}
+		return endpoint;
+	};
+
+	const proxy = new Proxy({} as Record<string, ServerQueryEndpoint<unknown, unknown>>, {
+		get(_target, prop) {
+			if (prop === "then") return undefined;
+			if (typeof prop !== "string") return undefined;
+			return getEndpoint(prop);
+		},
+	});
+
+	return proxy as ServerRpcModuleClient<TModule, Shared>;
+}
+
+// ---------------------------------------------------------------------------
+// React hook: merge server-fetched data with real-time subscription
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge server-fetched initial data with a real-time Confect RPC subscription.
+ *
+ * Use this in client components that receive server data via `use(promise)`
+ * (React Suspense) and also subscribe for live updates. The hook returns the
+ * latest subscription value when available, falling back to `initialData`.
+ *
+ * No `useEffect`, no `useState` — pure derivation in the render path.
+ *
+ * The subscription atom from `client.X.subscription(...)` is typed as
+ * `Atom<Result<unknown, unknown>>` because the RPC proxy loses generic info.
+ * The type of `initialData` anchors the return type: both the server query
+ * and the subscription call the same RPC endpoint, so the shapes match at
+ * runtime.
+ *
+ * @example
+ * ```tsx
+ * const initialData = use(serverPromise); // suspends
+ * const prAtom = useMemo(() => client.getPr.subscription({ ... }), [...]);
+ * const pr = useSubscriptionWithInitial(prAtom, initialData);
+ * ```
+ */
+export function useSubscriptionWithInitial<T>(
+	subscriptionAtom: Atom.Atom<Result.Result<unknown, unknown>>,
+	initialData: T,
+): T {
+	const result = useAtomValue(subscriptionAtom);
+
+	if (ResultModule.isInitial(result)) {
+		return initialData;
+	}
+
+	const valueOption = ResultModule.value(result);
+	if (Option.isSome(valueOption)) {
+		// Safe: the subscription and server query call the same RPC endpoint,
+		// so the runtime value matches T. The proxy erases the generic, but
+		// the hook restores type safety at its boundary.
+		return valueOption.value as T;
+	}
+
+	return initialData;
 }

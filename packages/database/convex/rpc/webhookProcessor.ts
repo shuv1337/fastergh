@@ -1,6 +1,7 @@
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
 import { Effect, Match, Option, Schema } from "effect";
-import { ConfectMutationCtx, confectSchema } from "../confect";
+import { internal } from "../_generated/api";
+import { ConfectMutationCtx, ConfectQueryCtx, confectSchema } from "../confect";
 import {
 	appendActivityFeedEntry,
 	updateAllProjections,
@@ -751,6 +752,238 @@ const extractActivityInfo = (
 };
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Maximum events to process per batch invocation (stay within mutation budget) */
+const BATCH_SIZE = 50;
+
+/** Maximum processing attempts before dead-lettering */
+const MAX_ATTEMPTS = 5;
+
+/** Base backoff delay in ms — actual delay = BACKOFF_BASE_MS * 2^(attempt-1) */
+const BACKOFF_BASE_MS = 1_000;
+
+// ---------------------------------------------------------------------------
+// Retry / backoff helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute next retry timestamp using exponential backoff with jitter.
+ * attempt is 1-based (the attempt that just failed).
+ */
+const computeNextRetryAt = (attempt: number): number => {
+	const exponential = BACKOFF_BASE_MS * 2 ** (attempt - 1);
+	// Add up to 25 % jitter so retries don't thundering-herd
+	const jitter = Math.floor(Math.random() * exponential * 0.25);
+	return Date.now() + exponential + jitter;
+};
+
+// ---------------------------------------------------------------------------
+// Shared post-success logic: activity feed + projections
+// ---------------------------------------------------------------------------
+
+/** PR actions that should trigger a file diff sync */
+const PR_SYNC_ACTIONS = new Set(["opened", "synchronize", "reopened"]);
+
+// ---------------------------------------------------------------------------
+// Write-operation reconciliation — map webhook events to write op types
+// ---------------------------------------------------------------------------
+
+type WriteOpType =
+	| "create_issue"
+	| "create_comment"
+	| "update_issue_state"
+	| "merge_pull_request";
+
+/**
+ * Determine if a webhook event corresponds to a write operation we may have initiated.
+ * Returns { operationType, entityNumber } if so, null otherwise.
+ */
+const matchWriteOperation = (
+	eventName: string,
+	action: string | null,
+	payload: Record<string, unknown>,
+): { operationType: WriteOpType; entityNumber: number } | null => {
+	if (eventName === "issues" && action === "opened") {
+		const issue = obj(payload.issue);
+		const issueNumber = num(issue.number);
+		if (issueNumber !== null) {
+			return { operationType: "create_issue", entityNumber: issueNumber };
+		}
+	}
+	if (eventName === "issue_comment" && action === "created") {
+		const issue = obj(payload.issue);
+		const issueNumber = num(issue.number);
+		if (issueNumber !== null) {
+			return { operationType: "create_comment", entityNumber: issueNumber };
+		}
+	}
+	if (
+		eventName === "issues" &&
+		(action === "closed" || action === "reopened")
+	) {
+		const issue = obj(payload.issue);
+		const issueNumber = num(issue.number);
+		if (issueNumber !== null) {
+			return {
+				operationType: "update_issue_state",
+				entityNumber: issueNumber,
+			};
+		}
+	}
+	if (eventName === "pull_request" && action === "closed") {
+		const pr = obj(payload.pull_request);
+		const prNumber = num(pr.number);
+		const merged = pr.merged === true;
+		if (prNumber !== null && merged) {
+			return { operationType: "merge_pull_request", entityNumber: prNumber };
+		}
+		// Also handle close-without-merge as update_issue_state
+		if (prNumber !== null && !merged) {
+			return { operationType: "update_issue_state", entityNumber: prNumber };
+		}
+	}
+	if (
+		eventName === "pull_request" &&
+		(action === "reopened" || action === "closed")
+	) {
+		const pr = obj(payload.pull_request);
+		const prNumber = num(pr.number);
+		if (prNumber !== null) {
+			return { operationType: "update_issue_state", entityNumber: prNumber };
+		}
+	}
+	return null;
+};
+
+/**
+ * Try to confirm a matching write operation when a webhook arrives.
+ */
+const reconcileWriteOperation = (
+	eventName: string,
+	action: string | null,
+	payload: Record<string, unknown>,
+	repositoryId: number,
+) =>
+	Effect.gen(function* () {
+		const match = matchWriteOperation(eventName, action, payload);
+		if (match === null) return;
+
+		const ctx = yield* ConfectMutationCtx;
+
+		// Find the most recent pending or completed write op for this entity
+		const ops = yield* ctx.db
+			.query("github_write_operations")
+			.withIndex(
+				"by_repositoryId_and_operationType_and_githubEntityNumber",
+				(q) =>
+					q
+						.eq("repositoryId", repositoryId)
+						.eq("operationType", match.operationType)
+						.eq("githubEntityNumber", match.entityNumber),
+			)
+			.order("desc")
+			.take(5);
+
+		for (const op of ops) {
+			if (op.state === "pending" || op.state === "completed") {
+				yield* ctx.db.patch(op._id, {
+					state: "confirmed",
+					updatedAt: Date.now(),
+				});
+				break;
+			}
+		}
+	});
+
+const afterSuccessfulProcessing = (
+	event: {
+		eventName: string;
+		action: string | null;
+		installationId: number | null;
+	},
+	payload: Record<string, unknown>,
+	repositoryId: number,
+) =>
+	Effect.gen(function* () {
+		const activityInfo = extractActivityInfo(
+			event.eventName,
+			event.action,
+			payload,
+		);
+		if (activityInfo !== null) {
+			yield* appendActivityFeedEntry(
+				repositoryId,
+				event.installationId ?? 0,
+				activityInfo.activityType,
+				activityInfo.title,
+				activityInfo.description,
+				activityInfo.actorLogin,
+				activityInfo.actorAvatarUrl,
+				activityInfo.entityNumber,
+			).pipe(Effect.ignoreLogged);
+		}
+
+		yield* updateAllProjections(repositoryId).pipe(Effect.ignoreLogged);
+
+		// Schedule PR file diff sync for relevant PR events
+		if (
+			event.eventName === "pull_request" &&
+			event.action !== null &&
+			PR_SYNC_ACTIONS.has(event.action)
+		) {
+			yield* schedulePrFileSync(payload, repositoryId).pipe(
+				Effect.ignoreLogged,
+			);
+		}
+
+		// Reconcile write operations — confirm pending/completed ops when webhook arrives
+		yield* reconcileWriteOperation(
+			event.eventName,
+			event.action,
+			payload,
+			repositoryId,
+		).pipe(Effect.ignoreLogged);
+	});
+
+/**
+ * Schedule a syncPrFiles action for a pull request event.
+ * Extracts owner/name/number/headSha from the payload and uses
+ * ctx.scheduler.runAfter to trigger the action asynchronously.
+ */
+const schedulePrFileSync = (
+	payload: Record<string, unknown>,
+	repositoryId: number,
+) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const pr = obj(payload.pull_request);
+		const repo = obj(payload.repository);
+		const prNumber = num(pr.number);
+		const headObj = obj(pr.head);
+		const headSha = str(headObj.sha);
+		const fullName = str(repo.full_name);
+
+		if (prNumber === null || !headSha || !fullName) return;
+
+		const parts = fullName.split("/");
+		if (parts.length !== 2) return;
+		const ownerLogin = parts[0];
+		const name = parts[1];
+
+		yield* Effect.promise(() =>
+			ctx.scheduler.runAfter(0, internal.rpc.githubActions.syncPrFiles, {
+				ownerLogin,
+				name,
+				repositoryId,
+				pullRequestNumber: prNumber,
+				headSha,
+			}),
+		);
+	});
+
+// ---------------------------------------------------------------------------
 // Processor — dispatches raw webhook events to appropriate handlers
 // ---------------------------------------------------------------------------
 
@@ -758,6 +991,7 @@ const extractActivityInfo = (
  * Process a single raw webhook event.
  * Reads the event from github_webhook_events_raw by deliveryId,
  * dispatches to the appropriate handler, and marks the event as processed.
+ * On failure, applies retry with exponential backoff, or dead-letters after MAX_ATTEMPTS.
  */
 const processWebhookEventDef = factory.internalMutation({
 	payload: {
@@ -771,37 +1005,65 @@ const processWebhookEventDef = factory.internalMutation({
 });
 
 /**
- * Process all pending webhook events.
- * Iterates through events with processState="pending" and processes each one.
+ * Process a batch of pending webhook events.
+ * Iterates through events with processState="pending" (oldest first, up to BATCH_SIZE).
+ *
+ * For each event:
+ * - Success → mark "processed", update activity feed + projections
+ * - Failure with attempts < MAX_ATTEMPTS → mark "retry" with exponential backoff
+ * - Failure with attempts >= MAX_ATTEMPTS → move to dead letters
  */
 const processAllPendingDef = factory.internalMutation({
 	success: Schema.Struct({
 		processed: Schema.Number,
-		failed: Schema.Number,
+		retried: Schema.Number,
+		deadLettered: Schema.Number,
 	}),
 });
+
+/**
+ * Promote retry events whose backoff window has elapsed back to "pending".
+ * Called by the cron on a regular cadence so they get re-processed.
+ */
+const promoteRetryEventsDef = factory.internalMutation({
+	success: Schema.Struct({
+		promoted: Schema.Number,
+	}),
+});
+
+/**
+ * Get queue health metrics for operational visibility.
+ */
+const getQueueHealthDef = factory.internalQuery({
+	success: Schema.Struct({
+		pending: Schema.Number,
+		retry: Schema.Number,
+		failed: Schema.Number,
+		deadLetters: Schema.Number,
+		recentProcessed: Schema.Number,
+	}),
+});
+
+// ---------------------------------------------------------------------------
+// Implementations
+// ---------------------------------------------------------------------------
 
 processWebhookEventDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 
-		// Look up the raw event
 		const rawEvent = yield* ctx.db
 			.query("github_webhook_events_raw")
 			.withIndex("by_deliveryId", (q) => q.eq("deliveryId", args.deliveryId))
 			.first();
 
 		if (Option.isNone(rawEvent)) {
-			return {
-				processed: false,
-				eventName: "unknown",
-				action: null,
-			};
+			return { processed: false, eventName: "unknown", action: null };
 		}
 
 		const event = rawEvent.value;
 
-		// Skip if already processed
+		// Skip already-processed
 		if (event.processState === "processed") {
 			return {
 				processed: true,
@@ -813,11 +1075,9 @@ processWebhookEventDef.implement((args) =>
 		const payload: Record<string, unknown> = JSON.parse(event.payloadJson);
 		const repositoryId = event.repositoryId;
 
-		// Skip events without a repository
+		// Events without a repository → mark processed immediately
 		if (repositoryId === null) {
-			yield* ctx.db.patch(event._id, {
-				processState: "processed",
-			});
+			yield* ctx.db.patch(event._id, { processState: "processed" });
 			return {
 				processed: true,
 				eventName: event.eventName,
@@ -825,54 +1085,49 @@ processWebhookEventDef.implement((args) =>
 			};
 		}
 
-		// Dispatch to handler based on event name
-		yield* dispatchHandler(event.eventName, payload, repositoryId).pipe(
+		const nextAttempt = event.processAttempts + 1;
+
+		const succeeded = yield* dispatchHandler(
+			event.eventName,
+			payload,
+			repositoryId,
+		).pipe(
+			Effect.map(() => true),
 			Effect.catchAll((error) =>
 				Effect.gen(function* () {
-					// Mark as failed
-					yield* ctx.db.patch(event._id, {
-						processState: "failed",
-						processError: String(error),
-					});
+					if (nextAttempt >= MAX_ATTEMPTS) {
+						// Dead-letter: move to dead_letters table
+						yield* ctx.db.insert("github_dead_letters", {
+							deliveryId: event.deliveryId,
+							reason: `Exhausted ${MAX_ATTEMPTS} attempts. Last error: ${String(error)}`,
+							payloadJson: event.payloadJson,
+							createdAt: Date.now(),
+						});
+						yield* ctx.db.delete(event._id);
+					} else {
+						// Retry: exponential backoff
+						yield* ctx.db.patch(event._id, {
+							processState: "retry",
+							processError: String(error),
+							processAttempts: nextAttempt,
+							nextRetryAt: computeNextRetryAt(nextAttempt),
+						});
+					}
+					return false;
 				}),
 			),
 		);
 
-		// Mark as processed (if not already failed above)
-		const currentState = yield* ctx.db.get(event._id);
-		if (
-			Option.isSome(currentState) &&
-			currentState.value.processState !== "failed"
-		) {
+		if (succeeded) {
 			yield* ctx.db.patch(event._id, {
 				processState: "processed",
+				processAttempts: nextAttempt,
 			});
-
-			// Append activity feed entry
-			const activityInfo = extractActivityInfo(
-				event.eventName,
-				event.action,
-				payload,
-			);
-			if (activityInfo !== null) {
-				yield* appendActivityFeedEntry(
-					repositoryId,
-					event.installationId ?? 0,
-					activityInfo.activityType,
-					activityInfo.title,
-					activityInfo.description,
-					activityInfo.actorLogin,
-					activityInfo.actorAvatarUrl,
-					activityInfo.entityNumber,
-				).pipe(Effect.ignoreLogged);
-			}
-
-			// Update projections after successful processing
-			yield* updateAllProjections(repositoryId).pipe(Effect.ignoreLogged);
+			yield* afterSuccessfulProcessing(event, payload, repositoryId);
 		}
 
 		return {
-			processed: true,
+			processed: succeeded,
 			eventName: event.eventName,
 			action: event.action,
 		};
@@ -883,28 +1138,30 @@ processAllPendingDef.implement(() =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		let processed = 0;
-		let failed = 0;
+		let retried = 0;
+		let deadLettered = 0;
 
 		const pendingEvents = yield* ctx.db
 			.query("github_webhook_events_raw")
 			.withIndex("by_processState_and_receivedAt", (q) =>
 				q.eq("processState", "pending"),
 			)
-			.take(100);
+			.take(BATCH_SIZE);
 
 		for (const event of pendingEvents) {
 			const payload: Record<string, unknown> = JSON.parse(event.payloadJson);
 			const repositoryId = event.repositoryId;
 
+			// Events without a repo → mark processed
 			if (repositoryId === null) {
-				yield* ctx.db.patch(event._id, {
-					processState: "processed",
-				});
+				yield* ctx.db.patch(event._id, { processState: "processed" });
 				processed++;
 				continue;
 			}
 
-			const result = yield* dispatchHandler(
+			const nextAttempt = event.processAttempts + 1;
+
+			const succeeded = yield* dispatchHandler(
 				event.eventName,
 				payload,
 				repositoryId,
@@ -912,60 +1169,148 @@ processAllPendingDef.implement(() =>
 				Effect.map(() => true),
 				Effect.catchAll((error) =>
 					Effect.gen(function* () {
-						yield* ctx.db.patch(event._id, {
-							processState: "failed",
-							processError: String(error),
-						});
+						if (nextAttempt >= MAX_ATTEMPTS) {
+							// Dead-letter
+							yield* ctx.db.insert("github_dead_letters", {
+								deliveryId: event.deliveryId,
+								reason: `Exhausted ${MAX_ATTEMPTS} attempts. Last error: ${String(error)}`,
+								payloadJson: event.payloadJson,
+								createdAt: Date.now(),
+							});
+							yield* ctx.db.delete(event._id);
+							deadLettered++;
+						} else {
+							// Retry with backoff
+							yield* ctx.db.patch(event._id, {
+								processState: "retry",
+								processError: String(error),
+								processAttempts: nextAttempt,
+								nextRetryAt: computeNextRetryAt(nextAttempt),
+							});
+							retried++;
+						}
 						return false;
 					}),
 				),
 			);
 
-			if (result) {
+			if (succeeded) {
 				yield* ctx.db.patch(event._id, {
 					processState: "processed",
+					processAttempts: nextAttempt,
 				});
-
-				// Append activity feed entry
-				const activityInfo = extractActivityInfo(
-					event.eventName,
-					event.action,
-					payload,
-				);
-				if (activityInfo !== null) {
-					yield* appendActivityFeedEntry(
-						repositoryId,
-						event.installationId ?? 0,
-						activityInfo.activityType,
-						activityInfo.title,
-						activityInfo.description,
-						activityInfo.actorLogin,
-						activityInfo.actorAvatarUrl,
-						activityInfo.entityNumber,
-					).pipe(Effect.ignoreLogged);
-				}
-
-				// Update projections after successful processing
-				yield* updateAllProjections(repositoryId).pipe(Effect.ignoreLogged);
+				yield* afterSuccessfulProcessing(event, payload, repositoryId);
 				processed++;
-			} else {
-				failed++;
 			}
 		}
 
-		return { processed, failed };
+		// Structured log for operational visibility
+		if (processed > 0 || retried > 0 || deadLettered > 0) {
+			console.info(
+				`[webhookProcessor] processAllPending: processed=${processed} retried=${retried} deadLettered=${deadLettered} batchSize=${pendingEvents.length}`,
+			);
+		}
+
+		return { processed, retried, deadLettered };
 	}),
 );
+
+promoteRetryEventsDef.implement(() =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const now = Date.now();
+		let promoted = 0;
+
+		// Find retry events whose backoff window has elapsed
+		const retryEvents = yield* ctx.db
+			.query("github_webhook_events_raw")
+			.withIndex("by_processState_and_nextRetryAt", (q) =>
+				q.eq("processState", "retry").lte("nextRetryAt", now),
+			)
+			.take(BATCH_SIZE);
+
+		for (const event of retryEvents) {
+			yield* ctx.db.patch(event._id, {
+				processState: "pending",
+				nextRetryAt: null,
+			});
+			promoted++;
+		}
+
+		if (promoted > 0) {
+			console.info(
+				`[webhookProcessor] promoteRetryEvents: promoted=${promoted}`,
+			);
+		}
+
+		return { promoted };
+	}),
+);
+
+getQueueHealthDef.implement(() =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectQueryCtx;
+
+		// Bounded counts — actionable queues (pending/retry/failed) should be small.
+		// Use .take(10001) + cap at 10000 to avoid unbounded reads.
+		const boundedCount = (
+			state: "pending" | "processed" | "failed" | "retry",
+		) =>
+			ctx.db
+				.query("github_webhook_events_raw")
+				.withIndex("by_processState_and_receivedAt", (q) =>
+					q.eq("processState", state),
+				)
+				.take(10001)
+				.pipe(Effect.map((items) => Math.min(items.length, 10000)));
+
+		const pending = yield* boundedCount("pending");
+		const retry = yield* boundedCount("retry");
+		const failed = yield* boundedCount("failed");
+
+		const deadLetters = yield* ctx.db
+			.query("github_dead_letters")
+			.take(10001)
+			.pipe(Effect.map((items) => Math.min(items.length, 10000)));
+
+		const oneHourAgo = Date.now() - 3_600_000;
+		const recentProcessed = yield* ctx.db
+			.query("github_webhook_events_raw")
+			.withIndex("by_processState_and_receivedAt", (q) =>
+				q.eq("processState", "processed").gte("receivedAt", oneHourAgo),
+			)
+			.take(10001)
+			.pipe(Effect.map((items) => Math.min(items.length, 10000)));
+
+		return {
+			pending,
+			retry,
+			failed,
+			deadLetters,
+			recentProcessed,
+		};
+	}),
+);
+
+// ---------------------------------------------------------------------------
+// Module
+// ---------------------------------------------------------------------------
 
 const webhookProcessorModule = makeRpcModule(
 	{
 		processWebhookEvent: processWebhookEventDef,
 		processAllPending: processAllPendingDef,
+		promoteRetryEvents: promoteRetryEventsDef,
+		getQueueHealth: getQueueHealthDef,
 	},
 	{ middlewares: DatabaseRpcTelemetryLayer },
 );
 
-export const { processWebhookEvent, processAllPending } =
-	webhookProcessorModule.handlers;
+export const {
+	processWebhookEvent,
+	processAllPending,
+	promoteRetryEvents,
+	getQueueHealth,
+} = webhookProcessorModule.handlers;
 export { webhookProcessorModule };
 export type WebhookProcessorModule = typeof webhookProcessorModule;

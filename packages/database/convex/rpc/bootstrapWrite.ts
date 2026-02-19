@@ -1,6 +1,7 @@
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
 import { Effect, Option, Schema } from "effect";
 import { ConfectMutationCtx, confectSchema } from "../confect";
+import { updateAllProjections } from "../shared/projections";
 import { DatabaseRpcTelemetryLayer } from "./telemetry";
 
 const factory = createRpcFactory({ schema: confectSchema });
@@ -430,6 +431,14 @@ updateSyncJobStateDef.implement((args) =>
 			attemptCount: job.value.attemptCount + 1,
 			updatedAt: now,
 		});
+
+		// When bootstrap completes, rebuild all view tables so the repo
+		// appears in the dashboard immediately.
+		if (args.state === "done" && job.value.repositoryId !== null) {
+			yield* updateAllProjections(job.value.repositoryId).pipe(
+				Effect.ignoreLogged,
+			);
+		}
 
 		return { updated: true };
 	}),

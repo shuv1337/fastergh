@@ -38,7 +38,7 @@ const makeRawEvent = (overrides: {
 	action?: string;
 	repositoryId: number;
 	payloadJson: string;
-	processState?: "pending" | "processed" | "failed";
+	processState?: "pending" | "processed" | "failed" | "retry";
 }) => ({
 	deliveryId: overrides.deliveryId,
 	eventName: overrides.eventName,
@@ -50,6 +50,8 @@ const makeRawEvent = (overrides: {
 	receivedAt: Date.now(),
 	processState: overrides.processState ?? "pending",
 	processError: null,
+	processAttempts: 0,
+	nextRetryAt: null,
 });
 
 /** Build a minimal GitHub issue webhook payload */
@@ -152,6 +154,107 @@ const makePushPayload = (opts: {
 		deleted: opts.deleted ?? false,
 		commits: opts.commits ?? [],
 		sender: { id: 1001, login: "testuser", avatar_url: null, type: "User" },
+	});
+
+/** Build a minimal check_run webhook payload */
+const makeCheckRunPayload = (opts: {
+	action: string;
+	checkRunId: number;
+	name: string;
+	headSha: string;
+	status: string;
+	conclusion?: string;
+	startedAt?: string;
+	completedAt?: string;
+}) =>
+	JSON.stringify({
+		action: opts.action,
+		check_run: {
+			id: opts.checkRunId,
+			name: opts.name,
+			head_sha: opts.headSha,
+			status: opts.status,
+			conclusion: opts.conclusion ?? null,
+			started_at: opts.startedAt ?? "2026-02-18T10:00:00Z",
+			completed_at: opts.completedAt ?? null,
+		},
+		sender: { id: 1001, login: "testuser", avatar_url: null, type: "User" },
+	});
+
+/** Build a minimal issue_comment webhook payload */
+const makeIssueCommentPayload = (opts: {
+	action: string;
+	commentId: number;
+	issueNumber: number;
+	issueTitle?: string;
+	body: string;
+	createdAt?: string;
+	updatedAt?: string;
+	user?: { id: number; login: string; avatar_url?: string; type?: string };
+	isPullRequest?: boolean;
+}) =>
+	JSON.stringify({
+		action: opts.action,
+		comment: {
+			id: opts.commentId,
+			body: opts.body,
+			user: opts.user ?? {
+				id: 1001,
+				login: "testuser",
+				avatar_url: null,
+				type: "User",
+			},
+			created_at: opts.createdAt ?? "2026-02-18T10:00:00Z",
+			updated_at: opts.updatedAt ?? "2026-02-18T10:00:00Z",
+		},
+		issue: {
+			number: opts.issueNumber,
+			title: opts.issueTitle ?? `Issue #${opts.issueNumber}`,
+			...(opts.isPullRequest ? { pull_request: {} } : {}),
+		},
+		sender: opts.user ?? {
+			id: 1001,
+			login: "testuser",
+			avatar_url: null,
+			type: "User",
+		},
+	});
+
+/** Build a minimal pull_request_review webhook payload */
+const makePrReviewPayload = (opts: {
+	action: string;
+	reviewId: number;
+	prNumber: number;
+	prTitle?: string;
+	state: string;
+	submittedAt?: string;
+	commitSha?: string;
+	user?: { id: number; login: string; avatar_url?: string; type?: string };
+}) =>
+	JSON.stringify({
+		action: opts.action,
+		review: {
+			id: opts.reviewId,
+			state: opts.state,
+			user: opts.user ?? {
+				id: 2001,
+				login: "reviewer",
+				avatar_url: null,
+				type: "User",
+			},
+			submitted_at: opts.submittedAt ?? "2026-02-18T11:00:00Z",
+			commit_id: opts.commitSha ?? "sha-review-commit",
+		},
+		pull_request: {
+			number: opts.prNumber,
+			title: opts.prTitle ?? `PR #${opts.prNumber}`,
+		},
+		sender: opts.user ?? {
+			id: 2001,
+			login: "reviewer",
+			avatar_url: null,
+			type: "User",
+		},
 	});
 
 /** Seed a repository in the DB so webhook processing can find it */
@@ -405,6 +508,8 @@ describe("Webhook Processing", () => {
 						receivedAt: Date.now(),
 						processState: "pending",
 						processError: null,
+						processAttempts: 0,
+						nextRetryAt: null,
 					});
 				}),
 			);
@@ -1060,6 +1165,1736 @@ describe("Branch Events", () => {
 
 			const branches = yield* collectTable(t, "github_branches");
 			expect(branches).toHaveLength(0);
+		}),
+	);
+});
+
+// ---------------------------------------------------------------------------
+// PR Diff Pipeline Tests
+// ---------------------------------------------------------------------------
+
+describe("PR Diff Pipeline", () => {
+	it.effect("upsertPrFiles inserts new file records", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			const result = yield* Effect.promise(() =>
+				t.mutation(internal.rpc.githubActions.upsertPrFiles, {
+					repositoryId,
+					pullRequestNumber: 42,
+					headSha: "sha-abc123",
+					files: [
+						{
+							filename: "src/index.ts",
+							status: "modified",
+							additions: 10,
+							deletions: 3,
+							changes: 13,
+							patch: "@@ -1,5 +1,12 @@\n+new line",
+							previousFilename: null,
+						},
+						{
+							filename: "README.md",
+							status: "added",
+							additions: 20,
+							deletions: 0,
+							changes: 20,
+							patch: "@@ -0,0 +1,20 @@\n+# README",
+							previousFilename: null,
+						},
+					],
+				}),
+			);
+			const value = assertSuccess(result);
+			expect(value).toMatchObject({ upserted: 2 });
+
+			const files = yield* collectTable<{
+				filename: string;
+				status: string;
+				headSha: string;
+			}>(t, "github_pull_request_files");
+			expect(files).toHaveLength(2);
+			expect(files.map((f) => f.filename).sort()).toEqual([
+				"README.md",
+				"src/index.ts",
+			]);
+		}),
+	);
+
+	it.effect("upsertPrFiles updates existing file records (idempotent)", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// Insert first
+			yield* Effect.promise(() =>
+				t.mutation(internal.rpc.githubActions.upsertPrFiles, {
+					repositoryId,
+					pullRequestNumber: 42,
+					headSha: "sha-v1",
+					files: [
+						{
+							filename: "src/index.ts",
+							status: "modified",
+							additions: 5,
+							deletions: 1,
+							changes: 6,
+							patch: "old patch",
+							previousFilename: null,
+						},
+					],
+				}),
+			);
+
+			// Update with new headSha
+			const result = yield* Effect.promise(() =>
+				t.mutation(internal.rpc.githubActions.upsertPrFiles, {
+					repositoryId,
+					pullRequestNumber: 42,
+					headSha: "sha-v2",
+					files: [
+						{
+							filename: "src/index.ts",
+							status: "modified",
+							additions: 10,
+							deletions: 3,
+							changes: 13,
+							patch: "new patch",
+							previousFilename: null,
+						},
+					],
+				}),
+			);
+			const value = assertSuccess(result);
+			expect(value).toMatchObject({ upserted: 1 });
+
+			// Should still be 1 file (updated, not duplicated)
+			const files = yield* collectTable<{
+				filename: string;
+				headSha: string;
+				additions: number;
+			}>(t, "github_pull_request_files");
+			expect(files).toHaveLength(1);
+			expect(files[0]).toMatchObject({
+				filename: "src/index.ts",
+				headSha: "sha-v2",
+				additions: 10,
+			});
+		}),
+	);
+
+	it.effect("listPrFiles returns files for a PR", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// Seed a PR in domain table (required for listPrFiles to find headSha)
+			yield* Effect.promise(() =>
+				t.run(async (ctx) => {
+					await ctx.db.insert("github_pull_requests", {
+						repositoryId,
+						githubPrId: 6042,
+						number: 42,
+						state: "open",
+						draft: false,
+						title: "Test PR",
+						body: null,
+						authorUserId: 1001,
+						assigneeUserIds: [],
+						requestedReviewerUserIds: [],
+						baseRefName: "main",
+						headRefName: "feature",
+						headSha: "sha-abc123",
+						mergeableState: null,
+						mergedAt: null,
+						closedAt: null,
+						githubUpdatedAt: Date.now(),
+						cachedAt: Date.now(),
+					});
+				}),
+			);
+
+			// Insert file records
+			yield* Effect.promise(() =>
+				t.mutation(internal.rpc.githubActions.upsertPrFiles, {
+					repositoryId,
+					pullRequestNumber: 42,
+					headSha: "sha-abc123",
+					files: [
+						{
+							filename: "src/app.ts",
+							status: "modified",
+							additions: 5,
+							deletions: 2,
+							changes: 7,
+							patch: "@@ patch @@",
+							previousFilename: null,
+						},
+					],
+				}),
+			);
+
+			// Query via projection endpoint
+			const result = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listPrFiles, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+					number: 42,
+				}),
+			);
+			const value = assertSuccess(result) as {
+				headSha: string | null;
+				files: Array<{ filename: string }>;
+			};
+			expect(value.headSha).toBe("sha-abc123");
+			expect(value.files).toHaveLength(1);
+			expect(value.files[0]).toMatchObject({ filename: "src/app.ts" });
+		}),
+	);
+
+	it.effect("listPrFiles returns empty for nonexistent PR", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			const result = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listPrFiles, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+					number: 999,
+				}),
+			);
+			const value = assertSuccess(result) as {
+				headSha: string | null;
+				files: Array<unknown>;
+			};
+			expect(value.headSha).toBeNull();
+			expect(value.files).toHaveLength(0);
+		}),
+	);
+
+	it.effect("listPrFiles filters by headSha when provided", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// Insert files for two different SHAs
+			yield* Effect.promise(() =>
+				t.mutation(internal.rpc.githubActions.upsertPrFiles, {
+					repositoryId,
+					pullRequestNumber: 42,
+					headSha: "sha-old",
+					files: [
+						{
+							filename: "old-file.ts",
+							status: "added",
+							additions: 1,
+							deletions: 0,
+							changes: 1,
+							patch: null,
+							previousFilename: null,
+						},
+					],
+				}),
+			);
+
+			// Insert a second file with different SHA and different filename
+			yield* Effect.promise(() =>
+				t.run(async (ctx) => {
+					await ctx.db.insert("github_pull_request_files", {
+						repositoryId,
+						pullRequestNumber: 42,
+						headSha: "sha-new",
+						filename: "new-file.ts",
+						status: "added",
+						additions: 5,
+						deletions: 0,
+						changes: 5,
+						patch: null,
+						previousFilename: null,
+						cachedAt: Date.now(),
+					});
+				}),
+			);
+
+			const result = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listPrFiles, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+					number: 42,
+					headSha: "sha-new",
+				}),
+			);
+			const value = assertSuccess(result) as {
+				headSha: string | null;
+				files: Array<{ filename: string }>;
+			};
+			expect(value.headSha).toBe("sha-new");
+			expect(value.files).toHaveLength(1);
+			expect(value.files[0]).toMatchObject({ filename: "new-file.ts" });
+		}),
+	);
+
+	it.effect("webhook processing triggers PR file sync scheduling", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// Process a PR opened event
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-pr-files-trigger",
+					eventName: "pull_request",
+					action: "opened",
+					repositoryId,
+					payloadJson: makePrPayload({
+						action: "opened",
+						prId: 6099,
+						number: 99,
+						state: "open",
+						title: "PR that triggers file sync",
+						headSha: "sha-trigger",
+					}),
+				}),
+			);
+			const result = yield* processEvent(t, "delivery-pr-files-trigger");
+			assertSuccess(result);
+
+			// The PR should be created in the domain table
+			const prs = yield* collectTable<{
+				number: number;
+				headSha: string;
+			}>(t, "github_pull_requests");
+			expect(prs).toHaveLength(1);
+			expect(prs[0]).toMatchObject({
+				number: 99,
+				headSha: "sha-trigger",
+			});
+
+			// Note: The scheduler.runAfter for syncPrFiles is called but
+			// convex-test doesn't execute scheduled actions. We verify the
+			// PR was created which is the prerequisite for file sync.
+		}),
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Optimistic Write Operations Tests
+// ---------------------------------------------------------------------------
+
+describe("Optimistic Write Operations", () => {
+	it.effect("createIssue mutation creates a pending write operation", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			const result = yield* Effect.promise(() =>
+				t.mutation(api.rpc.githubWrite.createIssue, {
+					correlationId: "corr-issue-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					title: "New issue from UI",
+				}),
+			);
+			const value = assertSuccess(result);
+			expect(value).toMatchObject({
+				correlationId: "corr-issue-1",
+			});
+
+			const ops = yield* collectTable<{
+				correlationId: string;
+				operationType: string;
+				state: string;
+				ownerLogin: string;
+				repoName: string;
+			}>(t, "github_write_operations");
+			expect(ops).toHaveLength(1);
+			expect(ops[0]).toMatchObject({
+				correlationId: "corr-issue-1",
+				operationType: "create_issue",
+				state: "pending",
+				ownerLogin: "testowner",
+				repoName: "testrepo",
+			});
+		}),
+	);
+
+	it.effect("createComment mutation creates a pending write operation", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			const result = yield* Effect.promise(() =>
+				t.mutation(api.rpc.githubWrite.createComment, {
+					correlationId: "corr-comment-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					number: 1,
+					body: "A comment from UI",
+				}),
+			);
+			const value = assertSuccess(result);
+			expect(value).toMatchObject({
+				correlationId: "corr-comment-1",
+			});
+
+			const ops = yield* collectTable<{
+				operationType: string;
+				state: string;
+			}>(t, "github_write_operations");
+			expect(ops).toHaveLength(1);
+			expect(ops[0]).toMatchObject({
+				operationType: "create_comment",
+				state: "pending",
+			});
+		}),
+	);
+
+	it.effect("markWriteCompleted transitions pending → completed", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// Create a pending write op
+			yield* Effect.promise(() =>
+				t.mutation(api.rpc.githubWrite.createIssue, {
+					correlationId: "corr-complete-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					title: "Issue to complete",
+				}),
+			);
+
+			const result = yield* Effect.promise(() =>
+				t.mutation(internal.rpc.githubWrite.markWriteCompleted, {
+					correlationId: "corr-complete-1",
+					resultDataJson: JSON.stringify({
+						number: 99,
+						htmlUrl: "https://github.com/testowner/testrepo/issues/99",
+					}),
+					githubEntityNumber: 99,
+				}),
+			);
+			const value = assertSuccess(result);
+			expect(value).toMatchObject({ updated: true });
+
+			const ops = yield* collectTable<{
+				correlationId: string;
+				state: string;
+				resultDataJson: string | null;
+				githubEntityNumber: number | null;
+			}>(t, "github_write_operations");
+			expect(ops).toHaveLength(1);
+			expect(ops[0]).toMatchObject({
+				state: "completed",
+				githubEntityNumber: 99,
+			});
+
+			const resultData = JSON.parse(ops[0].resultDataJson ?? "{}");
+			expect(resultData).toMatchObject({ number: 99 });
+		}),
+	);
+
+	it.effect("markWriteFailed transitions pending → failed", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* Effect.promise(() =>
+				t.mutation(api.rpc.githubWrite.createIssue, {
+					correlationId: "corr-fail-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					title: "Failing issue",
+				}),
+			);
+
+			const result = yield* Effect.promise(() =>
+				t.mutation(internal.rpc.githubWrite.markWriteFailed, {
+					correlationId: "corr-fail-1",
+					errorMessage: "Repository not found",
+					errorStatus: 404,
+				}),
+			);
+			const value = assertSuccess(result);
+			expect(value).toMatchObject({ updated: true });
+
+			const ops = yield* collectTable<{
+				state: string;
+				errorMessage: string | null;
+				errorStatus: number | null;
+			}>(t, "github_write_operations");
+			expect(ops).toHaveLength(1);
+			expect(ops[0]).toMatchObject({
+				state: "failed",
+				errorMessage: "Repository not found",
+				errorStatus: 404,
+			});
+		}),
+	);
+
+	it.effect("webhook reconciliation confirms a completed write op", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// Create a pending write op for creating issue #99
+			yield* Effect.promise(() =>
+				t.mutation(api.rpc.githubWrite.createIssue, {
+					correlationId: "corr-confirm-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					title: "Issue to be confirmed",
+				}),
+			);
+
+			// Mark it completed (as if the action succeeded)
+			yield* Effect.promise(() =>
+				t.mutation(internal.rpc.githubWrite.markWriteCompleted, {
+					correlationId: "corr-confirm-1",
+					resultDataJson: JSON.stringify({ number: 99 }),
+					githubEntityNumber: 99,
+				}),
+			);
+
+			// Now simulate the webhook arriving for issues.opened #99
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-confirm-issue-99",
+					eventName: "issues",
+					action: "opened",
+					repositoryId,
+					payloadJson: makeIssuePayload({
+						action: "opened",
+						issueId: 9900,
+						number: 99,
+						state: "open",
+						title: "Issue to be confirmed",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-confirm-issue-99");
+
+			// The write operation should now be "confirmed"
+			const ops = yield* collectTable<{
+				correlationId: string;
+				state: string;
+			}>(t, "github_write_operations");
+			expect(ops).toHaveLength(1);
+			expect(ops[0]).toMatchObject({
+				correlationId: "corr-confirm-1",
+				state: "confirmed",
+			});
+		}),
+	);
+
+	it.effect("listWriteOperations returns ops for a repository", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// Create two write ops
+			yield* Effect.promise(() =>
+				t.mutation(api.rpc.githubWrite.createIssue, {
+					correlationId: "corr-list-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					title: "First issue",
+				}),
+			);
+
+			yield* Effect.promise(() =>
+				t.mutation(api.rpc.githubWrite.createComment, {
+					correlationId: "corr-list-2",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					number: 1,
+					body: "A comment",
+				}),
+			);
+
+			const result = yield* Effect.promise(() =>
+				t.query(api.rpc.githubWrite.listWriteOperations, {
+					repositoryId,
+				}),
+			);
+			const value = assertSuccess(result);
+			const ops = value as Array<{
+				correlationId: string;
+				operationType: string;
+			}>;
+			expect(ops).toHaveLength(2);
+
+			const types = ops.map((o) => o.operationType).sort();
+			expect(types).toEqual(["create_comment", "create_issue"]);
+		}),
+	);
+
+	it.effect("updateIssueState mutation creates a pending write operation", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			const result = yield* Effect.promise(() =>
+				t.mutation(api.rpc.githubWrite.updateIssueState, {
+					correlationId: "corr-close-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					number: 5,
+					state: "closed",
+				}),
+			);
+			const value = assertSuccess(result);
+			expect(value).toMatchObject({
+				correlationId: "corr-close-1",
+			});
+
+			const ops = yield* collectTable<{
+				operationType: string;
+				state: string;
+				githubEntityNumber: number | null;
+			}>(t, "github_write_operations");
+			expect(ops).toHaveLength(1);
+			expect(ops[0]).toMatchObject({
+				operationType: "update_issue_state",
+				state: "pending",
+				githubEntityNumber: 5,
+			});
+
+			const optimistic = JSON.parse(
+				(ops[0] as { optimisticDataJson: string }).optimisticDataJson,
+			);
+			expect(optimistic).toMatchObject({
+				number: 5,
+				state: "closed",
+			});
+		}),
+	);
+
+	it.effect("mergePullRequest mutation creates a pending write operation", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			const result = yield* Effect.promise(() =>
+				t.mutation(api.rpc.githubWrite.mergePullRequest, {
+					correlationId: "corr-merge-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					number: 10,
+					mergeMethod: "squash",
+				}),
+			);
+			const value = assertSuccess(result);
+			expect(value).toMatchObject({
+				correlationId: "corr-merge-1",
+			});
+
+			const ops = yield* collectTable<{
+				operationType: string;
+				state: string;
+				githubEntityNumber: number | null;
+			}>(t, "github_write_operations");
+			expect(ops).toHaveLength(1);
+			expect(ops[0]).toMatchObject({
+				operationType: "merge_pull_request",
+				state: "pending",
+				githubEntityNumber: 10,
+			});
+		}),
+	);
+
+	it.effect("duplicate correlationId is rejected for createIssue", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// First write succeeds
+			yield* Effect.promise(() =>
+				t.mutation(api.rpc.githubWrite.createIssue, {
+					correlationId: "corr-dupe-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					title: "First",
+				}),
+			);
+
+			// Second write with same correlationId
+			const result = yield* Effect.promise(() =>
+				t.mutation(api.rpc.githubWrite.createIssue, {
+					correlationId: "corr-dupe-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					title: "Duplicate",
+				}),
+			);
+
+			// Should be a failure (DuplicateOperationError)
+			const exit = result as { _tag: string; cause?: unknown };
+			expect(exit._tag).toBe("Failure");
+
+			// Only one op should exist
+			const ops = yield* collectTable<{
+				correlationId: string;
+			}>(t, "github_write_operations");
+			expect(ops).toHaveLength(1);
+		}),
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Paginated Query Tests
+// ---------------------------------------------------------------------------
+
+/** Seed N pull request rows directly into the view table */
+const seedPrViewRows = (
+	t: ReturnType<typeof createConvexTest>,
+	repositoryId: number,
+	count: number,
+	stateOverride?: "open" | "closed",
+) =>
+	Effect.promise(() =>
+		t.run(async (ctx) => {
+			for (let i = 1; i <= count; i++) {
+				const state = stateOverride ?? (i % 3 === 0 ? "closed" : "open");
+				await ctx.db.insert("view_repo_pull_request_list", {
+					repositoryId,
+					githubPrId: 6000 + i,
+					number: i,
+					state,
+					draft: false,
+					title: `PR #${i}`,
+					authorLogin: "testuser",
+					authorAvatarUrl: null,
+					headRefName: `feature-${i}`,
+					baseRefName: "main",
+					commentCount: 0,
+					reviewCount: 0,
+					lastCheckConclusion: null,
+					githubUpdatedAt: Date.now() - (count - i) * 1000,
+					sortUpdated: Date.now() - (count - i) * 1000,
+				});
+			}
+		}),
+	);
+
+/** Seed N issue rows directly into the view table */
+const seedIssueViewRows = (
+	t: ReturnType<typeof createConvexTest>,
+	repositoryId: number,
+	count: number,
+	stateOverride?: "open" | "closed",
+) =>
+	Effect.promise(() =>
+		t.run(async (ctx) => {
+			for (let i = 1; i <= count; i++) {
+				const state = stateOverride ?? (i % 4 === 0 ? "closed" : "open");
+				await ctx.db.insert("view_repo_issue_list", {
+					repositoryId,
+					githubIssueId: 5000 + i,
+					number: i,
+					state,
+					title: `Issue #${i}`,
+					authorLogin: "testuser",
+					authorAvatarUrl: null,
+					labelNames: [],
+					commentCount: 0,
+					githubUpdatedAt: Date.now() - (count - i) * 1000,
+					sortUpdated: Date.now() - (count - i) * 1000,
+				});
+			}
+		}),
+	);
+
+/** Seed N activity feed rows directly into the view table */
+const seedActivityViewRows = (
+	t: ReturnType<typeof createConvexTest>,
+	repositoryId: number,
+	count: number,
+) =>
+	Effect.promise(() =>
+		t.run(async (ctx) => {
+			for (let i = 1; i <= count; i++) {
+				await ctx.db.insert("view_activity_feed", {
+					repositoryId,
+					installationId: 0,
+					activityType: "issue.opened",
+					title: `Activity ${i}`,
+					description: null,
+					actorLogin: "testuser",
+					actorAvatarUrl: null,
+					entityNumber: i,
+					createdAt: Date.now() - (count - i) * 1000,
+				});
+			}
+		}),
+	);
+
+describe("Paginated Queries", () => {
+	it.effect(
+		"listPullRequestsPaginated returns first page and continues with cursor",
+		() =>
+			Effect.gen(function* () {
+				const t = createConvexTest();
+				const repositoryId = 12345;
+				yield* seedRepository(t, repositoryId);
+				yield* seedPrViewRows(t, repositoryId, 5);
+
+				// First page: request 2 items
+				const page1Result = yield* Effect.promise(() =>
+					t.query(api.rpc.projectionQueries.listPullRequestsPaginated, {
+						ownerLogin: "testowner",
+						name: "testrepo",
+						cursor: null,
+						numItems: 2,
+					}),
+				);
+				const page1 = assertSuccess(page1Result) as {
+					page: Array<{ number: number }>;
+					isDone: boolean;
+					continueCursor: string;
+				};
+				expect(page1.page).toHaveLength(2);
+				expect(page1.isDone).toBe(false);
+				expect(page1.continueCursor).toBeTruthy();
+
+				// Second page using cursor
+				const page2Result = yield* Effect.promise(() =>
+					t.query(api.rpc.projectionQueries.listPullRequestsPaginated, {
+						ownerLogin: "testowner",
+						name: "testrepo",
+						cursor: page1.continueCursor,
+						numItems: 2,
+					}),
+				);
+				const page2 = assertSuccess(page2Result) as {
+					page: Array<{ number: number }>;
+					isDone: boolean;
+					continueCursor: string;
+				};
+				expect(page2.page).toHaveLength(2);
+
+				// Third page — should have 1 remaining
+				const page3Result = yield* Effect.promise(() =>
+					t.query(api.rpc.projectionQueries.listPullRequestsPaginated, {
+						ownerLogin: "testowner",
+						name: "testrepo",
+						cursor: page2.continueCursor,
+						numItems: 2,
+					}),
+				);
+				const page3 = assertSuccess(page3Result) as {
+					page: Array<{ number: number }>;
+					isDone: boolean;
+					continueCursor: string;
+				};
+				expect(page3.page).toHaveLength(1);
+				expect(page3.isDone).toBe(true);
+
+				// All 5 items seen across pages
+				const allNumbers = [
+					...page1.page.map((p) => p.number),
+					...page2.page.map((p) => p.number),
+					...page3.page.map((p) => p.number),
+				];
+				expect(allNumbers).toHaveLength(5);
+			}),
+	);
+
+	it.effect("listPullRequestsPaginated filters by state", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// 3 open + 2 closed
+			yield* seedPrViewRows(t, repositoryId, 3, "open");
+			yield* seedPrViewRows(t, repositoryId, 2, "closed");
+
+			// Filter open
+			const openResult = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listPullRequestsPaginated, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+					cursor: null,
+					numItems: 10,
+					state: "open",
+				}),
+			);
+			const open = assertSuccess(openResult) as {
+				page: Array<{ state: string }>;
+				isDone: boolean;
+			};
+			expect(open.page).toHaveLength(3);
+			for (const pr of open.page) {
+				expect(pr.state).toBe("open");
+			}
+
+			// Filter closed
+			const closedResult = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listPullRequestsPaginated, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+					cursor: null,
+					numItems: 10,
+					state: "closed",
+				}),
+			);
+			const closed = assertSuccess(closedResult) as {
+				page: Array<{ state: string }>;
+				isDone: boolean;
+			};
+			expect(closed.page).toHaveLength(2);
+			for (const pr of closed.page) {
+				expect(pr.state).toBe("closed");
+			}
+		}),
+	);
+
+	it.effect("listPullRequestsPaginated returns empty for unknown repo", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+
+			const result = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listPullRequestsPaginated, {
+					ownerLogin: "nonexistent",
+					name: "nope",
+					cursor: null,
+					numItems: 10,
+				}),
+			);
+			const value = assertSuccess(result) as {
+				page: Array<unknown>;
+				isDone: boolean;
+			};
+			expect(value.page).toHaveLength(0);
+			expect(value.isDone).toBe(true);
+		}),
+	);
+
+	it.effect(
+		"listIssuesPaginated returns first page and supports state filter",
+		() =>
+			Effect.gen(function* () {
+				const t = createConvexTest();
+				const repositoryId = 12345;
+				yield* seedRepository(t, repositoryId);
+
+				// 4 open + 3 closed
+				yield* seedIssueViewRows(t, repositoryId, 4, "open");
+				yield* seedIssueViewRows(t, repositoryId, 3, "closed");
+
+				// All items
+				const allResult = yield* Effect.promise(() =>
+					t.query(api.rpc.projectionQueries.listIssuesPaginated, {
+						ownerLogin: "testowner",
+						name: "testrepo",
+						cursor: null,
+						numItems: 10,
+					}),
+				);
+				const all = assertSuccess(allResult) as {
+					page: Array<{ number: number; state: string }>;
+					isDone: boolean;
+				};
+				expect(all.page).toHaveLength(7);
+				expect(all.isDone).toBe(true);
+
+				// Filter open only
+				const openResult = yield* Effect.promise(() =>
+					t.query(api.rpc.projectionQueries.listIssuesPaginated, {
+						ownerLogin: "testowner",
+						name: "testrepo",
+						cursor: null,
+						numItems: 10,
+						state: "open",
+					}),
+				);
+				const open = assertSuccess(openResult) as {
+					page: Array<{ state: string }>;
+					isDone: boolean;
+				};
+				expect(open.page).toHaveLength(4);
+				for (const issue of open.page) {
+					expect(issue.state).toBe("open");
+				}
+			}),
+	);
+
+	it.effect("listIssuesPaginated paginates with cursor", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+			yield* seedIssueViewRows(t, repositoryId, 7);
+
+			// Page 1 of 3 items
+			const page1Result = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listIssuesPaginated, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+					cursor: null,
+					numItems: 3,
+				}),
+			);
+			const page1 = assertSuccess(page1Result) as {
+				page: Array<{ number: number }>;
+				isDone: boolean;
+				continueCursor: string;
+			};
+			expect(page1.page).toHaveLength(3);
+			expect(page1.isDone).toBe(false);
+
+			// Page 2
+			const page2Result = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listIssuesPaginated, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+					cursor: page1.continueCursor,
+					numItems: 3,
+				}),
+			);
+			const page2 = assertSuccess(page2Result) as {
+				page: Array<{ number: number }>;
+				isDone: boolean;
+				continueCursor: string;
+			};
+			expect(page2.page).toHaveLength(3);
+
+			// Page 3 — 1 remaining
+			const page3Result = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listIssuesPaginated, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+					cursor: page2.continueCursor,
+					numItems: 3,
+				}),
+			);
+			const page3 = assertSuccess(page3Result) as {
+				page: Array<{ number: number }>;
+				isDone: boolean;
+			};
+			expect(page3.page).toHaveLength(1);
+			expect(page3.isDone).toBe(true);
+		}),
+	);
+
+	it.effect(
+		"listActivityPaginated returns first page and continues with cursor",
+		() =>
+			Effect.gen(function* () {
+				const t = createConvexTest();
+				const repositoryId = 12345;
+				yield* seedRepository(t, repositoryId);
+				yield* seedActivityViewRows(t, repositoryId, 5);
+
+				// First page: request 2 items
+				const page1Result = yield* Effect.promise(() =>
+					t.query(api.rpc.projectionQueries.listActivityPaginated, {
+						ownerLogin: "testowner",
+						name: "testrepo",
+						cursor: null,
+						numItems: 2,
+					}),
+				);
+				const page1 = assertSuccess(page1Result) as {
+					page: Array<{ entityNumber: number }>;
+					isDone: boolean;
+					continueCursor: string;
+				};
+				expect(page1.page).toHaveLength(2);
+				expect(page1.isDone).toBe(false);
+
+				// Second page
+				const page2Result = yield* Effect.promise(() =>
+					t.query(api.rpc.projectionQueries.listActivityPaginated, {
+						ownerLogin: "testowner",
+						name: "testrepo",
+						cursor: page1.continueCursor,
+						numItems: 2,
+					}),
+				);
+				const page2 = assertSuccess(page2Result) as {
+					page: Array<{ entityNumber: number }>;
+					isDone: boolean;
+					continueCursor: string;
+				};
+				expect(page2.page).toHaveLength(2);
+
+				// Third page — 1 remaining
+				const page3Result = yield* Effect.promise(() =>
+					t.query(api.rpc.projectionQueries.listActivityPaginated, {
+						ownerLogin: "testowner",
+						name: "testrepo",
+						cursor: page2.continueCursor,
+						numItems: 2,
+					}),
+				);
+				const page3 = assertSuccess(page3Result) as {
+					page: Array<{ entityNumber: number }>;
+					isDone: boolean;
+				};
+				expect(page3.page).toHaveLength(1);
+				expect(page3.isDone).toBe(true);
+
+				// All 5 activities seen
+				const allNumbers = [
+					...page1.page.map((a) => a.entityNumber),
+					...page2.page.map((a) => a.entityNumber),
+					...page3.page.map((a) => a.entityNumber),
+				];
+				expect(allNumbers).toHaveLength(5);
+			}),
+	);
+
+	it.effect("listActivityPaginated returns empty for nonexistent repo", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+
+			const result = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listActivityPaginated, {
+					ownerLogin: "nonexistent",
+					name: "nope",
+					cursor: null,
+					numItems: 10,
+				}),
+			);
+			const value = assertSuccess(result) as {
+				page: Array<unknown>;
+				isDone: boolean;
+			};
+			expect(value.page).toHaveLength(0);
+			expect(value.isDone).toBe(true);
+		}),
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Check Run Event Tests
+// ---------------------------------------------------------------------------
+
+describe("Check Run Events", () => {
+	it.effect("check_run created event inserts a check run", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-checkrun-created",
+					eventName: "check_run",
+					action: "created",
+					repositoryId,
+					payloadJson: makeCheckRunPayload({
+						action: "created",
+						checkRunId: 8001,
+						name: "CI / Build",
+						headSha: "sha-pr-head",
+						status: "in_progress",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-checkrun-created");
+
+			const checkRuns = yield* collectTable<{
+				githubCheckRunId: number;
+				name: string;
+				headSha: string;
+				status: string;
+				conclusion: string | null;
+			}>(t, "github_check_runs");
+			expect(checkRuns).toHaveLength(1);
+			expect(checkRuns[0]).toMatchObject({
+				githubCheckRunId: 8001,
+				name: "CI / Build",
+				headSha: "sha-pr-head",
+				status: "in_progress",
+				conclusion: null,
+			});
+		}),
+	);
+
+	it.effect("check_run completed event updates status and conclusion", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// First: create the check run
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-checkrun-create-2",
+					eventName: "check_run",
+					action: "created",
+					repositoryId,
+					payloadJson: makeCheckRunPayload({
+						action: "created",
+						checkRunId: 8002,
+						name: "CI / Tests",
+						headSha: "sha-pr-head-2",
+						status: "in_progress",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-checkrun-create-2");
+
+			// Then: complete it
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-checkrun-complete-2",
+					eventName: "check_run",
+					action: "completed",
+					repositoryId,
+					payloadJson: makeCheckRunPayload({
+						action: "completed",
+						checkRunId: 8002,
+						name: "CI / Tests",
+						headSha: "sha-pr-head-2",
+						status: "completed",
+						conclusion: "success",
+						completedAt: "2026-02-18T10:05:00Z",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-checkrun-complete-2");
+
+			const checkRuns = yield* collectTable<{
+				githubCheckRunId: number;
+				status: string;
+				conclusion: string | null;
+				completedAt: number | null;
+			}>(t, "github_check_runs");
+			expect(checkRuns).toHaveLength(1);
+			expect(checkRuns[0]).toMatchObject({
+				githubCheckRunId: 8002,
+				status: "completed",
+				conclusion: "success",
+			});
+			expect(checkRuns[0].completedAt).not.toBeNull();
+		}),
+	);
+
+	it.effect("check_run completed event generates activity feed entry", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-checkrun-activity",
+					eventName: "check_run",
+					action: "completed",
+					repositoryId,
+					payloadJson: makeCheckRunPayload({
+						action: "completed",
+						checkRunId: 8003,
+						name: "CI / Lint",
+						headSha: "sha-lint",
+						status: "completed",
+						conclusion: "failure",
+						completedAt: "2026-02-18T10:05:00Z",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-checkrun-activity");
+
+			const activities = yield* collectTable<{
+				activityType: string;
+				title: string;
+				description: string | null;
+			}>(t, "view_activity_feed");
+			expect(activities).toHaveLength(1);
+			expect(activities[0]).toMatchObject({
+				activityType: "check_run.failure",
+				title: "CI / Lint",
+				description: "Conclusion: failure",
+			});
+		}),
+	);
+
+	it.effect(
+		"check_run created event does NOT generate activity feed entry",
+		() =>
+			Effect.gen(function* () {
+				const t = createConvexTest();
+				const repositoryId = 12345;
+				yield* seedRepository(t, repositoryId);
+
+				yield* insertRawEvent(
+					t,
+					makeRawEvent({
+						deliveryId: "delivery-checkrun-no-activity",
+						eventName: "check_run",
+						action: "created",
+						repositoryId,
+						payloadJson: makeCheckRunPayload({
+							action: "created",
+							checkRunId: 8004,
+							name: "CI / Deploy",
+							headSha: "sha-deploy",
+							status: "queued",
+						}),
+					}),
+				);
+				yield* processEvent(t, "delivery-checkrun-no-activity");
+
+				// Only completed check runs produce activity feed entries
+				const activities = yield* collectTable(t, "view_activity_feed");
+				expect(activities).toHaveLength(0);
+			}),
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Issue Comment Event Tests
+// ---------------------------------------------------------------------------
+
+describe("Issue Comment Events", () => {
+	it.effect("issue_comment created event inserts a comment", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-comment-created",
+					eventName: "issue_comment",
+					action: "created",
+					repositoryId,
+					payloadJson: makeIssueCommentPayload({
+						action: "created",
+						commentId: 7001,
+						issueNumber: 5,
+						body: "Looks good to me!",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-comment-created");
+
+			const comments = yield* collectTable<{
+				githubCommentId: number;
+				issueNumber: number;
+				body: string;
+				authorUserId: number | null;
+			}>(t, "github_issue_comments");
+			expect(comments).toHaveLength(1);
+			expect(comments[0]).toMatchObject({
+				githubCommentId: 7001,
+				issueNumber: 5,
+				body: "Looks good to me!",
+				authorUserId: 1001,
+			});
+		}),
+	);
+
+	it.effect("issue_comment edited event updates an existing comment", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// First: create the comment
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-comment-create-edit",
+					eventName: "issue_comment",
+					action: "created",
+					repositoryId,
+					payloadJson: makeIssueCommentPayload({
+						action: "created",
+						commentId: 7002,
+						issueNumber: 3,
+						body: "Original body",
+						createdAt: "2026-02-18T10:00:00Z",
+						updatedAt: "2026-02-18T10:00:00Z",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-comment-create-edit");
+
+			// Then: edit it
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-comment-edited",
+					eventName: "issue_comment",
+					action: "edited",
+					repositoryId,
+					payloadJson: makeIssueCommentPayload({
+						action: "edited",
+						commentId: 7002,
+						issueNumber: 3,
+						body: "Updated body with corrections",
+						createdAt: "2026-02-18T10:00:00Z",
+						updatedAt: "2026-02-18T10:05:00Z",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-comment-edited");
+
+			const comments = yield* collectTable<{
+				githubCommentId: number;
+				body: string;
+			}>(t, "github_issue_comments");
+			expect(comments).toHaveLength(1);
+			expect(comments[0]).toMatchObject({
+				githubCommentId: 7002,
+				body: "Updated body with corrections",
+			});
+		}),
+	);
+
+	it.effect("issue_comment deleted event removes the comment", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// First: create a comment
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-comment-create-del",
+					eventName: "issue_comment",
+					action: "created",
+					repositoryId,
+					payloadJson: makeIssueCommentPayload({
+						action: "created",
+						commentId: 7003,
+						issueNumber: 8,
+						body: "This comment will be deleted",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-comment-create-del");
+
+			let comments = yield* collectTable(t, "github_issue_comments");
+			expect(comments).toHaveLength(1);
+
+			// Then: delete it
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-comment-deleted",
+					eventName: "issue_comment",
+					action: "deleted",
+					repositoryId,
+					payloadJson: makeIssueCommentPayload({
+						action: "deleted",
+						commentId: 7003,
+						issueNumber: 8,
+						body: "This comment will be deleted",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-comment-deleted");
+
+			comments = yield* collectTable(t, "github_issue_comments");
+			expect(comments).toHaveLength(0);
+		}),
+	);
+
+	it.effect("issue_comment on a PR generates pr_comment activity type", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-pr-comment-activity",
+					eventName: "issue_comment",
+					action: "created",
+					repositoryId,
+					payloadJson: makeIssueCommentPayload({
+						action: "created",
+						commentId: 7004,
+						issueNumber: 42,
+						body: "PR comment here",
+						isPullRequest: true,
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-pr-comment-activity");
+
+			const activities = yield* collectTable<{
+				activityType: string;
+				entityNumber: number | null;
+			}>(t, "view_activity_feed");
+			expect(activities).toHaveLength(1);
+			expect(activities[0]).toMatchObject({
+				activityType: "pr_comment.created",
+				entityNumber: 42,
+			});
+		}),
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Pull Request Review Event Tests
+// ---------------------------------------------------------------------------
+
+describe("Pull Request Review Events", () => {
+	it.effect("pr_review submitted event inserts a review", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-review-submitted",
+					eventName: "pull_request_review",
+					action: "submitted",
+					repositoryId,
+					payloadJson: makePrReviewPayload({
+						action: "submitted",
+						reviewId: 9001,
+						prNumber: 42,
+						state: "approved",
+						commitSha: "sha-reviewed",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-review-submitted");
+
+			const reviews = yield* collectTable<{
+				githubReviewId: number;
+				pullRequestNumber: number;
+				state: string;
+				commitSha: string | null;
+				authorUserId: number | null;
+			}>(t, "github_pull_request_reviews");
+			expect(reviews).toHaveLength(1);
+			expect(reviews[0]).toMatchObject({
+				githubReviewId: 9001,
+				pullRequestNumber: 42,
+				state: "approved",
+				commitSha: "sha-reviewed",
+				authorUserId: 2001,
+			});
+
+			// Reviewer user should be upserted
+			const users = yield* collectTable<{
+				githubUserId: number;
+				login: string;
+			}>(t, "github_users");
+			expect(users).toHaveLength(1);
+			expect(users[0]).toMatchObject({
+				githubUserId: 2001,
+				login: "reviewer",
+			});
+		}),
+	);
+
+	it.effect("pr_review dismissed event updates existing review state", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// First: submit the review
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-review-submit-dismiss",
+					eventName: "pull_request_review",
+					action: "submitted",
+					repositoryId,
+					payloadJson: makePrReviewPayload({
+						action: "submitted",
+						reviewId: 9002,
+						prNumber: 10,
+						state: "changes_requested",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-review-submit-dismiss");
+
+			let reviews = yield* collectTable<{
+				githubReviewId: number;
+				state: string;
+			}>(t, "github_pull_request_reviews");
+			expect(reviews).toHaveLength(1);
+			expect(reviews[0]).toMatchObject({ state: "changes_requested" });
+
+			// Then: dismiss it
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-review-dismissed",
+					eventName: "pull_request_review",
+					action: "dismissed",
+					repositoryId,
+					payloadJson: makePrReviewPayload({
+						action: "dismissed",
+						reviewId: 9002,
+						prNumber: 10,
+						state: "dismissed",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-review-dismissed");
+
+			reviews = yield* collectTable(t, "github_pull_request_reviews");
+			expect(reviews).toHaveLength(1);
+			expect(reviews[0]).toMatchObject({
+				githubReviewId: 9002,
+				state: "dismissed",
+			});
+		}),
+	);
+
+	it.effect("pr_review submitted event generates activity feed entry", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-review-activity",
+					eventName: "pull_request_review",
+					action: "submitted",
+					repositoryId,
+					payloadJson: makePrReviewPayload({
+						action: "submitted",
+						reviewId: 9003,
+						prNumber: 7,
+						prTitle: "Important feature",
+						state: "approved",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-review-activity");
+
+			const activities = yield* collectTable<{
+				activityType: string;
+				title: string;
+				actorLogin: string | null;
+				entityNumber: number | null;
+			}>(t, "view_activity_feed");
+			expect(activities).toHaveLength(1);
+			expect(activities[0]).toMatchObject({
+				activityType: "pr_review.approved",
+				title: "Important feature",
+				actorLogin: "reviewer",
+				entityNumber: 7,
+			});
+		}),
+	);
+
+	it.effect("multiple reviews on same PR are stored independently", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			// Review 1: commented
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-review-multi-1",
+					eventName: "pull_request_review",
+					action: "submitted",
+					repositoryId,
+					payloadJson: makePrReviewPayload({
+						action: "submitted",
+						reviewId: 9010,
+						prNumber: 15,
+						state: "commented",
+						user: {
+							id: 3001,
+							login: "reviewer-a",
+							avatar_url: null,
+							type: "User",
+						},
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-review-multi-1");
+
+			// Review 2: approved (different reviewer)
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-review-multi-2",
+					eventName: "pull_request_review",
+					action: "submitted",
+					repositoryId,
+					payloadJson: makePrReviewPayload({
+						action: "submitted",
+						reviewId: 9011,
+						prNumber: 15,
+						state: "approved",
+						user: {
+							id: 3002,
+							login: "reviewer-b",
+							avatar_url: null,
+							type: "User",
+						},
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-review-multi-2");
+
+			const reviews = yield* collectTable<{
+				githubReviewId: number;
+				state: string;
+				authorUserId: number | null;
+			}>(t, "github_pull_request_reviews");
+			expect(reviews).toHaveLength(2);
+
+			const states = reviews.map((r) => r.state).sort();
+			expect(states).toEqual(["approved", "commented"]);
+
+			// Both reviewers should be upserted
+			const users = yield* collectTable<{
+				githubUserId: number;
+				login: string;
+			}>(t, "github_users");
+			expect(users).toHaveLength(2);
 		}),
 	);
 });

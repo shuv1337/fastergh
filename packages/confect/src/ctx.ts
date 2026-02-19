@@ -493,11 +493,30 @@ class ConfectAuthImpl implements ConfectAuth {
 	}
 }
 
+/**
+ * Unwrap `ExitEncoded<A, E, D>` to just `A` at the type level.
+ *
+ * Confect-registered functions return `ExitEncoded` on the wire, so
+ * `FunctionReturnType<Ref>` resolves to `ExitEncoded<A, E, D>`.
+ * This utility type extracts the success value `A` so that
+ * `yield* ctx.runQuery(...)` gives you the logical return type.
+ *
+ * For non-Confect functions (plain Convex), the type passes through unchanged.
+ */
+type UnwrapExitEncoded<T> =
+	// Use Extract to isolate the Success branch of the ExitEncoded union
+	Extract<T, { readonly _tag: "Success" }> extends {
+		readonly _tag: "Success";
+		readonly value: infer A;
+	}
+		? A
+		: T;
+
 export interface ConfectQueryCtx<Tables extends GenericConfectSchema> {
 	runQuery<Query extends FunctionReference<"query", "public" | "internal">>(
 		query: Query,
 		...args: OptionalRestArgs<Query>
-	): Effect.Effect<FunctionReturnType<Query>>;
+	): Effect.Effect<UnwrapExitEncoded<FunctionReturnType<Query>>>;
 
 	db: ConfectDatabaseReader<Tables>;
 	auth: ConfectAuth;
@@ -507,12 +526,12 @@ export interface ConfectMutationCtx<Tables extends GenericConfectSchema> {
 	runQuery<Query extends FunctionReference<"query", "public" | "internal">>(
 		query: Query,
 		...args: OptionalRestArgs<Query>
-	): Effect.Effect<FunctionReturnType<Query>>;
+	): Effect.Effect<UnwrapExitEncoded<FunctionReturnType<Query>>>;
 
 	runMutation<Mutation extends FunctionReference<"mutation", "public" | "internal">>(
 		mutation: Mutation,
 		...args: OptionalRestArgs<Mutation>
-	): Effect.Effect<FunctionReturnType<Mutation>>;
+	): Effect.Effect<UnwrapExitEncoded<FunctionReturnType<Mutation>>>;
 
 	/** Raw Convex scheduler for scheduling functions from mutations. */
 	scheduler: Scheduler;
@@ -525,18 +544,19 @@ export interface ConfectActionCtx<Tables extends GenericConfectSchema> {
 	runQuery<Query extends FunctionReference<"query", "public" | "internal">>(
 		query: Query,
 		...args: OptionalRestArgs<Query>
-	): Effect.Effect<FunctionReturnType<Query>>;
+	): Effect.Effect<UnwrapExitEncoded<FunctionReturnType<Query>>>;
 
 	runMutation<Mutation extends FunctionReference<"mutation", "public" | "internal">>(
 		mutation: Mutation,
 		...args: OptionalRestArgs<Mutation>
-	): Effect.Effect<FunctionReturnType<Mutation>>;
+	): Effect.Effect<UnwrapExitEncoded<FunctionReturnType<Mutation>>>;
 
 	runAction<Action extends FunctionReference<"action", "public" | "internal">>(
 		action: Action,
 		...args: OptionalRestArgs<Action>
-	): Effect.Effect<FunctionReturnType<Action>>;
+	): Effect.Effect<UnwrapExitEncoded<FunctionReturnType<Action>>>;
 
+	scheduler: Scheduler;
 	auth: ConfectAuth;
 }
 
@@ -556,7 +576,10 @@ export const makeQueryCtx = <Tables extends GenericConfectSchema>(
 	runQuery: <Query extends FunctionReference<"query", "public" | "internal">>(
 		query: Query,
 		...args: OptionalRestArgs<Query>
-	) => Effect.promise(() => ctx.runQuery(query, ...args)),
+	) =>
+		Effect.promise(() => ctx.runQuery(query, ...args)).pipe(
+			Effect.flatMap(unwrapIfExitEncoded),
+		),
 	db: new ConfectDatabaseReaderImpl(ctx.db, tableSchemas),
 	auth: new ConfectAuthImpl(ctx.auth),
 });
@@ -568,15 +591,54 @@ export const makeMutationCtx = <Tables extends GenericConfectSchema>(
 	runQuery: <Query extends FunctionReference<"query", "public" | "internal">>(
 		query: Query,
 		...args: OptionalRestArgs<Query>
-	) => Effect.promise(() => ctx.runQuery(query, ...args)),
+	) =>
+		Effect.promise(() => ctx.runQuery(query, ...args)).pipe(
+			Effect.flatMap(unwrapIfExitEncoded),
+		),
 	runMutation: <Mutation extends FunctionReference<"mutation", "public" | "internal">>(
 		mutation: Mutation,
 		...args: OptionalRestArgs<Mutation>
-	) => Effect.promise(() => ctx.runMutation(mutation, ...args)),
+	) =>
+		Effect.promise(() => ctx.runMutation(mutation, ...args)).pipe(
+			Effect.flatMap(unwrapIfExitEncoded),
+		),
 	scheduler: ctx.scheduler,
 	db: new ConfectDatabaseWriterImpl(ctx.db, tableSchemas),
 	auth: new ConfectAuthImpl(ctx.auth),
 });
+
+/**
+ * Detect and unwrap Confect ExitEncoded results from cross-function calls.
+ *
+ * When a Confect action/mutation/query calls another Confect function via
+ * `ctx.runQuery`/`ctx.runMutation`/`ctx.runAction`, the raw Convex runtime
+ * returns the function's wire format — which for Confect functions is
+ * `ExitEncoded<Success, Error>` (a tagged union `{_tag: "Success", value}` |
+ * `{_tag: "Failure", cause}`).
+ *
+ * Without unwrapping, `yield* ctx.runQuery(...)` gives you the raw ExitEncoded
+ * object instead of the logical success value, forcing users to manually check
+ * `_tag` and extract `.value`. This helper makes cross-function calls
+ * transparent: Success values are extracted, Failure causes become Effect failures.
+ */
+const unwrapIfExitEncoded = <T>(result: T): Effect.Effect<T> => {
+	if (
+		typeof result === "object" &&
+		result !== null &&
+		"_tag" in result
+	) {
+		const tagged = result as { _tag: string; value?: unknown; cause?: unknown };
+		if (tagged._tag === "Success") {
+			return Effect.succeed(tagged.value as T);
+		}
+		if (tagged._tag === "Failure") {
+			// Re-throw as an Effect failure so the caller's error channel catches it
+			return Effect.die(tagged.cause);
+		}
+	}
+	// Not an ExitEncoded — return as-is (e.g. plain Convex functions)
+	return Effect.succeed(result);
+};
 
 export const makeActionCtx = <Tables extends GenericConfectSchema>(
 	ctx: GenericActionCtx<GenericDataModel>,
@@ -584,14 +646,24 @@ export const makeActionCtx = <Tables extends GenericConfectSchema>(
 	runQuery: <Query extends FunctionReference<"query", "public" | "internal">>(
 		query: Query,
 		...args: OptionalRestArgs<Query>
-	) => Effect.promise(() => ctx.runQuery(query, ...args)),
+	) =>
+		Effect.promise(() => ctx.runQuery(query, ...args)).pipe(
+			Effect.flatMap(unwrapIfExitEncoded),
+		),
 	runMutation: <Mutation extends FunctionReference<"mutation", "public" | "internal">>(
 		mutation: Mutation,
 		...args: OptionalRestArgs<Mutation>
-	) => Effect.promise(() => ctx.runMutation(mutation, ...args)),
+	) =>
+		Effect.promise(() => ctx.runMutation(mutation, ...args)).pipe(
+			Effect.flatMap(unwrapIfExitEncoded),
+		),
 	runAction: <Action extends FunctionReference<"action", "public" | "internal">>(
 		action: Action,
 		...args: OptionalRestArgs<Action>
-	) => Effect.promise(() => ctx.runAction(action, ...args)),
+	) =>
+		Effect.promise(() => ctx.runAction(action, ...args)).pipe(
+			Effect.flatMap(unwrapIfExitEncoded),
+		),
+	scheduler: ctx.scheduler,
 	auth: new ConfectAuthImpl(ctx.auth),
 });

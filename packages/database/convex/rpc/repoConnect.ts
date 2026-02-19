@@ -1,15 +1,8 @@
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
-import { makeFunctionReference } from "convex/server";
 import { Effect, Option, Schema } from "effect";
+import { internal } from "../_generated/api";
 import { ConfectMutationCtx, confectSchema } from "../confect";
 import { DatabaseRpcTelemetryLayer } from "./telemetry";
-
-// Use makeFunctionReference instead of importing `internal` to break circular type dependency
-// (api.d.ts imports this module → this module imports api.d.ts)
-const bootstrapRepoRef = makeFunctionReference<
-	"action",
-	{ githubRepoId: number; fullName: string; lockKey: string }
->("rpc/repoBootstrap:bootstrapRepo");
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -177,7 +170,7 @@ connectRepoDef.implement((args) =>
 
 			// Schedule the bootstrap action to run immediately
 			yield* Effect.promise(() =>
-				ctx.scheduler.runAfter(0, bootstrapRepoRef, {
+				ctx.scheduler.runAfter(0, internal.rpc.repoBootstrap.bootstrapRepo, {
 					githubRepoId: args.githubRepoId,
 					fullName: args.fullName,
 					lockKey,

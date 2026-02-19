@@ -91,5 +91,8 @@
 		"*": [
 			"biome format --write"
 		]
+	},
+	"dependencies": {
+		"@pierre/diffs": "^1.0.11"
 	}
 }
