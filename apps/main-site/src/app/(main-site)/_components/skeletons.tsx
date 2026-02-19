@@ -26,7 +26,89 @@ export function ListSkeleton() {
 	);
 }
 
-export function DetailSkeleton() {
+/**
+ * Skeleton for the issue detail view.
+ * Matches the single-column layout: title, state badge, body card, action bar, comments.
+ */
+export function IssueDetailSkeleton() {
+	return (
+		<div className="h-full overflow-y-auto animate-pulse">
+			<div className="p-4 max-w-4xl space-y-3">
+				{/* Header: state icon + title + meta */}
+				<div className="flex items-start gap-2.5">
+					<div className="size-5 rounded-full bg-muted shrink-0 mt-1" />
+					<div className="min-w-0 flex-1 space-y-1.5">
+						<div className="h-4 w-3/4 rounded bg-muted" />
+						<div className="flex items-center gap-2">
+							<div className="h-3 w-8 rounded bg-muted" />
+							<div className="h-4 w-12 rounded-full bg-muted" />
+							<div className="size-4 rounded-full bg-muted" />
+							<div className="h-3 w-20 rounded bg-muted" />
+						</div>
+					</div>
+				</div>
+
+				{/* Labels */}
+				<div className="flex gap-1">
+					<div className="h-4 w-14 rounded-full bg-muted" />
+					<div className="h-4 w-10 rounded-full bg-muted" />
+				</div>
+
+				{/* Updated timestamp */}
+				<div className="h-2.5 w-24 rounded bg-muted" />
+
+				{/* Body card */}
+				<div className="rounded-lg border p-4 space-y-2">
+					<div className="h-3 w-full rounded bg-muted" />
+					<div className="h-3 w-5/6 rounded bg-muted" />
+					<div className="h-3 w-4/6 rounded bg-muted" />
+					<div className="h-3 w-3/4 rounded bg-muted" />
+					<div className="h-3 w-2/3 rounded bg-muted" />
+				</div>
+
+				{/* Action bar */}
+				<div className="flex gap-2">
+					<div className="h-7 w-24 rounded bg-muted" />
+				</div>
+
+				{/* Comments section */}
+				<div className="space-y-1.5 pt-1">
+					<div className="h-2.5 w-20 rounded bg-muted" />
+					{Array.from({ length: 2 }, (_, i) => (
+						<div key={i} className="rounded-lg border space-y-0">
+							<div className="p-3 pb-0">
+								<div className="flex items-center gap-1.5">
+									<div className="size-4 rounded-full bg-muted" />
+									<div className="h-3 w-16 rounded bg-muted" />
+									<div className="h-2.5 w-10 rounded bg-muted" />
+								</div>
+							</div>
+							<div className="p-3 space-y-1.5">
+								<div className="h-3 w-full rounded bg-muted" />
+								<div className="h-3 w-3/4 rounded bg-muted" />
+							</div>
+						</div>
+					))}
+				</div>
+
+				{/* Comment form */}
+				<div className="border-t pt-4 space-y-1.5">
+					<div className="h-3 w-24 rounded bg-muted" />
+					<div className="h-16 w-full rounded-md border bg-muted/30" />
+					<div className="flex justify-end">
+						<div className="h-8 w-20 rounded bg-muted" />
+					</div>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+/**
+ * Skeleton for the PR detail view.
+ * Matches the two-column layout: diff files + right sidebar with branches, checks, comments.
+ */
+export function PrDetailSkeleton() {
 	return (
 		<div className="flex h-full animate-pulse">
 			{/* Main area: diff skeleton */}

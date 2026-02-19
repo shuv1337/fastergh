@@ -1,13 +1,13 @@
 import { Suspense } from "react";
 import { serverQueries } from "@/lib/server-queries";
-import { DetailSkeleton } from "../../../../../_components/skeletons";
+import { PrDetailSkeleton } from "../../../../../_components/skeletons";
 import { RunDetailClient } from "./run-detail-client";
 
 export default function RunDetailSlot(props: {
 	params: Promise<{ owner: string; name: string; runNumber: string }>;
 }) {
 	return (
-		<Suspense fallback={<DetailSkeleton />}>
+		<Suspense fallback={<PrDetailSkeleton />}>
 			<RunDetailContent paramsPromise={props.params} />
 		</Suspense>
 	);

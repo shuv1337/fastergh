@@ -1,13 +1,13 @@
 import { Suspense } from "react";
 import { serverQueries } from "@/lib/server-queries";
-import { DetailSkeleton } from "../../../../../_components/skeletons";
+import { PrDetailSkeleton } from "../../../../../_components/skeletons";
 import { PrDetailClient } from "./pr-detail-client";
 
 export default function PrDetailSlot(props: {
 	params: Promise<{ owner: string; name: string; number: string }>;
 }) {
 	return (
-		<Suspense fallback={<DetailSkeleton />}>
+		<Suspense fallback={<PrDetailSkeleton />}>
 			<PrDetailContent paramsPromise={props.params} />
 		</Suspense>
 	);
