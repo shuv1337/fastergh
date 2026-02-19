@@ -1,14 +1,16 @@
 "use client";
 
-import { useSubscriptionWithInitial } from "@packages/confect/rpc";
 import { Badge } from "@packages/ui/components/badge";
 import { Button } from "@packages/ui/components/button";
 import { Link } from "@packages/ui/components/link";
+import { useInfinitePaginationWithInitial } from "@packages/ui/hooks/use-paginated-atom";
 import { cn } from "@packages/ui/lib/utils";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
-import { GitPullRequest, MessageCircle, TriangleAlert } from "lucide-react";
+import { Loader2, MessageCircle } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { useMemo, useState } from "react";
+
+const PAGE_SIZE = 30;
 
 type PrItem = {
 	readonly number: number;
@@ -32,16 +34,16 @@ export function PrListClient({
 }: {
 	owner: string;
 	name: string;
-	initialData?: readonly PrItem[];
+	initialData?: ReadonlyArray<PrItem>;
 }) {
 	const [stateFilter, setStateFilter] = useState<"open" | "closed" | "all">(
 		"open",
 	);
 
 	const client = useProjectionQueries();
-	const prsAtom = useMemo(
+	const paginatedAtom = useMemo(
 		() =>
-			client.listPullRequests.subscription({
+			client.listPullRequestsPaginated.paginated(PAGE_SIZE, {
 				ownerLogin: owner,
 				name,
 				state: stateFilter === "all" ? undefined : stateFilter,
@@ -49,7 +51,11 @@ export function PrListClient({
 		[client, owner, name, stateFilter],
 	);
 
-	const prs = useSubscriptionWithInitial(prsAtom, initialData);
+	const {
+		items: prs,
+		sentinelRef,
+		isLoading,
+	} = useInfinitePaginationWithInitial(paginatedAtom, initialData);
 
 	const pathname = usePathname();
 	const activeNumber = (() => {
@@ -73,7 +79,7 @@ export function PrListClient({
 				))}
 			</div>
 
-			{prs.length === 0 && (
+			{prs.length === 0 && !isLoading && (
 				<p className="px-2 py-8 text-xs text-muted-foreground text-center">
 					No {stateFilter !== "all" ? stateFilter : ""} pull requests.
 				</p>
@@ -128,6 +134,14 @@ export function PrListClient({
 					)}
 				</Link>
 			))}
+
+			{/* Sentinel for infinite scroll */}
+			<div ref={sentinelRef} className="h-1" />
+			{isLoading && (
+				<div className="flex items-center justify-center py-3">
+					<Loader2 className="size-4 animate-spin text-muted-foreground" />
+				</div>
+			)}
 		</div>
 	);
 }

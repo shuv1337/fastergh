@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { Effect, Option, Schema } from "effect";
+import { Effect, Layer, Option, Schema, Stream } from "effect";
 import { Atom } from "@effect-atom/atom";
-import { createRpcClient, RpcDefectError } from "./client";
+import { createRpcClient, createServerRpcQuery, RpcDefectError } from "./client";
 import { createRpcFactory, makeRpcModule } from "./server";
 import { defineTable, defineSchema } from "../schema";
+import { ConvexClient, type ConvexClientService } from "../client";
 
 const testSchema = defineSchema({
 	guestbook: defineTable(
@@ -425,6 +426,197 @@ describe("Error round-trip (server encode → client decode)", () => {
 				expect(error.value).toBeInstanceOf(RpcDefectError);
 			}
 		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Server RPC query deduplication tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a mock ConvexHttpClientLayer that tracks how many actual query calls
+ * are made. Each query resolves after a short delay to simulate network latency,
+ * allowing us to test that concurrent calls are deduplicated.
+ */
+const createMockHttpLayer = () => {
+	let callCount = 0;
+	const callPayloads: Array<unknown> = [];
+
+	const service: ConvexClientService = {
+		query: <Q extends import("convex/server").FunctionReference<"query">>(
+			_query: Q,
+			args: Q["_args"],
+		) => {
+			callCount += 1;
+			callPayloads.push(args);
+			// Simulate network delay so concurrent calls overlap
+			return Effect.promise(
+				() =>
+					new Promise<import("convex/server").FunctionReturnType<Q>>((resolve) => {
+						setTimeout(
+							() =>
+								resolve({
+									_tag: "Success",
+									value: { data: "test-result" },
+								} as import("convex/server").FunctionReturnType<Q>),
+							50,
+						);
+					}),
+			);
+		},
+		mutation: () => Effect.die("not implemented"),
+		action: () => Effect.die("not implemented"),
+		subscribe: () => Stream.empty,
+	};
+
+	const layer = Layer.succeed(ConvexClient, service);
+
+	return {
+		layer,
+		getCallCount: () => callCount,
+		getCallPayloads: () => callPayloads,
+		resetCounts: () => {
+			callCount = 0;
+			callPayloads.length = 0;
+		},
+	};
+};
+
+describe("Server RPC query deduplication", () => {
+	it("concurrent queryPromise calls with identical payload only fire one request", async () => {
+		const mock = createMockHttpLayer();
+
+		const mockApi = {
+			list: guestbookModule.handlers.list,
+		};
+
+		const serverClient = createServerRpcQuery<typeof guestbookModule>(
+			mockApi as never,
+			{ url: "https://test.convex.cloud", layer: mock.layer },
+		);
+
+		// Fire 3 concurrent calls with the same payload
+		const [r1, r2, r3] = await Promise.all([
+			serverClient.list.queryPromise({}),
+			serverClient.list.queryPromise({}),
+			serverClient.list.queryPromise({}),
+		]);
+
+		// All should return the same result
+		expect(r1).toEqual({ data: "test-result" });
+		expect(r2).toEqual({ data: "test-result" });
+		expect(r3).toEqual({ data: "test-result" });
+
+		// Only ONE actual query should have been made
+		expect(mock.getCallCount()).toBe(1);
+	});
+
+	it("concurrent calls with DIFFERENT payloads fire separate requests", async () => {
+		const mock = createMockHttpLayer();
+
+		const mockApi = {
+			get: guestbookModule.handlers.get,
+		};
+
+		const serverClient = createServerRpcQuery<typeof guestbookModule>(
+			mockApi as never,
+			{ url: "https://test.convex.cloud", layer: mock.layer },
+		);
+
+		const [r1, r2] = await Promise.all([
+			serverClient.get.queryPromise({ id: "a" }),
+			serverClient.get.queryPromise({ id: "b" }),
+		]);
+
+		// Both resolve
+		expect(r1).toEqual({ data: "test-result" });
+		expect(r2).toEqual({ data: "test-result" });
+
+		// Two different payloads = two separate requests
+		expect(mock.getCallCount()).toBe(2);
+	});
+
+	it("sequential calls after TTL expiry fire fresh requests", async () => {
+		const mock = createMockHttpLayer();
+
+		const mockApi = {
+			list: guestbookModule.handlers.list,
+		};
+
+		const serverClient = createServerRpcQuery<typeof guestbookModule>(
+			mockApi as never,
+			{ url: "https://test.convex.cloud", layer: mock.layer },
+		);
+
+		// First call
+		const r1 = await serverClient.list.queryPromise({});
+		expect(r1).toEqual({ data: "test-result" });
+
+		// Second call happens immediately (within TTL) — should be cached
+		const r2 = await serverClient.list.queryPromise({});
+		expect(r2).toEqual({ data: "test-result" });
+
+		// Within the TTL window, both calls share the same cached result
+		// The Cache coalesces in-flight requests AND caches completed results
+		// for the TTL duration, so sequential calls within TTL only fire once.
+		expect(mock.getCallCount()).toBe(1);
+	});
+
+	it("deduplication works when first call rejects", async () => {
+		let callCount = 0;
+
+		const failingService: ConvexClientService = {
+			query: <Q extends import("convex/server").FunctionReference<"query">>(
+				_query: Q,
+				_args: Q["_args"],
+			) => {
+				callCount += 1;
+				return Effect.promise(
+					() =>
+						new Promise<import("convex/server").FunctionReturnType<Q>>((resolve) => {
+							setTimeout(
+								() =>
+									resolve({
+										_tag: "Failure",
+										cause: {
+											_tag: "Fail",
+											error: { _tag: "SomeError" },
+										},
+									} as import("convex/server").FunctionReturnType<Q>),
+								50,
+							);
+						}),
+				);
+			},
+			mutation: () => Effect.die("not implemented"),
+			action: () => Effect.die("not implemented"),
+			subscribe: () => Stream.empty,
+		};
+
+		const failingLayer = Layer.succeed(ConvexClient, failingService);
+
+		const mockApi = {
+			list: guestbookModule.handlers.list,
+		};
+
+		const serverClient = createServerRpcQuery<typeof guestbookModule>(
+			mockApi as never,
+			{ url: "https://test.convex.cloud", layer: failingLayer },
+		);
+
+		// All 3 should reject
+		const results = await Promise.allSettled([
+			serverClient.list.queryPromise({}),
+			serverClient.list.queryPromise({}),
+			serverClient.list.queryPromise({}),
+		]);
+
+		expect(results[0].status).toBe("rejected");
+		expect(results[1].status).toBe("rejected");
+		expect(results[2].status).toBe("rejected");
+
+		// Only ONE actual call
+		expect(callCount).toBe(1);
 	});
 });
 

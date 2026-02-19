@@ -1,30 +1,24 @@
-import { Suspense } from "react";
 import { serverQueries } from "@/lib/server-queries";
 import { IssueListClient } from "../../../../_components/issue-list-client";
 import { RepoListShell } from "../../../../_components/repo-list-shell";
-import { ListSkeleton } from "../../../../_components/skeletons";
 
-export default async function IssueListSlot(props: {
+export default function IssueListSlot(props: {
 	params: Promise<{ owner: string; name: string }>;
 }) {
-	const { owner, name } = await props.params;
-
 	return (
-		<RepoListShell owner={owner} name={name} activeTab="issues">
-			<Suspense fallback={<ListSkeleton />}>
-				<IssueListContent owner={owner} name={name} />
-			</Suspense>
+		<RepoListShell paramsPromise={props.params} activeTab="issues">
+			<IssueListContent paramsPromise={props.params} />
 		</RepoListShell>
 	);
 }
 
 async function IssueListContent({
-	owner,
-	name,
+	paramsPromise,
 }: {
-	owner: string;
-	name: string;
+	paramsPromise: Promise<{ owner: string; name: string }>;
 }) {
+	const { owner, name } = await paramsPromise;
+
 	const initialData = await serverQueries.listIssues.queryPromise({
 		ownerLogin: owner,
 		name,

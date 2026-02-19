@@ -8,7 +8,7 @@ import type {
 import { Atom, Result } from "@effect-atom/atom";
 import { Result as ResultModule, useAtomValue } from "@effect-atom/atom-react";
 import * as Cause from "effect/Cause";
-import { Chunk, Data, Effect, Exit, FiberId, Layer, Option, Stream } from "effect";
+import { Cache, Chunk, Data, Duration, Effect, Exit, FiberId, Layer, Option, Stream } from "effect";
 
 import {
 	ConvexClient,
@@ -98,6 +98,16 @@ type IsPaginatedPayload<T> = T extends {
 	? true
 	: false;
 
+/**
+ * Extra payload fields for a paginated endpoint – everything except the
+ * pagination primitives (`cursor` and `numItems`) that the framework manages.
+ */
+type PaginatedExtraPayload<Payload> = Omit<Payload, "cursor" | "numItems">;
+
+type PaginatedArgs<Extra> = keyof Extra extends never
+	? [numItems: number]
+	: [numItems: number, payload: Extra];
+
 export type RpcQueryClient<Payload, Success, Error> = {
 	query: (payload: Payload) => Atom.Atom<Result.Result<Success, Error | RpcDefectError>>;
 	queryEffect: (payload: Payload) => Effect.Effect<Success, Error | RpcDefectError>;
@@ -107,7 +117,7 @@ export type RpcQueryClient<Payload, Success, Error> = {
 	? IsPaginatedPayload<Payload> extends true
 		? {
 				paginated: (
-					numItems: number,
+					...args: PaginatedArgs<PaginatedExtraPayload<Payload>>
 				) => Atom.Writable<
 					Atom.PullResult<ExtractPageItem<Success>, Error | RpcDefectError>,
 					void
@@ -459,6 +469,7 @@ const createPaginatedAtom = (
 	convexFn: FunctionReference<"query">,
 	getShared: () => Record<string, unknown>,
 	numItems: number,
+	extraPayload: Record<string, unknown>,
 	enablePayloadTelemetryFallback: boolean,
 ): Atom.Writable<Atom.PullResult<unknown, unknown>, void> => {
 	return runtime.pull(
@@ -466,6 +477,7 @@ const createPaginatedAtom = (
 			Effect.gen(function* () {
 				const fullPayload = {
 					...getShared(),
+					...extraPayload,
 					cursor,
 					numItems,
 				};
@@ -504,7 +516,7 @@ export function createRpcClient<
 	const subscriptionFamilies = new Map<string, (payload: unknown) => Atom.Atom<Result.Result<unknown, unknown>>>();
 	const mutationFns = new Map<string, Atom.AtomResultFn<unknown, unknown, unknown>>();
 	const actionFns = new Map<string, Atom.AtomResultFn<unknown, unknown, unknown>>();
-	const paginatedFamilies = new Map<string, (numItems: number) => Atom.Writable<Atom.PullResult<unknown, unknown>, void>>();
+	const paginatedFamilies = new Map<string, (numItems: number, extra: Record<string, unknown>) => Atom.Writable<Atom.PullResult<unknown, unknown>, void>>();
 
 	const getQueryFamily = (tag: string) => {
 		let family = queryFamilies.get(tag);
@@ -577,22 +589,31 @@ export function createRpcClient<
 	};
 
 	const getPaginatedFamily = (tag: string) => {
-		let family = paginatedFamilies.get(tag);
-		if (!family) {
+		let cached = paginatedFamilies.get(tag);
+		if (!cached) {
 			const convexFn = convexApi[tag] as FunctionReference<"query">;
-			family = Atom.family((numItems: number) =>
-				createPaginatedAtom(
+			// Atom.family takes a single arg; use a stable JSON key so that
+			// identical (numItems + extra) combinations share the same atom.
+			const atomFamily = Atom.family((key: string) => {
+				const { numItems, extra } = JSON.parse(key) as {
+					numItems: number;
+					extra: Record<string, unknown>;
+				};
+				return createPaginatedAtom(
 					runtime,
 					tag,
 					convexFn,
 					getShared,
 					numItems,
+					extra,
 					enablePayloadTelemetryFallback,
-				),
-			);
-			paginatedFamilies.set(tag, family);
+				);
+			});
+			cached = (numItems: number, extra: Record<string, unknown>) =>
+				atomFamily(JSON.stringify({ numItems, extra }));
+			paginatedFamilies.set(tag, cached);
 		}
-		return family;
+		return cached;
 	};
 
 	const endpointProxyCache = new Map<string, unknown>();
@@ -661,7 +682,7 @@ export function createRpcClient<
 					call: getActionFn(prop),
 					callEffect,
 					callPromise: (payload: unknown) => Effect.runPromise(callEffect(payload)),
-					paginated: (numItems: number) => getPaginatedFamily(prop)(numItems),
+					paginated: (numItems: number, extra: Record<string, unknown> = {}) => getPaginatedFamily(prop)(numItems, extra),
 				};
 				endpointProxyCache.set(prop, endpointProxy);
 			}
@@ -701,6 +722,11 @@ export type ServerRpcModuleClient<
 
 export interface ServerRpcClientConfig {
 	readonly url: string;
+	/**
+	 * Optional layer override (e.g. for testing). When provided, this layer is
+	 * used instead of creating a `ConvexHttpClientLayer` from `url`.
+	 */
+	readonly layer?: Layer.Layer<ConvexClient>;
 }
 
 /**
@@ -711,6 +737,26 @@ export interface ServerRpcClientConfig {
  * Only query endpoints are exposed (mutations/actions are excluded).
  * Each endpoint has a single method: `queryPromise(payload) => Promise<Success>`.
  */
+/**
+ * Default TTL for the server-side query deduplication cache.
+ *
+ * During SSR multiple server components may call `queryPromise` with the
+ * same endpoint + payload concurrently.  `Cache` automatically coalesces
+ * concurrent lookups for the same key into a single in-flight request.
+ * Completed results are kept for this duration so that near-simultaneous
+ * calls (within the same render pass) hit the cache rather than firing
+ * duplicate HTTP requests.  The TTL is intentionally short to avoid
+ * serving stale data across unrelated requests on a long-lived server.
+ */
+const SERVER_QUERY_CACHE_TTL = Duration.seconds(5);
+
+/**
+ * Maximum number of distinct (endpoint + payload) entries kept in the
+ * server-side query cache.  This is deliberately generous — each entry
+ * is small (just the resolved value) and expires quickly.
+ */
+const SERVER_QUERY_CACHE_CAPACITY = 256;
+
 export function createServerRpcQuery<
 	TModule extends AnyRpcModule,
 	Shared extends Record<string, unknown> = {},
@@ -719,30 +765,75 @@ export function createServerRpcQuery<
 	config: ServerRpcClientConfig,
 	getShared: () => Shared = () => ({}) as Shared,
 ): ServerRpcModuleClient<TModule, Shared> {
-	const httpLayer = ConvexHttpClientLayer(config.url);
+	const httpLayer = config.layer ?? ConvexHttpClientLayer(config.url);
 
-	const cache = new Map<string, ServerQueryEndpoint<unknown, unknown>>();
+	/**
+	 * A single `Cache<string, unknown, unknown>` keyed by
+	 * `"endpointName:json(payload)"`.
+	 *
+	 * `Cache.make` returns an `Effect` — we run it once eagerly via
+	 * `Effect.runSync` wrapped in a lazy singleton so it's created on first
+	 * access.  The lookup function is provided the layer so each cache miss
+	 * fires exactly one HTTP request through the `ConvexHttpClientLayer`.
+	 *
+	 * Because Effect's `Cache` coalesces concurrent lookups for the same key,
+	 * three concurrent calls to `queryPromise({ id: "x" })` result in a
+	 * single Convex HTTP call.
+	 */
+
+	// We store a Map of endpoint name → convex function ref so the lookup
+	// can resolve which function to call from just the cache key string.
+	const convexFnRegistry = new Map<string, FunctionReference<"query">>();
+
+	const cacheEffect = Cache.make({
+		capacity: SERVER_QUERY_CACHE_CAPACITY,
+		timeToLive: SERVER_QUERY_CACHE_TTL,
+		lookup: (cacheKey: string) => {
+			const sepIndex = cacheKey.indexOf(":");
+			const endpointName = cacheKey.substring(0, sepIndex);
+			const fullPayload = JSON.parse(cacheKey.substring(sepIndex + 1));
+			const convexFn = convexFnRegistry.get(endpointName);
+			if (!convexFn) {
+				return Effect.die(
+					new Error(`No registered Convex function for endpoint "${endpointName}"`),
+				);
+			}
+			return createQueryEffect(
+				endpointName,
+				convexFn,
+				fullPayload,
+				false,
+			);
+		},
+	});
+
+	// The cache needs `ConvexClient` from the layer (via createQueryEffect).
+	// We provide the layer, then run the resulting Effect synchronously.
+	const queryCache = Effect.runSync(
+		Effect.provide(cacheEffect, httpLayer),
+	);
+
+	const endpointCache = new Map<string, ServerQueryEndpoint<unknown, unknown>>();
 
 	const getEndpoint = (prop: string): ServerQueryEndpoint<unknown, unknown> => {
-		let endpoint = cache.get(prop);
+		let endpoint = endpointCache.get(prop);
 		if (!endpoint) {
 			const convexFn = convexApi[prop];
 			if (!convexFn) {
 				throw new Error(`No Convex function found for endpoint "${prop}"`);
 			}
+			convexFnRegistry.set(prop, convexFn as FunctionReference<"query">);
+
 			endpoint = {
 				queryPromise: (payload: unknown) => {
 					const fullPayload = { ...getShared(), ...(payload as object) };
-					const effect = createQueryEffect(
-						prop,
-						convexFn as FunctionReference<"query">,
-						fullPayload,
-						false,
-					).pipe(Effect.provide(httpLayer));
-					return Effect.runPromise(effect);
+					const cacheKey = `${prop}:${JSON.stringify(fullPayload)}`;
+					return Effect.runPromise(
+						Effect.provide(queryCache.get(cacheKey), httpLayer),
+					);
 				},
 			};
-			cache.set(prop, endpoint);
+			endpointCache.set(prop, endpoint);
 		}
 		return endpoint;
 	};

@@ -69,3 +69,33 @@ export function useInfinitePagination<T, E>(
 
 	return { ...pagination, sentinelRef };
 }
+
+/**
+ * Like {@link useInfinitePagination} but shows server-prefetched `initialData`
+ * while the paginated atom is still loading its first page.  Once the atom
+ * has real data the initial data is discarded and the atom takes over.
+ */
+export function useInfinitePaginationWithInitial<T, E>(
+	atom: Atom.Writable<Atom.PullResult<T, E>, void>,
+	initialData: ReadonlyArray<T>,
+	options?: UseInfinitePaginationOptions,
+) {
+	const pagination = useInfinitePagination(atom, options);
+
+	// While the atom hasn't produced any items yet, show the prefetched data.
+	if (
+		pagination.isInitial ||
+		(pagination.isLoading && pagination.items.length === 0)
+	) {
+		return {
+			...pagination,
+			items: initialData as Array<T>,
+			// We don't know if there are more pages beyond the prefetched data,
+			// but assume there are so the sentinel triggers the first real fetch.
+			hasMore: true,
+			done: false,
+		};
+	}
+
+	return pagination;
+}

@@ -1,33 +1,27 @@
-import { Suspense } from "react";
 import { serverQueries } from "@/lib/server-queries";
 import { ActionsListClient } from "../../../../_components/actions-list-client";
 import { RepoListShell } from "../../../../_components/repo-list-shell";
-import { ListSkeleton } from "../../../../_components/skeletons";
 
 /**
  * Fallback for the @sidebar slot when navigating directly to /actions/[runNumber].
  */
-export default async function ActionsListDefault(props: {
+export default function ActionsListDefault(props: {
 	params: Promise<{ owner: string; name: string }>;
 }) {
-	const { owner, name } = await props.params;
-
 	return (
-		<RepoListShell owner={owner} name={name} activeTab="actions">
-			<Suspense fallback={<ListSkeleton />}>
-				<ActionsListContent owner={owner} name={name} />
-			</Suspense>
+		<RepoListShell paramsPromise={props.params} activeTab="actions">
+			<ActionsListContent paramsPromise={props.params} />
 		</RepoListShell>
 	);
 }
 
 async function ActionsListContent({
-	owner,
-	name,
+	paramsPromise,
 }: {
-	owner: string;
-	name: string;
+	paramsPromise: Promise<{ owner: string; name: string }>;
 }) {
+	const { owner, name } = await paramsPromise;
+
 	const initialData = await serverQueries.listWorkflowRuns.queryPromise({
 		ownerLogin: owner,
 		name,

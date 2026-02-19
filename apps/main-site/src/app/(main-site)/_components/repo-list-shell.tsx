@@ -1,21 +1,22 @@
 import { Link } from "@packages/ui/components/link";
 import { cn } from "@packages/ui/lib/utils";
 import { ArrowLeft, GitPullRequest, Play, TriangleAlert } from "lucide-react";
-import type { ReactNode } from "react";
+import { type ReactNode, Suspense } from "react";
+import { ListSkeleton } from "./skeletons";
 
 type RepoTab = "pulls" | "issues" | "actions";
 
-export function RepoListShell({
-	owner,
-	name,
+export async function RepoListShell({
+	paramsPromise,
 	activeTab,
 	children,
 }: {
-	owner: string;
-	name: string;
+	paramsPromise: Promise<{ owner: string; name: string }>;
 	activeTab: RepoTab;
 	children: ReactNode;
 }) {
+	const { owner, name } = await paramsPromise;
+
 	return (
 		<div className="flex h-full flex-col bg-sidebar">
 			<div className="shrink-0 border-b border-sidebar-border">
@@ -72,7 +73,9 @@ export function RepoListShell({
 					</Link>
 				</div>
 			</div>
-			<div className="flex-1 overflow-y-auto">{children}</div>
+			<div className="flex-1 overflow-y-auto">
+				<Suspense fallback={<ListSkeleton />}>{children}</Suspense>
+			</div>
 		</div>
 	);
 }
