@@ -9,7 +9,15 @@ import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
 import { useHotkey } from "@tanstack/react-hotkeys";
 import { Loader2, MessageCircle } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+/** Scroll the PR list item with the given number into view within its scroll container */
+function scrollPrIntoView(prNumber: number) {
+	requestAnimationFrame(() => {
+		const el = document.querySelector(`[data-pr-number="${prNumber}"]`);
+		el?.scrollIntoView({ block: "nearest" });
+	});
+}
 
 const PAGE_SIZE = 30;
 
@@ -52,11 +60,11 @@ export function PrListClient({
 		[client, owner, name, stateFilter],
 	);
 
-	const {
-		items: prs,
-		sentinelRef,
-		isLoading,
-	} = useInfinitePaginationWithInitial(paginatedAtom, initialData);
+	const pagination = useInfinitePaginationWithInitial(
+		paginatedAtom,
+		initialData,
+	);
+	const { items: prs, sentinelRef, isLoading } = pagination;
 
 	const pathname = usePathname();
 	const router = useRouter();
@@ -68,15 +76,51 @@ export function PrListClient({
 	// Find the index of the currently active PR for j/k navigation
 	const activeIndex = prs.findIndex((pr) => pr.number === activeNumber);
 
+	// When we load more pages via j at the end, navigate to the first new item
+	const pendingNavRef = useRef<"next" | null>(null);
+	const prevCountRef = useRef(prs.length);
+
+	useEffect(() => {
+		if (prs.length > prevCountRef.current && pendingNavRef.current === "next") {
+			const nextIndex = prevCountRef.current; // first item of the new page
+			const pr = prs[nextIndex];
+			if (pr) {
+				router.push(`/${owner}/${name}/pulls/${pr.number}`);
+				scrollPrIntoView(pr.number);
+			}
+			pendingNavRef.current = null;
+		}
+		prevCountRef.current = prs.length;
+	}, [prs.length, prs, owner, name, router]);
+
+	const navigateTo = useCallback(
+		(index: number) => {
+			const pr = prs[index];
+			if (pr) {
+				router.push(`/${owner}/${name}/pulls/${pr.number}`);
+				scrollPrIntoView(pr.number);
+			}
+		},
+		[prs, owner, name, router],
+	);
+
 	// j — open next PR (matches GitHub issue/PR list navigation)
 	useHotkey("J", (e) => {
 		e.preventDefault();
 		if (prs.length === 0) return;
-		const nextIndex =
-			activeIndex === -1 ? 0 : Math.min(activeIndex + 1, prs.length - 1);
-		const pr = prs[nextIndex];
-		if (pr) {
-			router.push(`/${owner}/${name}/pulls/${pr.number}`);
+
+		if (activeIndex === -1) {
+			navigateTo(0);
+			return;
+		}
+
+		const nextIndex = activeIndex + 1;
+		if (nextIndex < prs.length) {
+			navigateTo(nextIndex);
+		} else if (pagination.hasMore) {
+			// At the end of loaded items — load more, then navigate once loaded
+			pendingNavRef.current = "next";
+			pagination.loadMore();
 		}
 	});
 
@@ -85,10 +129,7 @@ export function PrListClient({
 		e.preventDefault();
 		if (prs.length === 0) return;
 		const nextIndex = activeIndex === -1 ? 0 : Math.max(activeIndex - 1, 0);
-		const pr = prs[nextIndex];
-		if (pr) {
-			router.push(`/${owner}/${name}/pulls/${pr.number}`);
-		}
+		navigateTo(nextIndex);
 	});
 
 	// o — also open (for when no PR is active yet, opens the first one)
@@ -96,10 +137,7 @@ export function PrListClient({
 		e.preventDefault();
 		if (prs.length === 0) return;
 		const index = activeIndex === -1 ? 0 : activeIndex;
-		const pr = prs[index];
-		if (pr) {
-			router.push(`/${owner}/${name}/pulls/${pr.number}`);
-		}
+		navigateTo(index);
 	});
 
 	return (
@@ -127,6 +165,7 @@ export function PrListClient({
 			{prs.map((pr) => (
 				<Link
 					key={pr.number}
+					data-pr-number={pr.number}
 					href={`/${owner}/${name}/pulls/${pr.number}`}
 					className={cn(
 						"flex items-start gap-2 rounded-md px-2 py-1.5 text-sm transition-colors no-underline",
