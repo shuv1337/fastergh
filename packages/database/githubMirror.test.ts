@@ -20,6 +20,7 @@ import { createConvexTest } from "./testing";
 // ---------------------------------------------------------------------------
 
 type ExitEncoded = { _tag: string; value?: unknown; cause?: unknown };
+const TEST_USER_ID = "test-user-id";
 
 const assertSuccess = (result: unknown): unknown => {
 	const exit = result as ExitEncoded;
@@ -35,7 +36,7 @@ const assertSuccess = (result: unknown): unknown => {
 const makeRawEvent = (overrides: {
 	deliveryId: string;
 	eventName: string;
-	action?: string;
+	action?: string | null;
 	repositoryId: number;
 	payloadJson: string;
 	processState?: "pending" | "processed" | "failed" | "retry";
@@ -257,6 +258,69 @@ const makePrReviewPayload = (opts: {
 		},
 	});
 
+/** Build a minimal pull_request_review_comment webhook payload */
+const makePrReviewCommentPayload = (opts: {
+	action: string;
+	reviewCommentId: number;
+	prNumber: number;
+	body: string;
+	prTitle?: string;
+	path?: string;
+	line?: number;
+	startLine?: number;
+	side?: string;
+	startSide?: string;
+	reviewId?: number;
+	inReplyToId?: number;
+	htmlUrl?: string;
+	createdAt?: string;
+	updatedAt?: string;
+	user?: {
+		id: number;
+		login: string;
+		avatar_url?: string | null;
+		type?: string;
+	};
+}) =>
+	JSON.stringify({
+		action: opts.action,
+		comment: {
+			id: opts.reviewCommentId,
+			pull_request_review_id: opts.reviewId ?? 9101,
+			in_reply_to_id: opts.inReplyToId ?? null,
+			body: opts.body,
+			path: opts.path ?? "src/index.ts",
+			line: opts.line ?? 12,
+			original_line: opts.line ?? 12,
+			start_line: opts.startLine ?? null,
+			side: opts.side ?? "RIGHT",
+			start_side: opts.startSide ?? null,
+			commit_id: "sha-review-comment",
+			original_commit_id: "sha-review-comment-original",
+			html_url:
+				opts.htmlUrl ??
+				"https://github.com/testowner/testrepo/pull/42#discussion_r9901",
+			user: opts.user ?? {
+				id: 2101,
+				login: "inline-reviewer",
+				avatar_url: null,
+				type: "User",
+			},
+			created_at: opts.createdAt ?? "2026-02-18T12:00:00Z",
+			updated_at: opts.updatedAt ?? "2026-02-18T12:00:00Z",
+		},
+		pull_request: {
+			number: opts.prNumber,
+			title: opts.prTitle ?? `PR #${opts.prNumber}`,
+		},
+		sender: opts.user ?? {
+			id: 2101,
+			login: "inline-reviewer",
+			avatar_url: null,
+			type: "User",
+		},
+	});
+
 /** Seed a repository in the DB so webhook processing can find it */
 const seedRepository = (
 	t: ReturnType<typeof createConvexTest>,
@@ -266,6 +330,7 @@ const seedRepository = (
 ) =>
 	Effect.promise(() =>
 		t.run(async (ctx) => {
+			const now = Date.now();
 			await ctx.db.insert("github_repositories", {
 				githubRepoId: repositoryId,
 				installationId: 0,
@@ -280,11 +345,27 @@ const seedRepository = (
 				disabled: false,
 				fork: false,
 				pushedAt: null,
-				githubUpdatedAt: Date.now(),
-				cachedAt: Date.now(),
+				githubUpdatedAt: now,
+				cachedAt: now,
+			});
+
+			await ctx.db.insert("github_user_repo_permissions", {
+				userId: TEST_USER_ID,
+				repositoryId,
+				githubUserId: 1001,
+				pull: true,
+				triage: true,
+				push: true,
+				maintain: true,
+				admin: true,
+				roleName: "admin",
+				syncedAt: now,
 			});
 		}),
 	);
+
+const authClient = (t: ReturnType<typeof createConvexTest>) =>
+	t.withIdentity({ subject: TEST_USER_ID });
 
 /** Insert a raw webhook event into the DB */
 const insertRawEvent = (
@@ -302,11 +383,16 @@ const processEvent = (
 	t: ReturnType<typeof createConvexTest>,
 	deliveryId: string,
 ) =>
-	Effect.promise(() =>
-		t.mutation(internal.rpc.webhookProcessor.processWebhookEvent, {
-			deliveryId,
-		}),
-	);
+	Effect.promise(async () => {
+		const result = await t.mutation(
+			internal.rpc.webhookProcessor.processWebhookEvent,
+			{
+				deliveryId,
+			},
+		);
+		await t.finishInProgressScheduledFunctions();
+		return result;
+	});
 
 /** Query a table and return all docs */
 const collectTable = <T>(
@@ -805,26 +891,51 @@ describe("Projection Correctness", () => {
 			);
 			yield* processEvent(t, "delivery-proj-pr");
 
-			const overviews = yield* collectTable(t, "view_repo_overview");
-			expect(overviews).toHaveLength(1);
-			expect(overviews[0]).toMatchObject({
+			const overviewResult = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.getRepoOverview, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+				}),
+			);
+			const overview = assertSuccess(overviewResult);
+			expect(overview).toMatchObject({
 				repositoryId,
 				fullName: "testowner/testrepo",
 				openPrCount: 1,
 				openIssueCount: 1,
 			});
 
-			const prViews = yield* collectTable(t, "view_repo_pull_request_list");
-			expect(prViews).toHaveLength(1);
-			expect(prViews[0]).toMatchObject({
+			const prsResult = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listPullRequests, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+				}),
+			);
+			const prs = assertSuccess(prsResult) as Array<{
+				number: number;
+				state: string;
+				title: string;
+			}>;
+			expect(prs).toHaveLength(1);
+			expect(prs[0]).toMatchObject({
 				number: 10,
 				state: "open",
 				title: "Projection test PR",
 			});
 
-			const issueViews = yield* collectTable(t, "view_repo_issue_list");
-			expect(issueViews).toHaveLength(1);
-			expect(issueViews[0]).toMatchObject({
+			const issuesResult = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listIssues, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+				}),
+			);
+			const issues = assertSuccess(issuesResult) as Array<{
+				number: number;
+				state: string;
+				title: string;
+			}>;
+			expect(issues).toHaveLength(1);
+			expect(issues[0]).toMatchObject({
 				number: 1,
 				state: "open",
 				title: "Projection test issue",
@@ -936,11 +1047,16 @@ describe("Projection Correctness", () => {
 			);
 			yield* processEvent(t, "delivery-state-open");
 
-			let overviews = yield* collectTable<{ openIssueCount: number }>(
-				t,
-				"view_repo_overview",
+			let overviewResult = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.getRepoOverview, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+				}),
 			);
-			expect(overviews[0]).toMatchObject({ openIssueCount: 1 });
+			let overview = assertSuccess(overviewResult) as {
+				openIssueCount: number;
+			};
+			expect(overview).toMatchObject({ openIssueCount: 1 });
 
 			yield* insertRawEvent(
 				t,
@@ -961,15 +1077,24 @@ describe("Projection Correctness", () => {
 			);
 			yield* processEvent(t, "delivery-state-close");
 
-			overviews = yield* collectTable(t, "view_repo_overview");
-			expect(overviews[0]).toMatchObject({ openIssueCount: 0 });
-
-			const issueViews = yield* collectTable<{ state: string }>(
-				t,
-				"view_repo_issue_list",
+			overviewResult = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.getRepoOverview, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+				}),
 			);
-			expect(issueViews).toHaveLength(1);
-			expect(issueViews[0]).toMatchObject({ state: "closed" });
+			overview = assertSuccess(overviewResult) as { openIssueCount: number };
+			expect(overview).toMatchObject({ openIssueCount: 0 });
+
+			const issuesResult = yield* Effect.promise(() =>
+				t.query(api.rpc.projectionQueries.listIssues, {
+					ownerLogin: "testowner",
+					name: "testrepo",
+				}),
+			);
+			const issues = assertSuccess(issuesResult) as Array<{ state: string }>;
+			expect(issues).toHaveLength(1);
+			expect(issues[0]).toMatchObject({ state: "closed" });
 		}),
 	);
 });
@@ -1494,11 +1619,12 @@ describe("Optimistic Write Operations", () => {
 	it.effect("createIssue mutation creates a pending write operation", () =>
 		Effect.gen(function* () {
 			const t = createConvexTest();
+			const client = authClient(t);
 			const repositoryId = 12345;
 			yield* seedRepository(t, repositoryId);
 
 			const result = yield* Effect.promise(() =>
-				t.mutation(api.rpc.githubWrite.createIssue, {
+				client.mutation(api.rpc.githubWrite.createIssue, {
 					correlationId: "corr-issue-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
@@ -1506,6 +1632,7 @@ describe("Optimistic Write Operations", () => {
 					title: "New issue from UI",
 				}),
 			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 			const value = assertSuccess(result);
 			expect(value).toMatchObject({
 				correlationId: "corr-issue-1",
@@ -1532,11 +1659,12 @@ describe("Optimistic Write Operations", () => {
 	it.effect("createComment mutation creates a pending write operation", () =>
 		Effect.gen(function* () {
 			const t = createConvexTest();
+			const client = authClient(t);
 			const repositoryId = 12345;
 			yield* seedRepository(t, repositoryId);
 
 			const result = yield* Effect.promise(() =>
-				t.mutation(api.rpc.githubWrite.createComment, {
+				client.mutation(api.rpc.githubWrite.createComment, {
 					correlationId: "corr-comment-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
@@ -1545,6 +1673,7 @@ describe("Optimistic Write Operations", () => {
 					body: "A comment from UI",
 				}),
 			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 			const value = assertSuccess(result);
 			expect(value).toMatchObject({
 				correlationId: "corr-comment-1",
@@ -1565,12 +1694,13 @@ describe("Optimistic Write Operations", () => {
 	it.effect("markWriteCompleted transitions pending → completed", () =>
 		Effect.gen(function* () {
 			const t = createConvexTest();
+			const client = authClient(t);
 			const repositoryId = 12345;
 			yield* seedRepository(t, repositoryId);
 
 			// Create a pending write op
 			yield* Effect.promise(() =>
-				t.mutation(api.rpc.githubWrite.createIssue, {
+				client.mutation(api.rpc.githubWrite.createIssue, {
 					correlationId: "corr-complete-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
@@ -1578,6 +1708,7 @@ describe("Optimistic Write Operations", () => {
 					title: "Issue to complete",
 				}),
 			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 
 			const result = yield* Effect.promise(() =>
 				t.mutation(internal.rpc.githubWrite.markWriteCompleted, {
@@ -1612,11 +1743,12 @@ describe("Optimistic Write Operations", () => {
 	it.effect("markWriteFailed transitions pending → failed", () =>
 		Effect.gen(function* () {
 			const t = createConvexTest();
+			const client = authClient(t);
 			const repositoryId = 12345;
 			yield* seedRepository(t, repositoryId);
 
 			yield* Effect.promise(() =>
-				t.mutation(api.rpc.githubWrite.createIssue, {
+				client.mutation(api.rpc.githubWrite.createIssue, {
 					correlationId: "corr-fail-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
@@ -1624,6 +1756,7 @@ describe("Optimistic Write Operations", () => {
 					title: "Failing issue",
 				}),
 			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 
 			const result = yield* Effect.promise(() =>
 				t.mutation(internal.rpc.githubWrite.markWriteFailed, {
@@ -1652,12 +1785,13 @@ describe("Optimistic Write Operations", () => {
 	it.effect("webhook reconciliation confirms a completed write op", () =>
 		Effect.gen(function* () {
 			const t = createConvexTest();
+			const client = authClient(t);
 			const repositoryId = 12345;
 			yield* seedRepository(t, repositoryId);
 
 			// Create a pending write op for creating issue #99
 			yield* Effect.promise(() =>
-				t.mutation(api.rpc.githubWrite.createIssue, {
+				client.mutation(api.rpc.githubWrite.createIssue, {
 					correlationId: "corr-confirm-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
@@ -1665,6 +1799,7 @@ describe("Optimistic Write Operations", () => {
 					title: "Issue to be confirmed",
 				}),
 			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 
 			// Mark it completed (as if the action succeeded)
 			yield* Effect.promise(() =>
@@ -1710,12 +1845,13 @@ describe("Optimistic Write Operations", () => {
 	it.effect("listWriteOperations returns ops for a repository", () =>
 		Effect.gen(function* () {
 			const t = createConvexTest();
+			const client = authClient(t);
 			const repositoryId = 12345;
 			yield* seedRepository(t, repositoryId);
 
 			// Create two write ops
 			yield* Effect.promise(() =>
-				t.mutation(api.rpc.githubWrite.createIssue, {
+				client.mutation(api.rpc.githubWrite.createIssue, {
 					correlationId: "corr-list-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
@@ -1723,9 +1859,10 @@ describe("Optimistic Write Operations", () => {
 					title: "First issue",
 				}),
 			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 
 			yield* Effect.promise(() =>
-				t.mutation(api.rpc.githubWrite.createComment, {
+				client.mutation(api.rpc.githubWrite.createComment, {
 					correlationId: "corr-list-2",
 					ownerLogin: "testowner",
 					name: "testrepo",
@@ -1734,9 +1871,10 @@ describe("Optimistic Write Operations", () => {
 					body: "A comment",
 				}),
 			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 
 			const result = yield* Effect.promise(() =>
-				t.query(api.rpc.githubWrite.listWriteOperations, {
+				client.query(api.rpc.githubWrite.listWriteOperations, {
 					repositoryId,
 				}),
 			);
@@ -1755,11 +1893,12 @@ describe("Optimistic Write Operations", () => {
 	it.effect("updateIssueState mutation creates a pending write operation", () =>
 		Effect.gen(function* () {
 			const t = createConvexTest();
+			const client = authClient(t);
 			const repositoryId = 12345;
 			yield* seedRepository(t, repositoryId);
 
 			const result = yield* Effect.promise(() =>
-				t.mutation(api.rpc.githubWrite.updateIssueState, {
+				client.mutation(api.rpc.githubWrite.updateIssueState, {
 					correlationId: "corr-close-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
@@ -1768,6 +1907,7 @@ describe("Optimistic Write Operations", () => {
 					state: "closed",
 				}),
 			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 			const value = assertSuccess(result);
 			expect(value).toMatchObject({
 				correlationId: "corr-close-1",
@@ -1798,11 +1938,12 @@ describe("Optimistic Write Operations", () => {
 	it.effect("mergePullRequest mutation creates a pending write operation", () =>
 		Effect.gen(function* () {
 			const t = createConvexTest();
+			const client = authClient(t);
 			const repositoryId = 12345;
 			yield* seedRepository(t, repositoryId);
 
 			const result = yield* Effect.promise(() =>
-				t.mutation(api.rpc.githubWrite.mergePullRequest, {
+				client.mutation(api.rpc.githubWrite.mergePullRequest, {
 					correlationId: "corr-merge-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
@@ -1811,6 +1952,7 @@ describe("Optimistic Write Operations", () => {
 					mergeMethod: "squash",
 				}),
 			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 			const value = assertSuccess(result);
 			expect(value).toMatchObject({
 				correlationId: "corr-merge-1",
@@ -1833,12 +1975,13 @@ describe("Optimistic Write Operations", () => {
 	it.effect("duplicate correlationId is rejected for createIssue", () =>
 		Effect.gen(function* () {
 			const t = createConvexTest();
+			const client = authClient(t);
 			const repositoryId = 12345;
 			yield* seedRepository(t, repositoryId);
 
 			// First write succeeds
 			yield* Effect.promise(() =>
-				t.mutation(api.rpc.githubWrite.createIssue, {
+				client.mutation(api.rpc.githubWrite.createIssue, {
 					correlationId: "corr-dupe-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
@@ -1846,10 +1989,11 @@ describe("Optimistic Write Operations", () => {
 					title: "First",
 				}),
 			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 
 			// Second write with same correlationId
 			const result = yield* Effect.promise(() =>
-				t.mutation(api.rpc.githubWrite.createIssue, {
+				client.mutation(api.rpc.githubWrite.createIssue, {
 					correlationId: "corr-dupe-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
@@ -1857,6 +2001,7 @@ describe("Optimistic Write Operations", () => {
 					title: "Duplicate",
 				}),
 			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 
 			// Should be a failure (DuplicateOperationError)
 			const exit = result as { _tag: string; cause?: unknown };
@@ -1875,7 +2020,7 @@ describe("Optimistic Write Operations", () => {
 // Paginated Query Tests
 // ---------------------------------------------------------------------------
 
-/** Seed N pull request rows directly into the view table */
+/** Seed N pull request rows in normalized table */
 const seedPrViewRows = (
 	t: ReturnType<typeof createConvexTest>,
 	repositoryId: number,
@@ -1885,29 +2030,33 @@ const seedPrViewRows = (
 	Effect.promise(() =>
 		t.run(async (ctx) => {
 			for (let i = 1; i <= count; i++) {
+				const now = Date.now() - (count - i) * 1000;
 				const state = stateOverride ?? (i % 3 === 0 ? "closed" : "open");
-				await ctx.db.insert("view_repo_pull_request_list", {
+				await ctx.db.insert("github_pull_requests", {
 					repositoryId,
 					githubPrId: 6000 + i,
 					number: i,
 					state,
 					draft: false,
 					title: `PR #${i}`,
-					authorLogin: "testuser",
-					authorAvatarUrl: null,
+					body: null,
+					authorUserId: null,
+					assigneeUserIds: [],
+					requestedReviewerUserIds: [],
 					headRefName: `feature-${i}`,
 					baseRefName: "main",
-					commentCount: 0,
-					reviewCount: 0,
-					lastCheckConclusion: null,
-					githubUpdatedAt: Date.now() - (count - i) * 1000,
-					sortUpdated: Date.now() - (count - i) * 1000,
+					headSha: `sha-${i}`,
+					mergeableState: null,
+					mergedAt: null,
+					closedAt: state === "closed" ? now : null,
+					githubUpdatedAt: now,
+					cachedAt: now,
 				});
 			}
 		}),
 	);
 
-/** Seed N issue rows directly into the view table */
+/** Seed N issue rows in normalized table */
 const seedIssueViewRows = (
 	t: ReturnType<typeof createConvexTest>,
 	repositoryId: number,
@@ -1917,19 +2066,23 @@ const seedIssueViewRows = (
 	Effect.promise(() =>
 		t.run(async (ctx) => {
 			for (let i = 1; i <= count; i++) {
+				const now = Date.now() - (count - i) * 1000;
 				const state = stateOverride ?? (i % 4 === 0 ? "closed" : "open");
-				await ctx.db.insert("view_repo_issue_list", {
+				await ctx.db.insert("github_issues", {
 					repositoryId,
 					githubIssueId: 5000 + i,
 					number: i,
 					state,
 					title: `Issue #${i}`,
-					authorLogin: "testuser",
-					authorAvatarUrl: null,
+					body: null,
+					authorUserId: null,
+					assigneeUserIds: [],
 					labelNames: [],
 					commentCount: 0,
-					githubUpdatedAt: Date.now() - (count - i) * 1000,
-					sortUpdated: Date.now() - (count - i) * 1000,
+					isPullRequest: false,
+					closedAt: state === "closed" ? now : null,
+					githubUpdatedAt: now,
+					cachedAt: now,
 				});
 			}
 		}),
@@ -2895,6 +3048,171 @@ describe("Pull Request Review Events", () => {
 				login: string;
 			}>(t, "github_users");
 			expect(users).toHaveLength(2);
+		}),
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Pull Request Review Comment Event Tests
+// ---------------------------------------------------------------------------
+
+describe("Pull Request Review Comment Events", () => {
+	it.effect("pr_review_comment created event inserts a review comment", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-review-comment-created",
+					eventName: "pull_request_review_comment",
+					action: "created",
+					repositoryId,
+					payloadJson: makePrReviewCommentPayload({
+						action: "created",
+						reviewCommentId: 9901,
+						prNumber: 42,
+						body: "Please rename this variable.",
+						path: "src/main.ts",
+						line: 27,
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-review-comment-created");
+
+			const reviewComments = yield* collectTable<{
+				githubReviewCommentId: number;
+				pullRequestNumber: number;
+				githubReviewId: number | null;
+				body: string;
+				path: string | null;
+				line: number | null;
+				authorUserId: number | null;
+			}>(t, "github_pull_request_review_comments");
+
+			expect(reviewComments).toHaveLength(1);
+			expect(reviewComments[0]).toMatchObject({
+				githubReviewCommentId: 9901,
+				pullRequestNumber: 42,
+				githubReviewId: 9101,
+				body: "Please rename this variable.",
+				path: "src/main.ts",
+				line: 27,
+				authorUserId: 2101,
+			});
+		}),
+	);
+
+	it.effect(
+		"pr_review_comment edited event updates an existing review comment",
+		() =>
+			Effect.gen(function* () {
+				const t = createConvexTest();
+				const repositoryId = 12345;
+				yield* seedRepository(t, repositoryId);
+
+				yield* insertRawEvent(
+					t,
+					makeRawEvent({
+						deliveryId: "delivery-review-comment-create-edit",
+						eventName: "pull_request_review_comment",
+						action: "created",
+						repositoryId,
+						payloadJson: makePrReviewCommentPayload({
+							action: "created",
+							reviewCommentId: 9902,
+							prNumber: 9,
+							body: "Initial inline note",
+							updatedAt: "2026-02-18T12:00:00Z",
+						}),
+					}),
+				);
+				yield* processEvent(t, "delivery-review-comment-create-edit");
+
+				yield* insertRawEvent(
+					t,
+					makeRawEvent({
+						deliveryId: "delivery-review-comment-edited",
+						eventName: "pull_request_review_comment",
+						action: "edited",
+						repositoryId,
+						payloadJson: makePrReviewCommentPayload({
+							action: "edited",
+							reviewCommentId: 9902,
+							prNumber: 9,
+							body: "Updated inline note",
+							updatedAt: "2026-02-18T12:05:00Z",
+						}),
+					}),
+				);
+				yield* processEvent(t, "delivery-review-comment-edited");
+
+				const reviewComments = yield* collectTable<{
+					githubReviewCommentId: number;
+					body: string;
+				}>(t, "github_pull_request_review_comments");
+
+				expect(reviewComments).toHaveLength(1);
+				expect(reviewComments[0]).toMatchObject({
+					githubReviewCommentId: 9902,
+					body: "Updated inline note",
+				});
+			}),
+	);
+
+	it.effect("pr_review_comment deleted event removes the review comment", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-review-comment-create-del",
+					eventName: "pull_request_review_comment",
+					action: "created",
+					repositoryId,
+					payloadJson: makePrReviewCommentPayload({
+						action: "created",
+						reviewCommentId: 9903,
+						prNumber: 11,
+						body: "Will delete this",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-review-comment-create-del");
+
+			let reviewComments = yield* collectTable(
+				t,
+				"github_pull_request_review_comments",
+			);
+			expect(reviewComments).toHaveLength(1);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-review-comment-deleted",
+					eventName: "pull_request_review_comment",
+					action: "deleted",
+					repositoryId,
+					payloadJson: makePrReviewCommentPayload({
+						action: "deleted",
+						reviewCommentId: 9903,
+						prNumber: 11,
+						body: "Will delete this",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-review-comment-deleted");
+
+			reviewComments = yield* collectTable(
+				t,
+				"github_pull_request_review_comments",
+			);
+			expect(reviewComments).toHaveLength(0);
 		}),
 	);
 });

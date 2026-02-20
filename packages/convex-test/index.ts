@@ -1269,7 +1269,8 @@ function asyncSyscallImpl() {
 				const componentPath = getCurrentComponentPath();
 				setTimeout(
 					(async () => {
-						const canceled = await withAuth().runInComponent(
+						try {
+							const canceled = await withAuth().runInComponent(
 							componentPath,
 							async () => {
 								const job = db.get(jobId) as ScheduledFunction;
@@ -1284,36 +1285,45 @@ function asyncSyscallImpl() {
 								db.patch(jobId, { state: { kind: "inProgress" } });
 								return false;
 							},
-						);
-						if (canceled) {
-							return;
-						}
-						try {
-							await withAuth().fun(functionPath, parsedArgs);
-						} catch (error) {
-							console.error(
-								`Error when running scheduled function ${name}`,
-								error,
 							);
-							await withAuth().runInComponent(componentPath, async () => {
-								db.patch(jobId, {
-									state: { kind: "failed" },
-									completedTime: Date.now(),
+							if (canceled) {
+								return;
+							}
+							try {
+								await withAuth().fun(functionPath, parsedArgs);
+							} catch (error) {
+								console.error(
+									`Error when running scheduled function ${name}`,
+									error,
+								);
+								await withAuth().runInComponent(componentPath, async () => {
+									db.patch(jobId, {
+										state: { kind: "failed" },
+										completedTime: Date.now(),
+									});
 								});
+								db.jobFinished(jobId);
+								return;
+							}
+							await withAuth().runInComponent(componentPath, async () => {
+								const job = db.get(jobId) as ScheduledFunction;
+								if (job.state.kind !== "inProgress") {
+									throw new Error(
+										`\`convexTest\` invariant error: Unexpected scheduled function state after it finished running: ${job.state.kind}`,
+									);
+								}
+								db.patch(jobId, { state: { kind: "success" } });
 							});
 							db.jobFinished(jobId);
-							return;
-						}
-						await withAuth().runInComponent(componentPath, async () => {
-							const job = db.get(jobId) as ScheduledFunction;
-							if (job.state.kind !== "inProgress") {
-								throw new Error(
-									`\`convexTest\` invariant error: Unexpected scheduled function state after it finished running: ${job.state.kind}`,
-								);
+						} catch (error) {
+							if (
+								error instanceof Error &&
+								error.message.includes("Write outside of transaction")
+							) {
+								return;
 							}
-							db.patch(jobId, { state: { kind: "success" } });
-						});
-						db.jobFinished(jobId);
+							throw error;
+						}
 					}) as () => void,
 					tsInSecs * 1000 - Date.now(),
 				);
