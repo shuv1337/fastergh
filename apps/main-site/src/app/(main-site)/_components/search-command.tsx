@@ -870,6 +870,7 @@ export function SearchCommand() {
 		useState<ReadonlyArray<RecentEntry>>(DEFAULT_RECENT);
 	const debouncedQuery = useDebouncedValue(query, 250);
 	const repo = useRepoFromPathname();
+	const pathname = usePathname();
 	const router = useRouter();
 
 	useHotkey("Mod+K", (event) => {
@@ -900,8 +901,8 @@ export function SearchCommand() {
 
 	const goToGitHub = useCallback(() => {
 		setOpen(false);
-		window.location.replace("https://github.com");
-	}, []);
+		window.location.replace(`https://github.com${pathname}`);
+	}, [pathname]);
 
 	const trimmed = debouncedQuery.trim();
 	const parsedQuery = useMemo(
