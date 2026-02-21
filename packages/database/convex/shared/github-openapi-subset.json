@@ -2446,7 +2446,7 @@
           },
           {
             "name": "sha",
-            "description": "SHA or branch to start listing commits from. Default: the repository’s default branch (usually `main`).",
+            "description": "SHA or branch to start listing commits from. Default: the repository\u2019s default branch (usually `main`).",
             "in": "query",
             "required": false,
             "schema": {
@@ -2944,7 +2944,7 @@
           },
           {
             "name": "ref",
-            "description": "The name of the commit/branch/tag. Default: the repository’s default branch.",
+            "description": "The name of the commit/branch/tag. Default: the repository\u2019s default branch.",
             "in": "query",
             "required": false,
             "schema": {
@@ -4634,7 +4634,8 @@
                   "type": "string"
                 },
                 "description": {
-                  "type": "string"
+                  "type": "string",
+                  "nullable": true
                 },
                 "color": {
                   "type": "string"
@@ -4723,7 +4724,8 @@
                 "type": "string"
               },
               "repo": {
-                "$ref": "#/components/schemas/repository"
+                "$ref": "#/components/schemas/repository",
+                "nullable": true
               },
               "sha": {
                 "type": "string"
@@ -4750,7 +4752,8 @@
                 "type": "string"
               },
               "repo": {
-                "$ref": "#/components/schemas/repository"
+                "$ref": "#/components/schemas/repository",
+                "nullable": true
               },
               "sha": {
                 "type": "string"

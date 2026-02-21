@@ -155,6 +155,59 @@ while (changed) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Patch known GitHub OpenAPI spec inaccuracies.
+//
+// GitHub's spec marks some fields as non-nullable that the API actually
+// returns as null. We fix them here so the generated Effect Schema client
+// stays in sync with real-world responses.
+// ---------------------------------------------------------------------------
+
+const schemaOverrides: Record<
+	string,
+	(schema: Record<string, unknown>) => void
+> = {
+	/**
+	 * pull-request-simple → labels[].description is nullable in practice.
+	 * GitHub labels created without a description have `"description": null`.
+	 */
+	"pull-request-simple": (schema) => {
+		const props = schema.properties as Record<string, unknown>;
+
+		// labels[].description is nullable
+		const labels = props?.labels as Record<string, unknown> | undefined;
+		const items = labels?.items as Record<string, unknown> | undefined;
+		const labelProps = items?.properties as Record<string, unknown> | undefined;
+		if (labelProps?.description) {
+			labelProps.description = { type: "string", nullable: true };
+		}
+
+		// head.repo and base.repo are nullable (deleted fork PRs)
+		for (const field of ["head", "base"]) {
+			const struct = props?.[field] as Record<string, unknown> | undefined;
+			const structProps = struct?.properties as
+				| Record<string, unknown>
+				| undefined;
+			if (
+				structProps?.repo &&
+				typeof structProps.repo === "object" &&
+				!("nullable" in (structProps.repo as Record<string, unknown>))
+			) {
+				const existing = structProps.repo as Record<string, unknown>;
+				existing.nullable = true;
+			}
+		}
+	},
+};
+
+for (const [schemaName, patchFn] of Object.entries(schemaOverrides)) {
+	const target = components.schemas?.[schemaName];
+	if (target && typeof target === "object") {
+		patchFn(target as Record<string, unknown>);
+		console.log(`PATCH: Applied override for schema "${schemaName}"`);
+	}
+}
+
 // Clean up empty component sections
 for (const [key, value] of Object.entries(components)) {
 	if (
