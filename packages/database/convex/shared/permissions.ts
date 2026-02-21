@@ -1,5 +1,5 @@
 import { Context, Data, Effect, Option } from "effect";
-import { ConfectQueryCtx } from "../confect";
+import { ConfectMutationCtx, ConfectQueryCtx } from "../confect";
 
 // ---------------------------------------------------------------------------
 // Permission Level
@@ -223,6 +223,78 @@ export const requireMaintainAccess = (userId: string, repositoryId: number) =>
 export const requireAdminAccess = (userId: string, repositoryId: number) =>
 	Effect.gen(function* () {
 		yield* verifyRepoPermission(userId, repositoryId, "admin");
+		return { userId, repositoryId } satisfies RepoAccessProof;
+	});
+
+// ---------------------------------------------------------------------------
+// Mutation-context variants
+// ---------------------------------------------------------------------------
+
+/**
+ * verifyRepoPermission equivalent that runs in mutation context.
+ */
+export const verifyRepoPermissionForMutation = (
+	userId: string,
+	repositoryId: number,
+	required: GitHubPermissionLevel,
+) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+
+		const permRow = yield* ctx.db
+			.query("github_user_repo_permissions")
+			.withIndex("by_userId_and_repositoryId", (q) =>
+				q.eq("userId", userId).eq("repositoryId", repositoryId),
+			)
+			.first();
+
+		if (Option.isSome(permRow)) {
+			const level = highestPermissionFromFlags(permRow.value);
+			if (level !== null && meetsRequirement(level, required)) {
+				return level;
+			}
+			return yield* new InsufficientPermissionError({
+				userId,
+				repositoryId,
+				required,
+				actual: level,
+			});
+		}
+
+		const repo = yield* ctx.db
+			.query("github_repositories")
+			.withIndex("by_githubRepoId", (q) => q.eq("githubRepoId", repositoryId))
+			.first();
+
+		if (Option.isSome(repo) && !repo.value.private) {
+			if (meetsRequirement("pull", required)) {
+				return "pull" satisfies GitHubPermissionLevel;
+			}
+		}
+
+		return yield* new InsufficientPermissionError({
+			userId,
+			repositoryId,
+			required,
+			actual: Option.isSome(repo) && !repo.value.private ? "pull" : null,
+		});
+	});
+
+export const requireTriageAccessForMutation = (
+	userId: string,
+	repositoryId: number,
+) =>
+	Effect.gen(function* () {
+		yield* verifyRepoPermissionForMutation(userId, repositoryId, "triage");
+		return { userId, repositoryId } satisfies RepoAccessProof;
+	});
+
+export const requirePushAccessForMutation = (
+	userId: string,
+	repositoryId: number,
+) =>
+	Effect.gen(function* () {
+		yield* verifyRepoPermissionForMutation(userId, repositoryId, "push");
 		return { userId, repositoryId } satisfies RepoAccessProof;
 	});
 

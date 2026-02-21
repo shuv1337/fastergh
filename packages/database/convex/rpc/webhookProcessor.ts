@@ -125,6 +125,7 @@ const handleIssuesEvent = (
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const now = Date.now();
+		const action = str(payload.action);
 		const issue = obj(payload.issue);
 		const githubIssueId = num(issue.id);
 		const issueNumber = num(issue.number);
@@ -182,8 +183,38 @@ const handleIssuesEvent = (
 			.first();
 
 		if (Option.isSome(existing)) {
+			const shouldConfirmOptimistic =
+				existing.value.optimisticState === "pending" &&
+				((action === "opened" &&
+					existing.value.optimisticOperationType === "create_issue") ||
+					((action === "closed" || action === "reopened") &&
+						existing.value.optimisticOperationType === "update_issue_state") ||
+					((action === "labeled" || action === "unlabeled") &&
+						existing.value.optimisticOperationType === "update_labels") ||
+					((action === "assigned" || action === "unassigned") &&
+						existing.value.optimisticOperationType === "update_assignees"));
+
 			if (githubUpdatedAt >= existing.value.githubUpdatedAt) {
 				yield* ctx.db.patch(existing.value._id, data);
+				if (shouldConfirmOptimistic) {
+					yield* ctx.db.patch(existing.value._id, {
+						optimisticState: "confirmed",
+						optimisticErrorMessage: null,
+						optimisticErrorStatus: null,
+						optimisticUpdatedAt: now,
+					});
+				}
+				const updated = yield* ctx.db.get(existing.value._id);
+				if (Option.isSome(updated)) {
+					yield* syncIssueReplace(ctx.rawCtx, existing.value, updated.value);
+				}
+			} else if (shouldConfirmOptimistic) {
+				yield* ctx.db.patch(existing.value._id, {
+					optimisticState: "confirmed",
+					optimisticErrorMessage: null,
+					optimisticErrorStatus: null,
+					optimisticUpdatedAt: now,
+				});
 				const updated = yield* ctx.db.get(existing.value._id);
 				if (Option.isSome(updated)) {
 					yield* syncIssueReplace(ctx.rawCtx, existing.value, updated.value);
@@ -208,6 +239,7 @@ const handlePullRequestEvent = (
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const now = Date.now();
+		const action = str(payload.action);
 		const pr = obj(payload.pull_request);
 		const githubPrId = num(pr.id);
 		const prNumber = num(pr.number);
@@ -272,8 +304,39 @@ const handlePullRequestEvent = (
 			.first();
 
 		if (Option.isSome(existing)) {
+			const shouldConfirmOptimistic =
+				existing.value.optimisticState === "pending" &&
+				((action === "closed" &&
+					pr.merged === true &&
+					existing.value.optimisticOperationType === "merge_pull_request") ||
+					((action === "closed" || action === "reopened") &&
+						existing.value.optimisticOperationType === "update_issue_state") ||
+					((action === "labeled" || action === "unlabeled") &&
+						existing.value.optimisticOperationType === "update_labels") ||
+					((action === "assigned" || action === "unassigned") &&
+						existing.value.optimisticOperationType === "update_assignees"));
+
 			if (githubUpdatedAt >= existing.value.githubUpdatedAt) {
 				yield* ctx.db.patch(existing.value._id, data);
+				if (shouldConfirmOptimistic) {
+					yield* ctx.db.patch(existing.value._id, {
+						optimisticState: "confirmed",
+						optimisticErrorMessage: null,
+						optimisticErrorStatus: null,
+						optimisticUpdatedAt: now,
+					});
+				}
+				const updated = yield* ctx.db.get(existing.value._id);
+				if (Option.isSome(updated)) {
+					yield* syncPrReplace(ctx.rawCtx, existing.value, updated.value);
+				}
+			} else if (shouldConfirmOptimistic) {
+				yield* ctx.db.patch(existing.value._id, {
+					optimisticState: "confirmed",
+					optimisticErrorMessage: null,
+					optimisticErrorStatus: null,
+					optimisticUpdatedAt: now,
+				});
 				const updated = yield* ctx.db.get(existing.value._id);
 				if (Option.isSome(updated)) {
 					yield* syncPrReplace(ctx.rawCtx, existing.value, updated.value);
@@ -349,6 +412,18 @@ const handleIssueCommentEvent = (
 
 		if (Option.isSome(existing)) {
 			yield* ctx.db.patch(existing.value._id, data);
+			if (
+				action === "created" &&
+				existing.value.optimisticOperationType === "create_comment" &&
+				existing.value.optimisticState === "pending"
+			) {
+				yield* ctx.db.patch(existing.value._id, {
+					optimisticState: "confirmed",
+					optimisticErrorMessage: null,
+					optimisticErrorStatus: null,
+					optimisticUpdatedAt: now,
+				});
+			}
 			const updated = yield* ctx.db.get(existing.value._id);
 			if (Option.isSome(updated)) {
 				yield* syncCommentReplace(ctx.rawCtx, existing.value, updated.value);
@@ -475,6 +550,7 @@ const handlePullRequestReviewEvent = (
 ) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
+		const action = str(payload.action);
 		const review = obj(payload.review);
 		const pr = obj(payload.pull_request);
 		const githubReviewId = num(review.id);
@@ -504,16 +580,62 @@ const handlePullRequestReviewEvent = (
 			.first();
 
 		if (Option.isSome(existing)) {
-			yield* ctx.db.patch(existing.value._id, data);
+			yield* ctx.db.patch(existing.value._id, {
+				...data,
+				...(action === "submitted" &&
+				existing.value.optimisticOperationType === "submit_pr_review" &&
+				existing.value.optimisticState === "pending"
+					? {
+							optimisticState: "confirmed",
+							optimisticErrorMessage: null,
+							optimisticErrorStatus: null,
+							optimisticUpdatedAt: Date.now(),
+						}
+					: {}),
+			});
 			const updated = yield* ctx.db.get(existing.value._id);
 			if (Option.isSome(updated)) {
 				yield* syncReviewReplace(ctx.rawCtx, existing.value, updated.value);
 			}
 		} else {
-			const id = yield* ctx.db.insert("github_pull_request_reviews", data);
-			const inserted = yield* ctx.db.get(id);
-			if (Option.isSome(inserted)) {
-				yield* syncReviewInsert(ctx.rawCtx, inserted.value);
+			const pendingOptimisticReview = yield* ctx.db
+				.query("github_pull_request_reviews")
+				.withIndex("by_repositoryId_and_pullRequestNumber", (q) =>
+					q
+						.eq("repositoryId", repositoryId)
+						.eq("pullRequestNumber", pullRequestNumber),
+				)
+				.order("desc")
+				.first();
+
+			if (
+				Option.isSome(pendingOptimisticReview) &&
+				action === "submitted" &&
+				pendingOptimisticReview.value.optimisticOperationType ===
+					"submit_pr_review" &&
+				pendingOptimisticReview.value.optimisticState === "pending"
+			) {
+				yield* ctx.db.patch(pendingOptimisticReview.value._id, {
+					...data,
+					optimisticState: "confirmed",
+					optimisticErrorMessage: null,
+					optimisticErrorStatus: null,
+					optimisticUpdatedAt: Date.now(),
+				});
+				const updated = yield* ctx.db.get(pendingOptimisticReview.value._id);
+				if (Option.isSome(updated)) {
+					yield* syncReviewReplace(
+						ctx.rawCtx,
+						pendingOptimisticReview.value,
+						updated.value,
+					);
+				}
+			} else {
+				const id = yield* ctx.db.insert("github_pull_request_reviews", data);
+				const inserted = yield* ctx.db.get(id);
+				if (Option.isSome(inserted)) {
+					yield* syncReviewInsert(ctx.rawCtx, inserted.value);
+				}
 			}
 		}
 	});
@@ -1307,117 +1429,6 @@ const computeNextRetryAt = (attempt: number): number => {
 /** PR actions that should trigger a file diff sync */
 const PR_SYNC_ACTIONS = new Set(["opened", "synchronize", "reopened"]);
 
-// ---------------------------------------------------------------------------
-// Write-operation reconciliation — map webhook events to write op types
-// ---------------------------------------------------------------------------
-
-type WriteOpType =
-	| "create_issue"
-	| "create_comment"
-	| "update_issue_state"
-	| "merge_pull_request";
-
-/**
- * Determine if a webhook event corresponds to a write operation we may have initiated.
- * Returns { operationType, entityNumber } if so, null otherwise.
- */
-const matchWriteOperation = (
-	eventName: string,
-	action: string | null,
-	payload: Record<string, unknown>,
-): { operationType: WriteOpType; entityNumber: number } | null => {
-	if (eventName === "issues" && action === "opened") {
-		const issue = obj(payload.issue);
-		const issueNumber = num(issue.number);
-		if (issueNumber !== null) {
-			return { operationType: "create_issue", entityNumber: issueNumber };
-		}
-	}
-	if (eventName === "issue_comment" && action === "created") {
-		const issue = obj(payload.issue);
-		const issueNumber = num(issue.number);
-		if (issueNumber !== null) {
-			return { operationType: "create_comment", entityNumber: issueNumber };
-		}
-	}
-	if (
-		eventName === "issues" &&
-		(action === "closed" || action === "reopened")
-	) {
-		const issue = obj(payload.issue);
-		const issueNumber = num(issue.number);
-		if (issueNumber !== null) {
-			return {
-				operationType: "update_issue_state",
-				entityNumber: issueNumber,
-			};
-		}
-	}
-	if (eventName === "pull_request" && action === "closed") {
-		const pr = obj(payload.pull_request);
-		const prNumber = num(pr.number);
-		const merged = pr.merged === true;
-		if (prNumber !== null && merged) {
-			return { operationType: "merge_pull_request", entityNumber: prNumber };
-		}
-		// Also handle close-without-merge as update_issue_state
-		if (prNumber !== null && !merged) {
-			return { operationType: "update_issue_state", entityNumber: prNumber };
-		}
-	}
-	if (
-		eventName === "pull_request" &&
-		(action === "reopened" || action === "closed")
-	) {
-		const pr = obj(payload.pull_request);
-		const prNumber = num(pr.number);
-		if (prNumber !== null) {
-			return { operationType: "update_issue_state", entityNumber: prNumber };
-		}
-	}
-	return null;
-};
-
-/**
- * Try to confirm a matching write operation when a webhook arrives.
- */
-const reconcileWriteOperation = (
-	eventName: string,
-	action: string | null,
-	payload: Record<string, unknown>,
-	repositoryId: number,
-) =>
-	Effect.gen(function* () {
-		const match = matchWriteOperation(eventName, action, payload);
-		if (match === null) return;
-
-		const ctx = yield* ConfectMutationCtx;
-
-		// Find the most recent pending or completed write op for this entity
-		const ops = yield* ctx.db
-			.query("github_write_operations")
-			.withIndex(
-				"by_repositoryId_and_operationType_and_githubEntityNumber",
-				(q) =>
-					q
-						.eq("repositoryId", repositoryId)
-						.eq("operationType", match.operationType)
-						.eq("githubEntityNumber", match.entityNumber),
-			)
-			.order("desc")
-			.take(5);
-
-		for (const op of ops) {
-			if (op.state === "pending" || op.state === "completed") {
-				yield* ctx.db.patch(op._id, {
-					state: "confirmed",
-					updatedAt: Date.now(),
-				});
-				break;
-			}
-		}
-	});
-
 const afterSuccessfulProcessing = (
 	event: {
 		eventName: string;
@@ -1456,14 +1467,6 @@ const afterSuccessfulProcessing = (
 				Effect.ignoreLogged,
 			);
 		}
-
-		// Reconcile write operations — confirm pending/completed ops when webhook arrives
-		yield* reconcileWriteOperation(
-			event.eventName,
-			event.action,
-			payload,
-			repositoryId,
-		).pipe(Effect.ignoreLogged);
 
 		yield* scheduleMemberPermissionSync(event.eventName, payload).pipe(
 			Effect.ignoreLogged,

@@ -1638,20 +1638,18 @@ describe("Optimistic Write Operations", () => {
 				correlationId: "corr-issue-1",
 			});
 
-			const ops = yield* collectTable<{
-				correlationId: string;
-				operationType: string;
-				state: string;
-				ownerLogin: string;
-				repoName: string;
-			}>(t, "github_write_operations");
-			expect(ops).toHaveLength(1);
-			expect(ops[0]).toMatchObject({
-				correlationId: "corr-issue-1",
-				operationType: "create_issue",
-				state: "pending",
-				ownerLogin: "testowner",
-				repoName: "testrepo",
+			const issues = yield* collectTable<{
+				title: string;
+				optimisticCorrelationId?: string | null;
+				optimisticOperationType?: string | null;
+				optimisticState?: string | null;
+			}>(t, "github_issues");
+			expect(issues).toHaveLength(1);
+			expect(issues[0]).toMatchObject({
+				title: "New issue from UI",
+				optimisticCorrelationId: "corr-issue-1",
+				optimisticOperationType: "create_issue",
+				optimisticState: "pending",
 			});
 		}),
 	);
@@ -1679,19 +1677,25 @@ describe("Optimistic Write Operations", () => {
 				correlationId: "corr-comment-1",
 			});
 
-			const ops = yield* collectTable<{
-				operationType: string;
-				state: string;
-			}>(t, "github_write_operations");
-			expect(ops).toHaveLength(1);
-			expect(ops[0]).toMatchObject({
-				operationType: "create_comment",
-				state: "pending",
+			const comments = yield* collectTable<{
+				issueNumber: number;
+				body: string;
+				optimisticCorrelationId?: string | null;
+				optimisticOperationType?: string | null;
+				optimisticState?: string | null;
+			}>(t, "github_issue_comments");
+			expect(comments).toHaveLength(1);
+			expect(comments[0]).toMatchObject({
+				issueNumber: 1,
+				body: "A comment from UI",
+				optimisticCorrelationId: "corr-comment-1",
+				optimisticOperationType: "create_comment",
+				optimisticState: "pending",
 			});
 		}),
 	);
 
-	it.effect("markWriteCompleted transitions pending → completed", () =>
+	it.effect("markCommentCreateAccepted stores GitHub comment id", () =>
 		Effect.gen(function* () {
 			const t = createConvexTest();
 			const client = authClient(t);
@@ -1700,47 +1704,39 @@ describe("Optimistic Write Operations", () => {
 
 			// Create a pending write op
 			yield* Effect.promise(() =>
-				client.mutation(api.rpc.githubWrite.createIssue, {
+				client.mutation(api.rpc.githubWrite.createComment, {
 					correlationId: "corr-complete-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
 					repositoryId,
-					title: "Issue to complete",
+					number: 1,
+					body: "Comment to complete",
 				}),
 			);
 			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 
 			const result = yield* Effect.promise(() =>
-				t.mutation(internal.rpc.githubWrite.markWriteCompleted, {
+				t.mutation(internal.rpc.githubWrite.markCommentCreateAccepted, {
 					correlationId: "corr-complete-1",
-					resultDataJson: JSON.stringify({
-						number: 99,
-						htmlUrl: "https://github.com/testowner/testrepo/issues/99",
-					}),
-					githubEntityNumber: 99,
+					githubCommentId: 999001,
 				}),
 			);
 			const value = assertSuccess(result);
 			expect(value).toMatchObject({ updated: true });
 
-			const ops = yield* collectTable<{
-				correlationId: string;
-				state: string;
-				resultDataJson: string | null;
-				githubEntityNumber: number | null;
-			}>(t, "github_write_operations");
-			expect(ops).toHaveLength(1);
-			expect(ops[0]).toMatchObject({
-				state: "completed",
-				githubEntityNumber: 99,
+			const comments = yield* collectTable<{
+				githubCommentId: number;
+				optimisticState?: string | null;
+			}>(t, "github_issue_comments");
+			expect(comments).toHaveLength(1);
+			expect(comments[0]).toMatchObject({
+				githubCommentId: 999001,
+				optimisticState: "pending",
 			});
-
-			const resultData = JSON.parse(ops[0].resultDataJson ?? "{}");
-			expect(resultData).toMatchObject({ number: 99 });
 		}),
 	);
 
-	it.effect("markWriteFailed transitions pending → failed", () =>
+	it.effect("markCommentCreateFailed transitions pending → failed", () =>
 		Effect.gen(function* () {
 			const t = createConvexTest();
 			const client = authClient(t);
@@ -1748,18 +1744,19 @@ describe("Optimistic Write Operations", () => {
 			yield* seedRepository(t, repositoryId);
 
 			yield* Effect.promise(() =>
-				client.mutation(api.rpc.githubWrite.createIssue, {
+				client.mutation(api.rpc.githubWrite.createComment, {
 					correlationId: "corr-fail-1",
 					ownerLogin: "testowner",
 					name: "testrepo",
 					repositoryId,
-					title: "Failing issue",
+					number: 1,
+					body: "Comment to fail",
 				}),
 			);
 			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 
 			const result = yield* Effect.promise(() =>
-				t.mutation(internal.rpc.githubWrite.markWriteFailed, {
+				t.mutation(internal.rpc.githubWrite.markCommentCreateFailed, {
 					correlationId: "corr-fail-1",
 					errorMessage: "Repository not found",
 					errorStatus: 404,
@@ -1768,16 +1765,16 @@ describe("Optimistic Write Operations", () => {
 			const value = assertSuccess(result);
 			expect(value).toMatchObject({ updated: true });
 
-			const ops = yield* collectTable<{
-				state: string;
-				errorMessage: string | null;
-				errorStatus: number | null;
-			}>(t, "github_write_operations");
-			expect(ops).toHaveLength(1);
-			expect(ops[0]).toMatchObject({
-				state: "failed",
-				errorMessage: "Repository not found",
-				errorStatus: 404,
+			const comments = yield* collectTable<{
+				optimisticState?: string | null;
+				optimisticErrorMessage?: string | null;
+				optimisticErrorStatus?: number | null;
+			}>(t, "github_issue_comments");
+			expect(comments).toHaveLength(1);
+			expect(comments[0]).toMatchObject({
+				optimisticState: "failed",
+				optimisticErrorMessage: "Repository not found",
+				optimisticErrorStatus: 404,
 			});
 		}),
 	);
@@ -1801,12 +1798,12 @@ describe("Optimistic Write Operations", () => {
 			);
 			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
 
-			// Mark it completed (as if the action succeeded)
+			// Mark it accepted by GitHub (as if the action succeeded)
 			yield* Effect.promise(() =>
-				t.mutation(internal.rpc.githubWrite.markWriteCompleted, {
+				t.mutation(internal.rpc.githubWrite.markIssueCreateAccepted, {
 					correlationId: "corr-confirm-1",
-					resultDataJson: JSON.stringify({ number: 99 }),
-					githubEntityNumber: 99,
+					githubIssueId: 9900,
+					githubIssueNumber: 99,
 				}),
 			);
 
@@ -1829,15 +1826,17 @@ describe("Optimistic Write Operations", () => {
 			);
 			yield* processEvent(t, "delivery-confirm-issue-99");
 
-			// The write operation should now be "confirmed"
-			const ops = yield* collectTable<{
-				correlationId: string;
-				state: string;
-			}>(t, "github_write_operations");
-			expect(ops).toHaveLength(1);
-			expect(ops[0]).toMatchObject({
-				correlationId: "corr-confirm-1",
-				state: "confirmed",
+			// The issue should now be optimistic "confirmed"
+			const issues = yield* collectTable<{
+				number: number;
+				optimisticCorrelationId?: string | null;
+				optimisticState?: string | null;
+			}>(t, "github_issues");
+			expect(issues).toHaveLength(1);
+			expect(issues[0]).toMatchObject({
+				number: 99,
+				optimisticCorrelationId: "corr-confirm-1",
+				optimisticState: "confirmed",
 			});
 		}),
 	);
@@ -1913,24 +1912,20 @@ describe("Optimistic Write Operations", () => {
 				correlationId: "corr-close-1",
 			});
 
-			const ops = yield* collectTable<{
-				operationType: string;
+			const issues = yield* collectTable<{
+				number: number;
 				state: string;
-				githubEntityNumber: number | null;
-			}>(t, "github_write_operations");
-			expect(ops).toHaveLength(1);
-			expect(ops[0]).toMatchObject({
-				operationType: "update_issue_state",
-				state: "pending",
-				githubEntityNumber: 5,
-			});
-
-			const optimistic = JSON.parse(
-				(ops[0] as { optimisticDataJson: string }).optimisticDataJson,
-			);
-			expect(optimistic).toMatchObject({
+				optimisticCorrelationId?: string | null;
+				optimisticOperationType?: string | null;
+				optimisticState?: string | null;
+			}>(t, "github_issues");
+			expect(issues).toHaveLength(1);
+			expect(issues[0]).toMatchObject({
 				number: 5,
 				state: "closed",
+				optimisticCorrelationId: "corr-close-1",
+				optimisticOperationType: "update_issue_state",
+				optimisticState: "pending",
 			});
 		}),
 	);
@@ -1958,16 +1953,396 @@ describe("Optimistic Write Operations", () => {
 				correlationId: "corr-merge-1",
 			});
 
-			const ops = yield* collectTable<{
-				operationType: string;
+			const prs = yield* collectTable<{
+				number: number;
 				state: string;
-				githubEntityNumber: number | null;
-			}>(t, "github_write_operations");
-			expect(ops).toHaveLength(1);
-			expect(ops[0]).toMatchObject({
-				operationType: "merge_pull_request",
-				state: "pending",
-				githubEntityNumber: 10,
+				optimisticCorrelationId?: string | null;
+				optimisticOperationType?: string | null;
+				optimisticState?: string | null;
+			}>(t, "github_pull_requests");
+			expect(prs).toHaveLength(1);
+			expect(prs[0]).toMatchObject({
+				number: 10,
+				state: "closed",
+				optimisticCorrelationId: "corr-merge-1",
+				optimisticOperationType: "merge_pull_request",
+				optimisticState: "pending",
+			});
+		}),
+	);
+
+	it.effect(
+		"updatePullRequestBranch mutation creates a pending write operation",
+		() =>
+			Effect.gen(function* () {
+				const t = createConvexTest();
+				const client = authClient(t);
+				const repositoryId = 12345;
+				yield* seedRepository(t, repositoryId);
+
+				const result = yield* Effect.promise(() =>
+					client.mutation(api.rpc.githubWrite.updatePullRequestBranch, {
+						correlationId: "corr-update-branch-1",
+						ownerLogin: "testowner",
+						name: "testrepo",
+						repositoryId,
+						number: 11,
+						expectedHeadSha: "abc123",
+					}),
+				);
+				yield* Effect.promise(() =>
+					client.finishInProgressScheduledFunctions(),
+				);
+				const value = assertSuccess(result);
+				expect(value).toMatchObject({
+					correlationId: "corr-update-branch-1",
+				});
+
+				const prs = yield* collectTable<{
+					number: number;
+					headSha: string;
+					optimisticCorrelationId?: string | null;
+					optimisticOperationType?: string | null;
+					optimisticState?: string | null;
+				}>(t, "github_pull_requests");
+				expect(prs).toHaveLength(1);
+				expect(prs[0]).toMatchObject({
+					number: 11,
+					headSha: "abc123",
+					optimisticCorrelationId: "corr-update-branch-1",
+					optimisticOperationType: "update_pull_request_branch",
+					optimisticState: "pending",
+				});
+			}),
+	);
+
+	it.effect("submitPrReview mutation creates a pending optimistic review", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const client = authClient(t);
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			const result = yield* Effect.promise(() =>
+				client.mutation(api.rpc.githubWrite.submitPrReview, {
+					correlationId: "corr-review-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					number: 42,
+					event: "APPROVE",
+					body: "Looks good",
+				}),
+			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
+			const value = assertSuccess(result);
+			expect(value).toMatchObject({
+				correlationId: "corr-review-1",
+			});
+
+			const reviews = yield* collectTable<{
+				pullRequestNumber: number;
+				state: string;
+				optimisticCorrelationId?: string | null;
+				optimisticOperationType?: string | null;
+				optimisticState?: string | null;
+			}>(t, "github_pull_request_reviews");
+			expect(reviews).toHaveLength(1);
+			expect(reviews[0]).toMatchObject({
+				pullRequestNumber: 42,
+				state: "APPROVED",
+				optimisticCorrelationId: "corr-review-1",
+				optimisticOperationType: "submit_pr_review",
+				optimisticState: "pending",
+			});
+		}),
+	);
+
+	it.effect(
+		"updateLabels mutation creates a pending optimistic labels update",
+		() =>
+			Effect.gen(function* () {
+				const t = createConvexTest();
+				const client = authClient(t);
+				const repositoryId = 12345;
+				yield* seedRepository(t, repositoryId);
+
+				const result = yield* Effect.promise(() =>
+					client.mutation(api.rpc.githubWrite.updateLabels, {
+						correlationId: "corr-labels-1",
+						ownerLogin: "testowner",
+						name: "testrepo",
+						repositoryId,
+						number: 77,
+						labelsToAdd: ["bug", "priority:high"],
+						labelsToRemove: [],
+					}),
+				);
+				yield* Effect.promise(() =>
+					client.finishInProgressScheduledFunctions(),
+				);
+				const value = assertSuccess(result);
+				expect(value).toMatchObject({
+					correlationId: "corr-labels-1",
+				});
+
+				const issues = yield* collectTable<{
+					number: number;
+					labelNames: Array<string>;
+					optimisticCorrelationId?: string | null;
+					optimisticOperationType?: string | null;
+					optimisticState?: string | null;
+				}>(t, "github_issues");
+				expect(issues).toHaveLength(1);
+				expect(issues[0]).toMatchObject({
+					number: 77,
+					labelNames: ["bug", "priority:high"],
+					optimisticCorrelationId: "corr-labels-1",
+					optimisticOperationType: "update_labels",
+					optimisticState: "pending",
+				});
+			}),
+	);
+
+	it.effect(
+		"updateAssignees mutation creates a pending optimistic assignee update",
+		() =>
+			Effect.gen(function* () {
+				const t = createConvexTest();
+				const client = authClient(t);
+				const repositoryId = 12345;
+				yield* seedRepository(t, repositoryId);
+
+				yield* Effect.promise(() =>
+					t.run(async (ctx) => {
+						await ctx.db.insert("github_users", {
+							githubUserId: 2001,
+							login: "alice",
+							avatarUrl: null,
+							siteAdmin: false,
+							type: "User",
+							updatedAt: Date.now(),
+						});
+					}),
+				);
+
+				const result = yield* Effect.promise(() =>
+					client.mutation(api.rpc.githubWrite.updateAssignees, {
+						correlationId: "corr-assignees-1",
+						ownerLogin: "testowner",
+						name: "testrepo",
+						repositoryId,
+						number: 88,
+						assigneesToAdd: ["alice"],
+						assigneesToRemove: [],
+					}),
+				);
+				yield* Effect.promise(() =>
+					client.finishInProgressScheduledFunctions(),
+				);
+				const value = assertSuccess(result);
+				expect(value).toMatchObject({
+					correlationId: "corr-assignees-1",
+				});
+
+				const issues = yield* collectTable<{
+					number: number;
+					assigneeUserIds: Array<number>;
+					optimisticCorrelationId?: string | null;
+					optimisticOperationType?: string | null;
+					optimisticState?: string | null;
+				}>(t, "github_issues");
+				expect(issues).toHaveLength(1);
+				expect(issues[0]).toMatchObject({
+					number: 88,
+					assigneeUserIds: [2001],
+					optimisticCorrelationId: "corr-assignees-1",
+					optimisticOperationType: "update_assignees",
+					optimisticState: "pending",
+				});
+			}),
+	);
+
+	it.effect("issue labeled webhook confirms optimistic labels update", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const client = authClient(t);
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* Effect.promise(() =>
+				client.mutation(api.rpc.githubWrite.updateLabels, {
+					correlationId: "corr-confirm-labels-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					number: 15,
+					labelsToAdd: ["bug"],
+					labelsToRemove: [],
+				}),
+			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
+			yield* Effect.promise(() =>
+				t.mutation(internal.rpc.githubWrite.markLabelsUpdateAccepted, {
+					correlationId: "corr-confirm-labels-1",
+				}),
+			);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-confirm-labels-1",
+					eventName: "issues",
+					action: "labeled",
+					repositoryId,
+					payloadJson: makeIssuePayload({
+						action: "labeled",
+						issueId: 15001,
+						number: 15,
+						state: "open",
+						title: "Issue 15",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-confirm-labels-1");
+
+			const issues = yield* collectTable<{
+				number: number;
+				optimisticCorrelationId?: string | null;
+				optimisticState?: string | null;
+			}>(t, "github_issues");
+			expect(issues).toHaveLength(1);
+			expect(issues[0]).toMatchObject({
+				number: 15,
+				optimisticCorrelationId: "corr-confirm-labels-1",
+				optimisticState: "confirmed",
+			});
+		}),
+	);
+
+	it.effect("issue assigned webhook confirms optimistic assignee update", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const client = authClient(t);
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* Effect.promise(() =>
+				t.run(async (ctx) => {
+					await ctx.db.insert("github_users", {
+						githubUserId: 777,
+						login: "octocat",
+						avatarUrl: null,
+						siteAdmin: false,
+						type: "User",
+						updatedAt: Date.now(),
+					});
+				}),
+			);
+
+			yield* Effect.promise(() =>
+				client.mutation(api.rpc.githubWrite.updateAssignees, {
+					correlationId: "corr-confirm-assignees-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					number: 16,
+					assigneesToAdd: ["octocat"],
+					assigneesToRemove: [],
+				}),
+			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
+			yield* Effect.promise(() =>
+				t.mutation(internal.rpc.githubWrite.markAssigneesUpdateAccepted, {
+					correlationId: "corr-confirm-assignees-1",
+				}),
+			);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-confirm-assignees-1",
+					eventName: "issues",
+					action: "assigned",
+					repositoryId,
+					payloadJson: makeIssuePayload({
+						action: "assigned",
+						issueId: 16001,
+						number: 16,
+						state: "open",
+						title: "Issue 16",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-confirm-assignees-1");
+
+			const issues = yield* collectTable<{
+				number: number;
+				optimisticCorrelationId?: string | null;
+				optimisticState?: string | null;
+			}>(t, "github_issues");
+			expect(issues).toHaveLength(1);
+			expect(issues[0]).toMatchObject({
+				number: 16,
+				optimisticCorrelationId: "corr-confirm-assignees-1",
+				optimisticState: "confirmed",
+			});
+		}),
+	);
+
+	it.effect("review submitted webhook confirms optimistic PR review", () =>
+		Effect.gen(function* () {
+			const t = createConvexTest();
+			const client = authClient(t);
+			const repositoryId = 12345;
+			yield* seedRepository(t, repositoryId);
+
+			yield* Effect.promise(() =>
+				client.mutation(api.rpc.githubWrite.submitPrReview, {
+					correlationId: "corr-confirm-review-1",
+					ownerLogin: "testowner",
+					name: "testrepo",
+					repositoryId,
+					number: 42,
+					event: "APPROVE",
+				}),
+			);
+			yield* Effect.promise(() => client.finishInProgressScheduledFunctions());
+
+			yield* Effect.promise(() =>
+				t.mutation(internal.rpc.githubWrite.markPrReviewAccepted, {
+					correlationId: "corr-confirm-review-1",
+					githubReviewId: 555001,
+				}),
+			);
+
+			yield* insertRawEvent(
+				t,
+				makeRawEvent({
+					deliveryId: "delivery-confirm-review-1",
+					eventName: "pull_request_review",
+					action: "submitted",
+					repositoryId,
+					payloadJson: makePrReviewPayload({
+						action: "submitted",
+						reviewId: 555001,
+						prNumber: 42,
+						state: "APPROVED",
+					}),
+				}),
+			);
+			yield* processEvent(t, "delivery-confirm-review-1");
+
+			const reviews = yield* collectTable<{
+				githubReviewId: number;
+				optimisticCorrelationId?: string | null;
+				optimisticState?: string | null;
+			}>(t, "github_pull_request_reviews");
+			expect(reviews).toHaveLength(1);
+			expect(reviews[0]).toMatchObject({
+				githubReviewId: 555001,
+				optimisticCorrelationId: "corr-confirm-review-1",
+				optimisticState: "confirmed",
 			});
 		}),
 	);
@@ -2007,11 +2382,14 @@ describe("Optimistic Write Operations", () => {
 			const exit = result as { _tag: string; cause?: unknown };
 			expect(exit._tag).toBe("Failure");
 
-			// Only one op should exist
-			const ops = yield* collectTable<{
-				correlationId: string;
-			}>(t, "github_write_operations");
-			expect(ops).toHaveLength(1);
+			// Only one optimistic issue row should exist
+			const issues = yield* collectTable<{
+				optimisticCorrelationId?: string | null;
+			}>(t, "github_issues");
+			expect(issues).toHaveLength(1);
+			expect(issues[0]).toMatchObject({
+				optimisticCorrelationId: "corr-dupe-1",
+			});
 		}),
 	);
 });

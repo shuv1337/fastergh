@@ -2,15 +2,17 @@
  * GitHub write workflows with optimistic updates.
  *
  * Pattern:
- *   1. Public MUTATION inserts a `github_write_operations` row in state "pending"
- *      with optimistic data, then schedules an internal action.
- *   2. Internal ACTION calls GitHub API, then calls an internal mutation to mark
- *      the operation "completed" (with response data) or "failed" (with error).
- *   3. When the webhook arrives, webhookProcessor reconciles the operation to
- *      "confirmed" — proving the write landed.
+ *   1. Public MUTATION writes optimistic state directly into the canonical
+ *      domain row (`github_issues`, `github_pull_requests`,
+ *      `github_issue_comments`, `github_pull_request_reviews`)
+ *      and schedules an internal action.
+ *   2. Internal ACTION calls GitHub API and marks the optimistic row as
+ *      `pending` (accepted) or `failed` (error details).
+ *   3. When the webhook arrives, webhookProcessor reconciles the row to
+ *      `confirmed` — proving the write landed.
  *
- * The UI subscribes to the write operations table and can show optimistic state
- * immediately, then converge to the confirmed state.
+ * The UI subscribes to domain projections and can show optimistic state
+ * immediately, then converge to confirmed state.
  */
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
 import { Effect, Option, Schema } from "effect";
@@ -21,9 +23,15 @@ import {
 	ConfectQueryCtx,
 	confectSchema,
 } from "../confect";
-import { GitHubApiClient } from "../shared/githubApi";
+import { GitHubApiClient, type GitHubClient } from "../shared/githubApi";
 import { lookupGitHubTokenByUserIdConfect } from "../shared/githubToken";
-import { resolveRepoAccess } from "../shared/permissions";
+import {
+	RepoPushAccess,
+	RepoTriageAccess,
+	requirePushAccessForMutation,
+	requireTriageAccessForMutation,
+	resolveRepoAccess,
+} from "../shared/permissions";
 import { DatabaseRpcTelemetryLayer } from "./telemetry";
 
 const factory = createRpcFactory({ schema: confectSchema });
@@ -37,6 +45,10 @@ const OperationType = Schema.Literal(
 	"create_comment",
 	"update_issue_state",
 	"merge_pull_request",
+	"update_pull_request_branch",
+	"submit_pr_review",
+	"update_labels",
+	"update_assignees",
 );
 
 const OperationState = Schema.Literal(
@@ -110,70 +122,68 @@ class InsufficientPermission extends Schema.TaggedError<InsufficientPermission>(
 const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
 const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
 
-const permissionRank = {
-	pull: 0,
-	triage: 1,
-	push: 2,
-	maintain: 3,
-	admin: 4,
+const toSyntheticIssueNumber = (correlationId: string): number => {
+	let hash = 0;
+	for (const char of correlationId) {
+		hash = (hash * 31 + char.charCodeAt(0)) | 0;
+	}
+	if (hash === 0) return -Date.now();
+	if (hash > 0) return -hash;
+	return hash;
 };
 
-const highestPermission = (permission: {
-	readonly pull: boolean;
-	readonly triage: boolean;
-	readonly push: boolean;
-	readonly maintain: boolean;
-	readonly admin: boolean;
-}) => {
-	if (permission.admin) return "admin";
-	if (permission.maintain) return "maintain";
-	if (permission.push) return "push";
-	if (permission.triage) return "triage";
-	if (permission.pull) return "pull";
-	return null;
-};
+const triageProofForMutation = (userId: string, repositoryId: number) =>
+	requireTriageAccessForMutation(userId, repositoryId).pipe(
+		Effect.mapError(
+			() =>
+				new InsufficientPermission({
+					repositoryId,
+					required: "triage",
+				}),
+		),
+	);
 
-const requireRepoPermissionForMutation = (
+const pushProofForMutation = (userId: string, repositoryId: number) =>
+	requirePushAccessForMutation(userId, repositoryId).pipe(
+		Effect.mapError(
+			() =>
+				new InsufficientPermission({
+					repositoryId,
+					required: "push",
+				}),
+		),
+	);
+
+const hasExistingCorrelationId = (
 	ctx: ConfectMutationCtx,
-	userId: string,
-	repositoryId: number,
-	required: Schema.Schema.Type<typeof RequiredPermission>,
+	correlationId: string,
 ) =>
 	Effect.gen(function* () {
-		const permission = yield* ctx.db
-			.query("github_user_repo_permissions")
-			.withIndex("by_userId_and_repositoryId", (q) =>
-				q.eq("userId", userId).eq("repositoryId", repositoryId),
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", correlationId),
 			)
 			.first();
+		if (Option.isSome(issue)) return true;
 
-		if (Option.isSome(permission)) {
-			const actual = highestPermission(permission.value);
-			if (
-				actual !== null &&
-				permissionRank[actual] >= permissionRank[required]
-			) {
-				return;
-			}
-		}
-
-		const repo = yield* ctx.db
-			.query("github_repositories")
-			.withIndex("by_githubRepoId", (q) => q.eq("githubRepoId", repositoryId))
+		const comment = yield* ctx.db
+			.query("github_issue_comments")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", correlationId),
+			)
 			.first();
+		if (Option.isSome(comment)) return true;
 
-		if (
-			Option.isSome(repo) &&
-			!repo.value.private &&
-			permissionRank.pull >= permissionRank[required]
-		) {
-			return;
-		}
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", correlationId),
+			)
+			.first();
+		if (Option.isSome(pr)) return true;
 
-		return yield* new InsufficientPermission({
-			repositoryId,
-			required,
-		});
+		return false;
 	});
 
 /**
@@ -192,6 +202,12 @@ const getActingUserId = (ctx: {
 		}
 		return identity.value.subject;
 	});
+
+const getRepositoryById = (ctx: ConfectMutationCtx, repositoryId: number) =>
+	ctx.db
+		.query("github_repositories")
+		.withIndex("by_githubRepoId", (q) => q.eq("githubRepoId", repositoryId))
+		.first();
 
 // ---------------------------------------------------------------------------
 // 1. Public mutations — create pending write ops + schedule actions
@@ -223,57 +239,56 @@ createIssueDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		yield* requireRepoPermissionForMutation(
-			ctx,
+		const triageProof = yield* triageProofForMutation(
 			actingUserId,
 			args.repositoryId,
-			"triage",
+		);
+		yield* RepoTriageAccess.pipe(
+			Effect.provideService(RepoTriageAccess, triageProof),
 		);
 		const now = Date.now();
 
-		// Dedup check
-		const existing = yield* ctx.db
-			.query("github_write_operations")
-			.withIndex("by_correlationId", (q) =>
-				q.eq("correlationId", args.correlationId),
-			)
-			.first();
+		const hasDuplicate = yield* hasExistingCorrelationId(
+			ctx,
+			args.correlationId,
+		);
 
-		if (Option.isSome(existing)) {
+		if (hasDuplicate) {
 			return yield* new DuplicateOperationError({
 				correlationId: args.correlationId,
 			});
 		}
-
-		const inputPayload = {
-			ownerLogin: args.ownerLogin,
-			name: args.name,
-			title: args.title,
-			body: args.body,
-			labels: args.labels,
-		};
 
 		const optimisticData = {
 			title: args.title,
 			body: args.body ?? null,
 			labels: args.labels ?? [],
 		};
+		const labelNames: Array<string> = [...optimisticData.labels];
 
-		yield* ctx.db.insert("github_write_operations", {
-			correlationId: args.correlationId,
-			operationType: "create_issue",
-			state: "pending",
+		const syntheticIssueNumber = toSyntheticIssueNumber(args.correlationId);
+
+		yield* ctx.db.insert("github_issues", {
 			repositoryId: args.repositoryId,
-			ownerLogin: args.ownerLogin,
-			repoName: args.name,
-			inputPayloadJson: JSON.stringify(inputPayload),
-			optimisticDataJson: JSON.stringify(optimisticData),
-			resultDataJson: null,
-			errorMessage: null,
-			errorStatus: null,
-			githubEntityNumber: null,
-			createdAt: now,
-			updatedAt: now,
+			githubIssueId: syntheticIssueNumber,
+			number: syntheticIssueNumber,
+			state: "open",
+			title: args.title,
+			body: args.body ?? null,
+			authorUserId: null,
+			assigneeUserIds: [],
+			labelNames,
+			commentCount: 0,
+			isPullRequest: false,
+			closedAt: null,
+			githubUpdatedAt: now,
+			cachedAt: now,
+			optimisticCorrelationId: args.correlationId,
+			optimisticOperationType: "create_issue",
+			optimisticState: "pending",
+			optimisticErrorMessage: null,
+			optimisticErrorStatus: null,
+			optimisticUpdatedAt: now,
 		});
 
 		yield* Effect.promise(() =>
@@ -312,54 +327,42 @@ createCommentDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		yield* requireRepoPermissionForMutation(
-			ctx,
+		const triageProof = yield* triageProofForMutation(
 			actingUserId,
 			args.repositoryId,
-			"triage",
+		);
+		yield* RepoTriageAccess.pipe(
+			Effect.provideService(RepoTriageAccess, triageProof),
 		);
 		const now = Date.now();
 
-		const existing = yield* ctx.db
-			.query("github_write_operations")
-			.withIndex("by_correlationId", (q) =>
-				q.eq("correlationId", args.correlationId),
-			)
-			.first();
+		const hasDuplicate = yield* hasExistingCorrelationId(
+			ctx,
+			args.correlationId,
+		);
 
-		if (Option.isSome(existing)) {
+		if (hasDuplicate) {
 			return yield* new DuplicateOperationError({
 				correlationId: args.correlationId,
 			});
 		}
 
-		const inputPayload = {
-			ownerLogin: args.ownerLogin,
-			name: args.name,
-			number: args.number,
-			body: args.body,
-		};
+		const syntheticCommentId = toSyntheticIssueNumber(args.correlationId);
 
-		const optimisticData = {
-			number: args.number,
-			body: args.body,
-		};
-
-		yield* ctx.db.insert("github_write_operations", {
-			correlationId: args.correlationId,
-			operationType: "create_comment",
-			state: "pending",
+		yield* ctx.db.insert("github_issue_comments", {
 			repositoryId: args.repositoryId,
-			ownerLogin: args.ownerLogin,
-			repoName: args.name,
-			inputPayloadJson: JSON.stringify(inputPayload),
-			optimisticDataJson: JSON.stringify(optimisticData),
-			resultDataJson: null,
-			errorMessage: null,
-			errorStatus: null,
-			githubEntityNumber: args.number,
+			issueNumber: args.number,
+			githubCommentId: syntheticCommentId,
+			authorUserId: null,
+			body: args.body,
 			createdAt: now,
 			updatedAt: now,
+			optimisticCorrelationId: args.correlationId,
+			optimisticOperationType: "create_comment",
+			optimisticState: "pending",
+			optimisticErrorMessage: null,
+			optimisticErrorStatus: null,
+			optimisticUpdatedAt: now,
 		});
 
 		yield* Effect.promise(() =>
@@ -398,55 +401,86 @@ updateIssueStateDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		yield* requireRepoPermissionForMutation(
-			ctx,
+		const triageProof = yield* triageProofForMutation(
 			actingUserId,
 			args.repositoryId,
-			"triage",
+		);
+		yield* RepoTriageAccess.pipe(
+			Effect.provideService(RepoTriageAccess, triageProof),
 		);
 		const now = Date.now();
 
-		const existing = yield* ctx.db
-			.query("github_write_operations")
-			.withIndex("by_correlationId", (q) =>
-				q.eq("correlationId", args.correlationId),
-			)
-			.first();
+		const hasDuplicate = yield* hasExistingCorrelationId(
+			ctx,
+			args.correlationId,
+		);
 
-		if (Option.isSome(existing)) {
+		if (hasDuplicate) {
 			return yield* new DuplicateOperationError({
 				correlationId: args.correlationId,
 			});
 		}
 
-		const inputPayload = {
-			ownerLogin: args.ownerLogin,
-			name: args.name,
-			number: args.number,
-			state: args.state,
-		};
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_repositoryId_and_number", (q) =>
+				q.eq("repositoryId", args.repositoryId).eq("number", args.number),
+			)
+			.first();
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_repositoryId_and_number", (q) =>
+				q.eq("repositoryId", args.repositoryId).eq("number", args.number),
+			)
+			.first();
 
-		const optimisticData = {
-			number: args.number,
-			state: args.state,
-		};
-
-		yield* ctx.db.insert("github_write_operations", {
-			correlationId: args.correlationId,
-			operationType: "update_issue_state",
-			state: "pending",
-			repositoryId: args.repositoryId,
-			ownerLogin: args.ownerLogin,
-			repoName: args.name,
-			inputPayloadJson: JSON.stringify(inputPayload),
-			optimisticDataJson: JSON.stringify(optimisticData),
-			resultDataJson: null,
-			errorMessage: null,
-			errorStatus: null,
-			githubEntityNumber: args.number,
-			createdAt: now,
-			updatedAt: now,
-		});
+		if (Option.isSome(pr)) {
+			yield* ctx.db.patch(pr.value._id, {
+				state: args.state,
+				closedAt: args.state === "closed" ? now : null,
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "update_issue_state",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+				optimisticPayloadJson: JSON.stringify({ state: args.state }),
+			});
+		} else if (Option.isSome(issue)) {
+			yield* ctx.db.patch(issue.value._id, {
+				state: args.state,
+				closedAt: args.state === "closed" ? now : null,
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "update_issue_state",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+			});
+		} else {
+			yield* ctx.db.insert("github_issues", {
+				repositoryId: args.repositoryId,
+				githubIssueId: toSyntheticIssueNumber(args.correlationId),
+				number: args.number,
+				state: args.state,
+				title: `Issue #${String(args.number)}`,
+				body: null,
+				authorUserId: null,
+				assigneeUserIds: [],
+				labelNames: [],
+				commentCount: 0,
+				isPullRequest: false,
+				closedAt: args.state === "closed" ? now : null,
+				githubUpdatedAt: now,
+				cachedAt: now,
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "update_issue_state",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+			});
+		}
 
 		yield* Effect.promise(() =>
 			ctx.scheduler.runAfter(
@@ -486,57 +520,555 @@ mergePullRequestDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		yield* requireRepoPermissionForMutation(
-			ctx,
+		const pushProof = yield* pushProofForMutation(
 			actingUserId,
 			args.repositoryId,
-			"push",
+		);
+		yield* RepoPushAccess.pipe(
+			Effect.provideService(RepoPushAccess, pushProof),
 		);
 		const now = Date.now();
 
-		const existing = yield* ctx.db
-			.query("github_write_operations")
-			.withIndex("by_correlationId", (q) =>
-				q.eq("correlationId", args.correlationId),
-			)
-			.first();
+		const hasDuplicate = yield* hasExistingCorrelationId(
+			ctx,
+			args.correlationId,
+		);
 
-		if (Option.isSome(existing)) {
+		if (hasDuplicate) {
 			return yield* new DuplicateOperationError({
 				correlationId: args.correlationId,
 			});
 		}
 
-		const inputPayload = {
-			ownerLogin: args.ownerLogin,
-			name: args.name,
-			number: args.number,
-			mergeMethod: args.mergeMethod,
-			commitTitle: args.commitTitle,
-			commitMessage: args.commitMessage,
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_repositoryId_and_number", (q) =>
+				q.eq("repositoryId", args.repositoryId).eq("number", args.number),
+			)
+			.first();
+		const optimisticPayload = {
+			mergeMethod: args.mergeMethod ?? null,
+			commitTitle: args.commitTitle ?? null,
+			commitMessage: args.commitMessage ?? null,
 		};
 
-		const optimisticData = {
-			number: args.number,
-			mergeMethod: args.mergeMethod ?? "merge",
+		if (Option.isSome(pr)) {
+			yield* ctx.db.patch(pr.value._id, {
+				state: "closed",
+				closedAt: now,
+				mergedAt: now,
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "merge_pull_request",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+				optimisticPayloadJson: JSON.stringify(optimisticPayload),
+			});
+		} else {
+			yield* ctx.db.insert("github_pull_requests", {
+				repositoryId: args.repositoryId,
+				githubPrId: toSyntheticIssueNumber(args.correlationId),
+				number: args.number,
+				state: "closed",
+				draft: false,
+				title: `Pull request #${String(args.number)}`,
+				body: null,
+				authorUserId: null,
+				assigneeUserIds: [],
+				requestedReviewerUserIds: [],
+				labelNames: [],
+				baseRefName: "main",
+				headRefName: "unknown",
+				headSha: args.correlationId,
+				mergeableState: null,
+				mergedAt: now,
+				closedAt: now,
+				githubUpdatedAt: now,
+				cachedAt: now,
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "merge_pull_request",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+				optimisticPayloadJson: JSON.stringify(optimisticPayload),
+			});
+		}
+
+		yield* Effect.promise(() =>
+			ctx.scheduler.runAfter(
+				0,
+				internal.rpc.githubWrite.executeWriteOperation,
+				{ correlationId: args.correlationId, actingUserId },
+			),
+		);
+
+		return { correlationId: args.correlationId };
+	}),
+);
+
+/**
+ * Update pull request branch (optimistic).
+ */
+const updatePullRequestBranchDef = factory.mutation({
+	payload: {
+		correlationId: Schema.String,
+		ownerLogin: Schema.String,
+		name: Schema.String,
+		repositoryId: Schema.Number,
+		number: Schema.Number,
+		expectedHeadSha: Schema.optional(Schema.String),
+	},
+	success: Schema.Struct({ correlationId: Schema.String }),
+	error: Schema.Union(
+		DuplicateOperationError,
+		NotAuthenticated,
+		InsufficientPermission,
+	),
+});
+
+updatePullRequestBranchDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const actingUserId = yield* getActingUserId(ctx);
+		const pushProof = yield* pushProofForMutation(
+			actingUserId,
+			args.repositoryId,
+		);
+		yield* RepoPushAccess.pipe(
+			Effect.provideService(RepoPushAccess, pushProof),
+		);
+		const now = Date.now();
+
+		const hasDuplicate = yield* hasExistingCorrelationId(
+			ctx,
+			args.correlationId,
+		);
+
+		if (hasDuplicate) {
+			return yield* new DuplicateOperationError({
+				correlationId: args.correlationId,
+			});
+		}
+
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_repositoryId_and_number", (q) =>
+				q.eq("repositoryId", args.repositoryId).eq("number", args.number),
+			)
+			.first();
+		const optimisticPayload = {
+			expectedHeadSha: args.expectedHeadSha ?? null,
 		};
 
-		yield* ctx.db.insert("github_write_operations", {
-			correlationId: args.correlationId,
-			operationType: "merge_pull_request",
-			state: "pending",
+		if (Option.isSome(pr)) {
+			yield* ctx.db.patch(pr.value._id, {
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "update_pull_request_branch",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+				optimisticPayloadJson: JSON.stringify(optimisticPayload),
+			});
+		} else {
+			yield* ctx.db.insert("github_pull_requests", {
+				repositoryId: args.repositoryId,
+				githubPrId: toSyntheticIssueNumber(args.correlationId),
+				number: args.number,
+				state: "open",
+				draft: false,
+				title: `Pull request #${String(args.number)}`,
+				body: null,
+				authorUserId: null,
+				assigneeUserIds: [],
+				requestedReviewerUserIds: [],
+				labelNames: [],
+				baseRefName: "main",
+				headRefName: "unknown",
+				headSha: args.expectedHeadSha ?? args.correlationId,
+				mergeableState: null,
+				mergedAt: null,
+				closedAt: null,
+				githubUpdatedAt: now,
+				cachedAt: now,
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "update_pull_request_branch",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+				optimisticPayloadJson: JSON.stringify(optimisticPayload),
+			});
+		}
+
+		yield* Effect.promise(() =>
+			ctx.scheduler.runAfter(
+				0,
+				internal.rpc.githubWrite.executeWriteOperation,
+				{ correlationId: args.correlationId, actingUserId },
+			),
+		);
+
+		return { correlationId: args.correlationId };
+	}),
+);
+
+const submitPrReviewDef = factory.mutation({
+	payload: {
+		correlationId: Schema.String,
+		ownerLogin: Schema.String,
+		name: Schema.String,
+		repositoryId: Schema.Number,
+		number: Schema.Number,
+		event: Schema.Literal("APPROVE", "REQUEST_CHANGES", "COMMENT"),
+		body: Schema.optional(Schema.String),
+	},
+	success: Schema.Struct({ correlationId: Schema.String }),
+	error: Schema.Union(
+		DuplicateOperationError,
+		NotAuthenticated,
+		InsufficientPermission,
+	),
+});
+
+submitPrReviewDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const actingUserId = yield* getActingUserId(ctx);
+		const triageProof = yield* triageProofForMutation(
+			actingUserId,
+			args.repositoryId,
+		);
+		yield* RepoTriageAccess.pipe(
+			Effect.provideService(RepoTriageAccess, triageProof),
+		);
+
+		const hasDuplicate = yield* hasExistingCorrelationId(
+			ctx,
+			args.correlationId,
+		);
+		if (hasDuplicate) {
+			return yield* new DuplicateOperationError({
+				correlationId: args.correlationId,
+			});
+		}
+
+		const now = Date.now();
+		const optimisticReviewId = toSyntheticIssueNumber(args.correlationId);
+		const reviewState =
+			args.event === "APPROVE"
+				? "APPROVED"
+				: args.event === "REQUEST_CHANGES"
+					? "CHANGES_REQUESTED"
+					: "COMMENTED";
+
+		yield* ctx.db.insert("github_pull_request_reviews", {
 			repositoryId: args.repositoryId,
-			ownerLogin: args.ownerLogin,
-			repoName: args.name,
-			inputPayloadJson: JSON.stringify(inputPayload),
-			optimisticDataJson: JSON.stringify(optimisticData),
-			resultDataJson: null,
-			errorMessage: null,
-			errorStatus: null,
-			githubEntityNumber: args.number,
-			createdAt: now,
-			updatedAt: now,
+			pullRequestNumber: args.number,
+			githubReviewId: optimisticReviewId,
+			authorUserId: null,
+			state: reviewState,
+			submittedAt: now,
+			commitSha: null,
+			optimisticCorrelationId: args.correlationId,
+			optimisticOperationType: "submit_pr_review",
+			optimisticState: "pending",
+			optimisticErrorMessage: null,
+			optimisticErrorStatus: null,
+			optimisticUpdatedAt: now,
+			optimisticPayloadJson: JSON.stringify({
+				event: args.event,
+				body: args.body ?? null,
+			}),
 		});
+
+		yield* Effect.promise(() =>
+			ctx.scheduler.runAfter(
+				0,
+				internal.rpc.githubWrite.executeWriteOperation,
+				{ correlationId: args.correlationId, actingUserId },
+			),
+		);
+
+		return { correlationId: args.correlationId };
+	}),
+);
+
+const updateLabelsDef = factory.mutation({
+	payload: {
+		correlationId: Schema.String,
+		ownerLogin: Schema.String,
+		name: Schema.String,
+		repositoryId: Schema.Number,
+		number: Schema.Number,
+		labelsToAdd: Schema.Array(Schema.String),
+		labelsToRemove: Schema.Array(Schema.String),
+	},
+	success: Schema.Struct({ correlationId: Schema.String }),
+	error: Schema.Union(
+		DuplicateOperationError,
+		NotAuthenticated,
+		InsufficientPermission,
+	),
+});
+
+updateLabelsDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const actingUserId = yield* getActingUserId(ctx);
+		const triageProof = yield* triageProofForMutation(
+			actingUserId,
+			args.repositoryId,
+		);
+		yield* RepoTriageAccess.pipe(
+			Effect.provideService(RepoTriageAccess, triageProof),
+		);
+
+		const hasDuplicate = yield* hasExistingCorrelationId(
+			ctx,
+			args.correlationId,
+		);
+		if (hasDuplicate) {
+			return yield* new DuplicateOperationError({
+				correlationId: args.correlationId,
+			});
+		}
+
+		const now = Date.now();
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_repositoryId_and_number", (q) =>
+				q.eq("repositoryId", args.repositoryId).eq("number", args.number),
+			)
+			.first();
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_repositoryId_and_number", (q) =>
+				q.eq("repositoryId", args.repositoryId).eq("number", args.number),
+			)
+			.first();
+
+		const applyLabels = (current: ReadonlyArray<string>) => {
+			const withoutRemoved = current.filter(
+				(label) => !args.labelsToRemove.includes(label),
+			);
+			const merged = [...withoutRemoved, ...args.labelsToAdd];
+			return [...new Set(merged)];
+		};
+
+		if (Option.isSome(issue)) {
+			yield* ctx.db.patch(issue.value._id, {
+				labelNames: applyLabels(issue.value.labelNames),
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "update_labels",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+				optimisticPayloadJson: JSON.stringify({
+					labelsToAdd: args.labelsToAdd,
+					labelsToRemove: args.labelsToRemove,
+				}),
+			});
+		}
+
+		if (Option.isSome(pr)) {
+			const currentLabels = pr.value.labelNames ?? [];
+			yield* ctx.db.patch(pr.value._id, {
+				labelNames: applyLabels(currentLabels),
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "update_labels",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+				optimisticPayloadJson: JSON.stringify({
+					labelsToAdd: args.labelsToAdd,
+					labelsToRemove: args.labelsToRemove,
+				}),
+			});
+		}
+
+		if (Option.isNone(issue) && Option.isNone(pr)) {
+			yield* ctx.db.insert("github_issues", {
+				repositoryId: args.repositoryId,
+				githubIssueId: toSyntheticIssueNumber(args.correlationId),
+				number: args.number,
+				state: "open",
+				title: `Issue #${String(args.number)}`,
+				body: null,
+				authorUserId: null,
+				assigneeUserIds: [],
+				labelNames: [...new Set(args.labelsToAdd)],
+				commentCount: 0,
+				isPullRequest: false,
+				closedAt: null,
+				githubUpdatedAt: now,
+				cachedAt: now,
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "update_labels",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+				optimisticPayloadJson: JSON.stringify({
+					labelsToAdd: args.labelsToAdd,
+					labelsToRemove: args.labelsToRemove,
+				}),
+			});
+		}
+
+		yield* Effect.promise(() =>
+			ctx.scheduler.runAfter(
+				0,
+				internal.rpc.githubWrite.executeWriteOperation,
+				{ correlationId: args.correlationId, actingUserId },
+			),
+		);
+
+		return { correlationId: args.correlationId };
+	}),
+);
+
+const updateAssigneesDef = factory.mutation({
+	payload: {
+		correlationId: Schema.String,
+		ownerLogin: Schema.String,
+		name: Schema.String,
+		repositoryId: Schema.Number,
+		number: Schema.Number,
+		assigneesToAdd: Schema.Array(Schema.String),
+		assigneesToRemove: Schema.Array(Schema.String),
+	},
+	success: Schema.Struct({ correlationId: Schema.String }),
+	error: Schema.Union(
+		DuplicateOperationError,
+		NotAuthenticated,
+		InsufficientPermission,
+	),
+});
+
+updateAssigneesDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const actingUserId = yield* getActingUserId(ctx);
+		const triageProof = yield* triageProofForMutation(
+			actingUserId,
+			args.repositoryId,
+		);
+		yield* RepoTriageAccess.pipe(
+			Effect.provideService(RepoTriageAccess, triageProof),
+		);
+
+		const hasDuplicate = yield* hasExistingCorrelationId(
+			ctx,
+			args.correlationId,
+		);
+		if (hasDuplicate) {
+			return yield* new DuplicateOperationError({
+				correlationId: args.correlationId,
+			});
+		}
+
+		const now = Date.now();
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_repositoryId_and_number", (q) =>
+				q.eq("repositoryId", args.repositoryId).eq("number", args.number),
+			)
+			.first();
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_repositoryId_and_number", (q) =>
+				q.eq("repositoryId", args.repositoryId).eq("number", args.number),
+			)
+			.first();
+
+		const resolveUserIds = (logins: ReadonlyArray<string>) =>
+			Effect.forEach(logins, (login) =>
+				ctx.db
+					.query("github_users")
+					.withIndex("by_login", (q) => q.eq("login", login))
+					.first()
+					.pipe(
+						Effect.map((user) =>
+							Option.isSome(user) ? user.value.githubUserId : null,
+						),
+					),
+			);
+
+		const addIdsRaw = yield* resolveUserIds(args.assigneesToAdd);
+		const removeIdsRaw = yield* resolveUserIds(args.assigneesToRemove);
+		const addIds = addIdsRaw.filter((id) => id !== null);
+		const removeIds = new Set(removeIdsRaw.filter((id) => id !== null));
+
+		const applyAssignees = (current: ReadonlyArray<number>) => {
+			const kept = current.filter((id) => !removeIds.has(id));
+			return [...new Set([...kept, ...addIds])];
+		};
+
+		if (Option.isSome(issue)) {
+			yield* ctx.db.patch(issue.value._id, {
+				assigneeUserIds: applyAssignees(issue.value.assigneeUserIds),
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "update_assignees",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+				optimisticPayloadJson: JSON.stringify({
+					assigneesToAdd: args.assigneesToAdd,
+					assigneesToRemove: args.assigneesToRemove,
+				}),
+			});
+		}
+
+		if (Option.isSome(pr)) {
+			yield* ctx.db.patch(pr.value._id, {
+				assigneeUserIds: applyAssignees(pr.value.assigneeUserIds),
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "update_assignees",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+				optimisticPayloadJson: JSON.stringify({
+					assigneesToAdd: args.assigneesToAdd,
+					assigneesToRemove: args.assigneesToRemove,
+				}),
+			});
+		}
+
+		if (Option.isNone(issue) && Option.isNone(pr)) {
+			yield* ctx.db.insert("github_issues", {
+				repositoryId: args.repositoryId,
+				githubIssueId: toSyntheticIssueNumber(args.correlationId),
+				number: args.number,
+				state: "open",
+				title: `Issue #${String(args.number)}`,
+				body: null,
+				authorUserId: null,
+				assigneeUserIds: [...new Set(addIds)],
+				labelNames: [],
+				commentCount: 0,
+				isPullRequest: false,
+				closedAt: null,
+				githubUpdatedAt: now,
+				cachedAt: now,
+				optimisticCorrelationId: args.correlationId,
+				optimisticOperationType: "update_assignees",
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: now,
+				optimisticPayloadJson: JSON.stringify({
+					assigneesToAdd: args.assigneesToAdd,
+					assigneesToRemove: args.assigneesToRemove,
+				}),
+			});
+		}
 
 		yield* Effect.promise(() =>
 			ctx.scheduler.runAfter(
@@ -556,7 +1088,7 @@ mergePullRequestDef.implement((args) =>
 
 /**
  * Execute a pending write operation by calling the GitHub API.
- * On success, calls markWriteCompleted. On failure, calls markWriteFailed.
+ * On success/failure, updates optimistic state on domain rows.
  */
 const executeWriteOperationDef = factory.internalAction({
 	payload: { correlationId: Schema.String, actingUserId: Schema.String },
@@ -566,35 +1098,23 @@ const executeWriteOperationDef = factory.internalAction({
 executeWriteOperationDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectActionCtx;
-
-		// Read the operation via internal query
-		// Confect's makeActionCtx now auto-unwraps ExitEncoded, giving us the value directly
-		const opResult = yield* ctx.runQuery(
-			internal.rpc.githubWrite.getWriteOperation,
+		const pendingIssueResult = yield* ctx.runQuery(
+			internal.rpc.githubWrite.getPendingIssueCreate,
 			{ correlationId: args.correlationId },
 		);
-
-		// Decode through Schema for type safety (FunctionReturnType is unknown due to Convex codegen)
-		const OpResultSchema = Schema.Struct({
+		const PendingIssueResultSchema = Schema.Struct({
 			found: Schema.Boolean,
-			operationType: Schema.optional(Schema.String),
-			inputPayloadJson: Schema.optional(Schema.String),
+			repositoryId: Schema.optional(Schema.Number),
 			ownerLogin: Schema.optional(Schema.String),
 			repoName: Schema.optional(Schema.String),
+			title: Schema.optional(Schema.String),
+			body: Schema.optional(Schema.NullOr(Schema.String)),
+			labels: Schema.optional(Schema.Array(Schema.String)),
 		});
-		const op = Schema.decodeUnknownSync(OpResultSchema)(opResult);
-		if (!op.found) {
-			return { completed: false };
-		}
-		const inputPayload = JSON.parse(op.inputPayloadJson ?? "{}") as Record<
-			string,
-			unknown
-		>;
-		const operationType = op.operationType ?? "";
-		const ownerLogin = op.ownerLogin ?? "";
-		const repoName = op.repoName ?? "";
+		const pendingIssue = Schema.decodeUnknownSync(PendingIssueResultSchema)(
+			pendingIssueResult,
+		);
 
-		// Resolve the GitHub token from the signed-in user who triggered the action
 		const token = yield* lookupGitHubTokenByUserIdConfect(
 			ctx.runQuery,
 			args.actingUserId,
@@ -604,77 +1124,447 @@ executeWriteOperationDef.implement((args) =>
 			GitHubApiClient.fromToken(token),
 		);
 
-		// Dispatch based on operation type
-		const result = yield* Effect.gen(function* () {
-			if (operationType === "create_issue") {
-				return yield* executeCreateIssue(
-					gh,
-					ownerLogin,
-					repoName,
-					inputPayload,
-				);
-			}
-			if (operationType === "create_comment") {
-				return yield* executeCreateComment(
-					gh,
-					ownerLogin,
-					repoName,
-					inputPayload,
-				);
-			}
-			if (operationType === "update_issue_state") {
-				return yield* executeUpdateIssueState(
-					gh,
-					ownerLogin,
-					repoName,
-					inputPayload,
-				);
-			}
-			if (operationType === "merge_pull_request") {
-				return yield* executeMergePullRequest(
-					gh,
-					ownerLogin,
-					repoName,
-					inputPayload,
-				);
-			}
-			return {
-				success: false,
-				resultData: null,
-				entityNumber: null,
-				errorStatus: 0,
-				errorMessage: `Unknown operation type: ${operationType}`,
+		if (pendingIssue.found) {
+			const issueInput = {
+				title: pendingIssue.title ?? "",
+				body: pendingIssue.body ?? undefined,
+				labels: pendingIssue.labels ?? [],
 			};
-		}).pipe(
-			Effect.catchAll((error) =>
-				Effect.succeed({
-					success: false,
-					resultData: null,
-					entityNumber: null,
-					errorStatus: 0,
-					errorMessage: String(error),
-				}),
-			),
-		);
 
-		// Call internal mutation to mark completed or failed
-		if (result.success) {
-			yield* ctx.runMutation(internal.rpc.githubWrite.markWriteCompleted, {
+			const issueResult = yield* executeCreateIssue(
+				gh,
+				pendingIssue.ownerLogin ?? "",
+				pendingIssue.repoName ?? "",
+				issueInput,
+			).pipe(
+				Effect.catchAll((error) =>
+					Effect.succeed({
+						success: false,
+						resultData: null,
+						entityNumber: null,
+						errorStatus: errorStatusFromUnknown(error),
+						errorMessage: errorMessageFromUnknown(error),
+					}),
+				),
+			);
+
+			if (issueResult.success && issueResult.resultData !== null) {
+				const issueNumber = num(issueResult.resultData.number);
+				const issueId = num(issueResult.resultData.issueId);
+				if (issueNumber !== null && issueId !== null) {
+					yield* ctx.runMutation(
+						internal.rpc.githubWrite.markIssueCreateAccepted,
+						{
+							correlationId: args.correlationId,
+							githubIssueId: issueId,
+							githubIssueNumber: issueNumber,
+						},
+					);
+					return { completed: true };
+				}
+			}
+
+			yield* ctx.runMutation(internal.rpc.githubWrite.markIssueCreateFailed, {
 				correlationId: args.correlationId,
-				resultDataJson: result.resultData
-					? JSON.stringify(result.resultData)
-					: null,
-				githubEntityNumber: result.entityNumber,
+				errorMessage: issueResult.errorMessage ?? "Unknown error",
+				errorStatus: issueResult.errorStatus,
 			});
-		} else {
-			yield* ctx.runMutation(internal.rpc.githubWrite.markWriteFailed, {
-				correlationId: args.correlationId,
-				errorMessage: result.errorMessage ?? "Unknown error",
-				errorStatus: result.errorStatus ?? 0,
-			});
+			return { completed: false };
 		}
 
-		return { completed: result.success };
+		const pendingCommentResult = yield* ctx.runQuery(
+			internal.rpc.githubWrite.getPendingCommentCreate,
+			{ correlationId: args.correlationId },
+		);
+		const PendingCommentResultSchema = Schema.Struct({
+			found: Schema.Boolean,
+			ownerLogin: Schema.optional(Schema.String),
+			repoName: Schema.optional(Schema.String),
+			number: Schema.optional(Schema.Number),
+			body: Schema.optional(Schema.String),
+		});
+		const pendingComment = Schema.decodeUnknownSync(PendingCommentResultSchema)(
+			pendingCommentResult,
+		);
+		if (pendingComment.found) {
+			const commentResult = yield* executeCreateComment(
+				gh,
+				pendingComment.ownerLogin ?? "",
+				pendingComment.repoName ?? "",
+				{
+					number: pendingComment.number ?? 0,
+					body: pendingComment.body ?? "",
+				},
+			).pipe(
+				Effect.catchAll((error) =>
+					Effect.succeed({
+						success: false,
+						resultData: null,
+						entityNumber: null,
+						errorStatus: errorStatusFromUnknown(error),
+						errorMessage: errorMessageFromUnknown(error),
+					}),
+				),
+			);
+
+			if (commentResult.success && commentResult.resultData !== null) {
+				const commentId = num(commentResult.resultData.commentId);
+				if (commentId !== null) {
+					yield* ctx.runMutation(
+						internal.rpc.githubWrite.markCommentCreateAccepted,
+						{ correlationId: args.correlationId, githubCommentId: commentId },
+					);
+					return { completed: true };
+				}
+			}
+
+			yield* ctx.runMutation(internal.rpc.githubWrite.markCommentCreateFailed, {
+				correlationId: args.correlationId,
+				errorMessage: commentResult.errorMessage ?? "Unknown error",
+				errorStatus: commentResult.errorStatus,
+			});
+			return { completed: false };
+		}
+
+		const pendingStateResult = yield* ctx.runQuery(
+			internal.rpc.githubWrite.getPendingIssueStateUpdate,
+			{ correlationId: args.correlationId },
+		);
+		const PendingStateResultSchema = Schema.Struct({
+			found: Schema.Boolean,
+			ownerLogin: Schema.optional(Schema.String),
+			repoName: Schema.optional(Schema.String),
+			number: Schema.optional(Schema.Number),
+			state: Schema.optional(Schema.Literal("open", "closed")),
+		});
+		const pendingState = Schema.decodeUnknownSync(PendingStateResultSchema)(
+			pendingStateResult,
+		);
+		if (pendingState.found) {
+			const stateResult = yield* executeUpdateIssueState(
+				gh,
+				pendingState.ownerLogin ?? "",
+				pendingState.repoName ?? "",
+				{
+					number: pendingState.number ?? 0,
+					state: pendingState.state ?? "closed",
+				},
+			).pipe(
+				Effect.catchAll((error) =>
+					Effect.succeed({
+						success: false,
+						resultData: null,
+						entityNumber: null,
+						errorStatus: errorStatusFromUnknown(error),
+						errorMessage: errorMessageFromUnknown(error),
+					}),
+				),
+			);
+
+			if (stateResult.success) {
+				yield* ctx.runMutation(
+					internal.rpc.githubWrite.markIssueStateUpdateAccepted,
+					{ correlationId: args.correlationId },
+				);
+				return { completed: true };
+			}
+
+			yield* ctx.runMutation(
+				internal.rpc.githubWrite.markIssueStateUpdateFailed,
+				{
+					correlationId: args.correlationId,
+					errorMessage: stateResult.errorMessage ?? "Unknown error",
+					errorStatus: stateResult.errorStatus,
+				},
+			);
+			return { completed: false };
+		}
+
+		const pendingMergeResult = yield* ctx.runQuery(
+			internal.rpc.githubWrite.getPendingPullRequestMerge,
+			{ correlationId: args.correlationId },
+		);
+		const PendingMergeResultSchema = Schema.Struct({
+			found: Schema.Boolean,
+			ownerLogin: Schema.optional(Schema.String),
+			repoName: Schema.optional(Schema.String),
+			number: Schema.optional(Schema.Number),
+			mergeMethod: Schema.optional(
+				Schema.NullOr(Schema.Literal("merge", "squash", "rebase")),
+			),
+			commitTitle: Schema.optional(Schema.NullOr(Schema.String)),
+			commitMessage: Schema.optional(Schema.NullOr(Schema.String)),
+		});
+		const pendingMerge = Schema.decodeUnknownSync(PendingMergeResultSchema)(
+			pendingMergeResult,
+		);
+		if (pendingMerge.found) {
+			const mergeResult = yield* executeMergePullRequest(
+				gh,
+				pendingMerge.ownerLogin ?? "",
+				pendingMerge.repoName ?? "",
+				{
+					number: pendingMerge.number ?? 0,
+					mergeMethod: pendingMerge.mergeMethod ?? undefined,
+					commitTitle: pendingMerge.commitTitle ?? undefined,
+					commitMessage: pendingMerge.commitMessage ?? undefined,
+				},
+			).pipe(
+				Effect.catchAll((error) =>
+					Effect.succeed({
+						success: false,
+						resultData: null,
+						entityNumber: null,
+						errorStatus: errorStatusFromUnknown(error),
+						errorMessage: errorMessageFromUnknown(error),
+					}),
+				),
+			);
+
+			if (mergeResult.success) {
+				yield* ctx.runMutation(
+					internal.rpc.githubWrite.markMergePullRequestAccepted,
+					{ correlationId: args.correlationId },
+				);
+				return { completed: true };
+			}
+
+			yield* ctx.runMutation(
+				internal.rpc.githubWrite.markMergePullRequestFailed,
+				{
+					correlationId: args.correlationId,
+					errorMessage: mergeResult.errorMessage ?? "Unknown error",
+					errorStatus: mergeResult.errorStatus,
+				},
+			);
+			return { completed: false };
+		}
+
+		const pendingBranchUpdateResult = yield* ctx.runQuery(
+			internal.rpc.githubWrite.getPendingPullRequestBranchUpdate,
+			{ correlationId: args.correlationId },
+		);
+		const PendingBranchUpdateResultSchema = Schema.Struct({
+			found: Schema.Boolean,
+			ownerLogin: Schema.optional(Schema.String),
+			repoName: Schema.optional(Schema.String),
+			number: Schema.optional(Schema.Number),
+			expectedHeadSha: Schema.optional(Schema.NullOr(Schema.String)),
+		});
+		const pendingBranchUpdate = Schema.decodeUnknownSync(
+			PendingBranchUpdateResultSchema,
+		)(pendingBranchUpdateResult);
+		if (pendingBranchUpdate.found) {
+			const branchUpdateResult = yield* executeUpdatePullRequestBranch(
+				pendingBranchUpdate.ownerLogin ?? "",
+				pendingBranchUpdate.repoName ?? "",
+				{
+					number: pendingBranchUpdate.number ?? 0,
+					expectedHeadSha: pendingBranchUpdate.expectedHeadSha ?? undefined,
+				},
+				token,
+			).pipe(
+				Effect.catchAll((error) =>
+					Effect.succeed({
+						success: false,
+						resultData: null,
+						entityNumber: null,
+						errorStatus: errorStatusFromUnknown(error),
+						errorMessage: errorMessageFromUnknown(error),
+					}),
+				),
+			);
+
+			if (branchUpdateResult.success) {
+				yield* ctx.runMutation(
+					internal.rpc.githubWrite.markPullRequestBranchUpdateAccepted,
+					{ correlationId: args.correlationId },
+				);
+				return { completed: true };
+			}
+
+			yield* ctx.runMutation(
+				internal.rpc.githubWrite.markPullRequestBranchUpdateFailed,
+				{
+					correlationId: args.correlationId,
+					errorMessage: branchUpdateResult.errorMessage ?? "Unknown error",
+					errorStatus: branchUpdateResult.errorStatus,
+				},
+			);
+			return { completed: false };
+		}
+
+		const pendingReviewResult = yield* ctx.runQuery(
+			internal.rpc.githubWrite.getPendingPrReview,
+			{ correlationId: args.correlationId },
+		);
+		const PendingReviewResultSchema = Schema.Struct({
+			found: Schema.Boolean,
+			ownerLogin: Schema.optional(Schema.String),
+			repoName: Schema.optional(Schema.String),
+			number: Schema.optional(Schema.Number),
+			event: Schema.optional(
+				Schema.Literal("APPROVE", "REQUEST_CHANGES", "COMMENT"),
+			),
+			body: Schema.optional(Schema.NullOr(Schema.String)),
+		});
+		const pendingReview = Schema.decodeUnknownSync(PendingReviewResultSchema)(
+			pendingReviewResult,
+		);
+		if (pendingReview.found) {
+			const reviewResult = yield* executeSubmitPrReview(
+				gh,
+				pendingReview.ownerLogin ?? "",
+				pendingReview.repoName ?? "",
+				{
+					number: pendingReview.number ?? 0,
+					event: pendingReview.event ?? "COMMENT",
+					body: pendingReview.body ?? undefined,
+				},
+			).pipe(
+				Effect.catchAll((error) =>
+					Effect.succeed({
+						success: false,
+						resultData: null,
+						entityNumber: null,
+						errorStatus: errorStatusFromUnknown(error),
+						errorMessage: errorMessageFromUnknown(error),
+					}),
+				),
+			);
+
+			if (reviewResult.success && reviewResult.resultData !== null) {
+				const reviewId = num(reviewResult.resultData.reviewId);
+				if (reviewId !== null) {
+					yield* ctx.runMutation(
+						internal.rpc.githubWrite.markPrReviewAccepted,
+						{
+							correlationId: args.correlationId,
+							githubReviewId: reviewId,
+						},
+					);
+					return { completed: true };
+				}
+			}
+
+			yield* ctx.runMutation(internal.rpc.githubWrite.markPrReviewFailed, {
+				correlationId: args.correlationId,
+				errorMessage: reviewResult.errorMessage ?? "Unknown error",
+				errorStatus: reviewResult.errorStatus,
+			});
+			return { completed: false };
+		}
+
+		const pendingLabelsResult = yield* ctx.runQuery(
+			internal.rpc.githubWrite.getPendingLabelsUpdate,
+			{ correlationId: args.correlationId },
+		);
+		const PendingLabelsResultSchema = Schema.Struct({
+			found: Schema.Boolean,
+			ownerLogin: Schema.optional(Schema.String),
+			repoName: Schema.optional(Schema.String),
+			number: Schema.optional(Schema.Number),
+			labelsToAdd: Schema.optional(Schema.Array(Schema.String)),
+			labelsToRemove: Schema.optional(Schema.Array(Schema.String)),
+		});
+		const pendingLabels = Schema.decodeUnknownSync(PendingLabelsResultSchema)(
+			pendingLabelsResult,
+		);
+		if (pendingLabels.found) {
+			const labelsResult = yield* executeUpdateLabels(
+				gh,
+				pendingLabels.ownerLogin ?? "",
+				pendingLabels.repoName ?? "",
+				{
+					number: pendingLabels.number ?? 0,
+					labelsToAdd: pendingLabels.labelsToAdd ?? [],
+					labelsToRemove: pendingLabels.labelsToRemove ?? [],
+				},
+			).pipe(
+				Effect.catchAll((error) =>
+					Effect.succeed({
+						success: false,
+						resultData: null,
+						entityNumber: null,
+						errorStatus: errorStatusFromUnknown(error),
+						errorMessage: errorMessageFromUnknown(error),
+					}),
+				),
+			);
+
+			if (labelsResult.success) {
+				yield* ctx.runMutation(
+					internal.rpc.githubWrite.markLabelsUpdateAccepted,
+					{ correlationId: args.correlationId },
+				);
+				return { completed: true };
+			}
+
+			yield* ctx.runMutation(internal.rpc.githubWrite.markLabelsUpdateFailed, {
+				correlationId: args.correlationId,
+				errorMessage: labelsResult.errorMessage ?? "Unknown error",
+				errorStatus: labelsResult.errorStatus,
+			});
+			return { completed: false };
+		}
+
+		const pendingAssigneesResult = yield* ctx.runQuery(
+			internal.rpc.githubWrite.getPendingAssigneesUpdate,
+			{ correlationId: args.correlationId },
+		);
+		const PendingAssigneesResultSchema = Schema.Struct({
+			found: Schema.Boolean,
+			ownerLogin: Schema.optional(Schema.String),
+			repoName: Schema.optional(Schema.String),
+			number: Schema.optional(Schema.Number),
+			assigneesToAdd: Schema.optional(Schema.Array(Schema.String)),
+			assigneesToRemove: Schema.optional(Schema.Array(Schema.String)),
+		});
+		const pendingAssignees = Schema.decodeUnknownSync(
+			PendingAssigneesResultSchema,
+		)(pendingAssigneesResult);
+		if (pendingAssignees.found) {
+			const assigneesResult = yield* executeUpdateAssignees(
+				gh,
+				pendingAssignees.ownerLogin ?? "",
+				pendingAssignees.repoName ?? "",
+				{
+					number: pendingAssignees.number ?? 0,
+					assigneesToAdd: pendingAssignees.assigneesToAdd ?? [],
+					assigneesToRemove: pendingAssignees.assigneesToRemove ?? [],
+				},
+			).pipe(
+				Effect.catchAll((error) =>
+					Effect.succeed({
+						success: false,
+						resultData: null,
+						entityNumber: null,
+						errorStatus: errorStatusFromUnknown(error),
+						errorMessage: errorMessageFromUnknown(error),
+					}),
+				),
+			);
+
+			if (assigneesResult.success) {
+				yield* ctx.runMutation(
+					internal.rpc.githubWrite.markAssigneesUpdateAccepted,
+					{ correlationId: args.correlationId },
+				);
+				return { completed: true };
+			}
+
+			yield* ctx.runMutation(
+				internal.rpc.githubWrite.markAssigneesUpdateFailed,
+				{
+					correlationId: args.correlationId,
+					errorMessage: assigneesResult.errorMessage ?? "Unknown error",
+					errorStatus: assigneesResult.errorStatus,
+				},
+			);
+			return { completed: false };
+		}
+
+		return { completed: false };
 	}).pipe(Effect.catchAll(() => Effect.succeed({ completed: false }))),
 );
 
@@ -691,15 +1581,75 @@ type ExecutionResult = {
 };
 
 type GHClient = {
-	use: <A>(
-		fn: (
-			fetch: (path: string, init?: RequestInit) => Promise<Response>,
-		) => Promise<A>,
-	) => Effect.Effect<
-		A,
-		| import("../shared/githubApi").GitHubApiError
-		| import("../shared/githubApi").GitHubRateLimitError
-	>;
+	client: GitHubClient;
+};
+
+const failedResult = (
+	errorMessage: string,
+	errorStatus = 0,
+): ExecutionResult => ({
+	success: false,
+	resultData: null,
+	entityNumber: null,
+	errorStatus,
+	errorMessage,
+});
+
+const errorStatusFromUnknown = (error: unknown): number => {
+	if (typeof error !== "object" || error === null) return 0;
+	if ("status" in error && typeof error.status === "number") {
+		return error.status;
+	}
+	if (
+		"response" in error &&
+		typeof error.response === "object" &&
+		error.response !== null &&
+		"status" in error.response &&
+		typeof error.response.status === "number"
+	) {
+		return error.response.status;
+	}
+	return 0;
+};
+
+const errorMessageFromUnknown = (error: unknown): string => {
+	if (typeof error !== "object" || error === null) return String(error);
+	if ("message" in error && typeof error.message === "string") {
+		return error.message;
+	}
+	if (
+		"cause" in error &&
+		typeof error.cause === "object" &&
+		error.cause !== null &&
+		"message" in error.cause &&
+		typeof error.cause.message === "string"
+	) {
+		return error.cause.message;
+	}
+	return String(error);
+};
+
+const toStringArray = (value: unknown): Array<string> => {
+	if (!Array.isArray(value)) return [];
+	return value.filter((item): item is string => typeof item === "string");
+};
+
+const parseJsonObject = (
+	json: string | null | undefined,
+): Record<string, unknown> => {
+	if (json === null || json === undefined) return {};
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(json);
+	} catch {
+		return {};
+	}
+	if (typeof parsed !== "object" || parsed === null) return {};
+	const record: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(parsed)) {
+		record[key] = value;
+	}
+	return record;
 };
 
 const executeCreateIssue = (
@@ -709,67 +1659,36 @@ const executeCreateIssue = (
 	input: Record<string, unknown>,
 ): Effect.Effect<ExecutionResult> =>
 	Effect.gen(function* () {
-		const result = yield* gh.use(async (fetch) => {
-			const body: Record<string, unknown> = { title: input.title };
-			if (input.body !== undefined) body.body = input.body;
-			if (Array.isArray(input.labels) && input.labels.length > 0) {
-				body.labels = input.labels;
-			}
+		const title = typeof input.title === "string" ? input.title : "";
+		const body = typeof input.body === "string" ? input.body : undefined;
+		const labels =
+			Array.isArray(input.labels) &&
+			input.labels.length > 0 &&
+			input.labels.every((label) => typeof label === "string")
+				? input.labels
+				: undefined;
 
-			const res = await fetch(`/repos/${ownerLogin}/${repoName}/issues`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify(body),
-			});
-
-			if (!res.ok) {
-				const text = await res.text();
-				return { ok: false, status: res.status, message: text, data: null };
-			}
-
-			const data = await res.json();
-			return { ok: true, status: res.status, message: null, data };
+		const issue = yield* gh.client.issuesCreate(ownerLogin, repoName, {
+			payload: { title, body, labels },
 		});
-
-		if (!result.ok) {
-			return {
-				success: false,
-				resultData: null,
-				entityNumber: null,
-				errorStatus: result.status,
-				errorMessage: result.message,
-			};
-		}
 
 		return {
 			success: true,
 			resultData: {
-				number: num(result.data?.number) ?? 0,
-				htmlUrl: str(result.data?.html_url) ?? "",
+				issueId: issue.id,
+				number: issue.number,
+				htmlUrl: issue.html_url,
 			},
-			entityNumber: num(result.data?.number),
+			entityNumber: issue.number,
 			errorStatus: 0,
 			errorMessage: null,
 		};
 	}).pipe(
-		Effect.catchTags({
-			GitHubApiError: (e) =>
-				Effect.succeed({
-					success: false,
-					resultData: null,
-					entityNumber: null,
-					errorStatus: e.status,
-					errorMessage: e.message,
-				} satisfies ExecutionResult),
-			GitHubRateLimitError: (e) =>
-				Effect.succeed({
-					success: false,
-					resultData: null,
-					entityNumber: null,
-					errorStatus: e.status,
-					errorMessage: e.message,
-				} satisfies ExecutionResult),
-		}),
+		Effect.catchAll((e) =>
+			Effect.succeed(
+				failedResult(errorMessageFromUnknown(e), errorStatusFromUnknown(e)),
+			),
+		),
 	);
 
 const executeCreateComment = (
@@ -780,64 +1699,31 @@ const executeCreateComment = (
 ): Effect.Effect<ExecutionResult> =>
 	Effect.gen(function* () {
 		const issueNumber = num(input.number) ?? 0;
-		const result = yield* gh.use(async (fetch) => {
-			const res = await fetch(
-				`/repos/${ownerLogin}/${repoName}/issues/${issueNumber}/comments`,
-				{
-					method: "POST",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ body: input.body }),
-				},
-			);
+		const body = typeof input.body === "string" ? input.body : "";
 
-			if (!res.ok) {
-				const text = await res.text();
-				return { ok: false, status: res.status, message: text, data: null };
-			}
-
-			const data = await res.json();
-			return { ok: true, status: res.status, message: null, data };
-		});
-
-		if (!result.ok) {
-			return {
-				success: false,
-				resultData: null,
-				entityNumber: null,
-				errorStatus: result.status,
-				errorMessage: result.message,
-			};
-		}
+		const comment = yield* gh.client.issuesCreateComment(
+			ownerLogin,
+			repoName,
+			String(issueNumber),
+			{ payload: { body } },
+		);
 
 		return {
 			success: true,
 			resultData: {
-				commentId: num(result.data?.id) ?? 0,
-				htmlUrl: str(result.data?.html_url) ?? "",
+				commentId: comment.id,
+				htmlUrl: comment.html_url,
 			},
 			entityNumber: issueNumber,
 			errorStatus: 0,
 			errorMessage: null,
 		};
 	}).pipe(
-		Effect.catchTags({
-			GitHubApiError: (e) =>
-				Effect.succeed({
-					success: false,
-					resultData: null,
-					entityNumber: null,
-					errorStatus: e.status,
-					errorMessage: e.message,
-				} satisfies ExecutionResult),
-			GitHubRateLimitError: (e) =>
-				Effect.succeed({
-					success: false,
-					resultData: null,
-					entityNumber: null,
-					errorStatus: e.status,
-					errorMessage: e.message,
-				} satisfies ExecutionResult),
-		}),
+		Effect.catchAll((e) =>
+			Effect.succeed(
+				failedResult(errorMessageFromUnknown(e), errorStatusFromUnknown(e)),
+			),
+		),
 	);
 
 const executeUpdateIssueState = (
@@ -848,40 +1734,32 @@ const executeUpdateIssueState = (
 ): Effect.Effect<ExecutionResult> =>
 	Effect.gen(function* () {
 		const issueNumber = num(input.number) ?? 0;
-		const result = yield* gh.use(async (fetch) => {
-			const res = await fetch(
-				`/repos/${ownerLogin}/${repoName}/issues/${issueNumber}`,
-				{
-					method: "PATCH",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ state: input.state }),
-				},
-			);
+		const state =
+			input.state === "open" || input.state === "closed"
+				? input.state
+				: "closed";
 
-			if (!res.ok) {
-				const text = await res.text();
-				return { ok: false, status: res.status, message: text, data: null };
-			}
+		const updated = yield* gh.client.issuesUpdate(
+			ownerLogin,
+			repoName,
+			String(issueNumber),
+			{ payload: { state } },
+		);
 
-			const data = await res.json();
-			return { ok: true, status: res.status, message: null, data };
-		});
+		// issuesUpdate can return Issue | BasicError — check for number field
+		const returnedNumber =
+			"number" in updated && typeof updated.number === "number"
+				? updated.number
+				: issueNumber;
+		const returnedState =
+			"state" in updated && typeof updated.state === "string"
+				? updated.state
+				: state;
 
-		if (!result.ok) {
-			return {
-				success: false,
-				resultData: null,
-				entityNumber: null,
-				errorStatus: result.status,
-				errorMessage: result.message,
-			};
-		}
-
-		const returnedState = str(result.data?.state);
 		return {
 			success: true,
 			resultData: {
-				number: num(result.data?.number) ?? issueNumber,
+				number: returnedNumber,
 				state: returnedState === "open" ? "open" : "closed",
 			},
 			entityNumber: issueNumber,
@@ -889,24 +1767,11 @@ const executeUpdateIssueState = (
 			errorMessage: null,
 		};
 	}).pipe(
-		Effect.catchTags({
-			GitHubApiError: (e) =>
-				Effect.succeed({
-					success: false,
-					resultData: null,
-					entityNumber: null,
-					errorStatus: e.status,
-					errorMessage: e.message,
-				} satisfies ExecutionResult),
-			GitHubRateLimitError: (e) =>
-				Effect.succeed({
-					success: false,
-					resultData: null,
-					entityNumber: null,
-					errorStatus: e.status,
-					errorMessage: e.message,
-				} satisfies ExecutionResult),
-		}),
+		Effect.catchAll((e) =>
+			Effect.succeed(
+				failedResult(errorMessageFromUnknown(e), errorStatusFromUnknown(e)),
+			),
+		),
 	);
 
 const executeMergePullRequest = (
@@ -917,113 +1782,294 @@ const executeMergePullRequest = (
 ): Effect.Effect<ExecutionResult> =>
 	Effect.gen(function* () {
 		const prNumber = num(input.number) ?? 0;
-		const result = yield* gh.use(async (fetch) => {
-			const body: Record<string, unknown> = {};
-			if (input.mergeMethod !== undefined)
-				body.merge_method = input.mergeMethod;
-			if (input.commitTitle !== undefined)
-				body.commit_title = input.commitTitle;
-			if (input.commitMessage !== undefined)
-				body.commit_message = input.commitMessage;
+		const mergeMethod =
+			input.mergeMethod === "merge" ||
+			input.mergeMethod === "squash" ||
+			input.mergeMethod === "rebase"
+				? input.mergeMethod
+				: undefined;
+		const commitTitle =
+			typeof input.commitTitle === "string" ? input.commitTitle : undefined;
+		const commitMessage =
+			typeof input.commitMessage === "string" ? input.commitMessage : undefined;
 
-			const res = await fetch(
-				`/repos/${ownerLogin}/${repoName}/pulls/${prNumber}/merge`,
-				{
-					method: "PUT",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify(body),
+		const result = yield* gh.client.pullsMerge(
+			ownerLogin,
+			repoName,
+			String(prNumber),
+			{
+				payload: {
+					merge_method: mergeMethod,
+					commit_title: commitTitle,
+					commit_message: commitMessage,
 				},
-			);
-
-			if (!res.ok) {
-				const text = await res.text();
-				return { ok: false, status: res.status, message: text, data: null };
-			}
-
-			const data = await res.json();
-			return { ok: true, status: res.status, message: null, data };
-		});
-
-		if (!result.ok) {
-			return {
-				success: false,
-				resultData: null,
-				entityNumber: null,
-				errorStatus: result.status,
-				errorMessage: result.message,
-			};
-		}
+			},
+		);
 
 		return {
 			success: true,
 			resultData: {
-				merged: result.data?.merged === true,
-				sha: str(result.data?.sha) ?? "",
-				message: str(result.data?.message) ?? "Pull request merged",
+				merged: result.merged,
+				sha: result.sha,
+				message: result.message,
 			},
 			entityNumber: prNumber,
 			errorStatus: 0,
 			errorMessage: null,
 		};
 	}).pipe(
-		Effect.catchTags({
-			GitHubApiError: (e) =>
-				Effect.succeed({
-					success: false,
-					resultData: null,
-					entityNumber: null,
-					errorStatus: e.status,
-					errorMessage: e.message,
-				} satisfies ExecutionResult),
-			GitHubRateLimitError: (e) =>
-				Effect.succeed({
-					success: false,
-					resultData: null,
-					entityNumber: null,
-					errorStatus: e.status,
-					errorMessage: e.message,
-				} satisfies ExecutionResult),
-		}),
+		Effect.catchAll((e) =>
+			Effect.succeed(
+				failedResult(errorMessageFromUnknown(e), errorStatusFromUnknown(e)),
+			),
+		),
+	);
+
+const executeUpdatePullRequestBranch = (
+	ownerLogin: string,
+	repoName: string,
+	input: Record<string, unknown>,
+	token: string,
+): Effect.Effect<ExecutionResult> =>
+	Effect.gen(function* () {
+		const prNumber = num(input.number) ?? 0;
+		const expectedHeadSha =
+			typeof input.expectedHeadSha === "string" ? input.expectedHeadSha : null;
+		const payload =
+			expectedHeadSha === null ? {} : { expected_head_sha: expectedHeadSha };
+		const response = yield* Effect.tryPromise({
+			try: () =>
+				fetch(
+					`https://api.github.com/repos/${encodeURIComponent(ownerLogin)}/${encodeURIComponent(repoName)}/pulls/${String(prNumber)}/update-branch`,
+					{
+						method: "PUT",
+						headers: {
+							Authorization: `Bearer ${token}`,
+							Accept: "application/vnd.github+json",
+							"X-GitHub-Api-Version": "2022-11-28",
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify(payload),
+					},
+				),
+			catch: (error) => new Error(String(error)),
+		});
+
+		const responseText = yield* Effect.tryPromise({
+			try: () => response.text(),
+			catch: (error) => new Error(String(error)),
+		});
+		const parsedBody = parseJsonObject(responseText);
+		const message =
+			typeof parsedBody.message === "string"
+				? parsedBody.message
+				: "Pull request branch update queued";
+
+		if (response.status >= 200 && response.status < 300) {
+			return {
+				success: true,
+				resultData: {
+					number: prNumber,
+					message,
+				},
+				entityNumber: prNumber,
+				errorStatus: 0,
+				errorMessage: null,
+			};
+		}
+
+		return failedResult(message, response.status);
+	}).pipe(
+		Effect.catchAll((error) =>
+			Effect.succeed(
+				failedResult(
+					errorMessageFromUnknown(error),
+					errorStatusFromUnknown(error),
+				),
+			),
+		),
+	);
+
+const executeSubmitPrReview = (
+	gh: GHClient,
+	ownerLogin: string,
+	repoName: string,
+	input: Record<string, unknown>,
+): Effect.Effect<ExecutionResult> =>
+	Effect.gen(function* () {
+		const prNumber = num(input.number) ?? 0;
+		const event =
+			input.event === "APPROVE" ||
+			input.event === "REQUEST_CHANGES" ||
+			input.event === "COMMENT"
+				? input.event
+				: "COMMENT";
+		const body = typeof input.body === "string" ? input.body : undefined;
+
+		const review = yield* gh.client.pullsCreateReview(
+			ownerLogin,
+			repoName,
+			String(prNumber),
+			{
+				payload: { event, body },
+			},
+		);
+
+		return {
+			success: true,
+			resultData: {
+				reviewId: review.id,
+				state: review.state,
+			},
+			entityNumber: prNumber,
+			errorStatus: 0,
+			errorMessage: null,
+		};
+	}).pipe(
+		Effect.catchAll((e) =>
+			Effect.succeed(
+				failedResult(errorMessageFromUnknown(e), errorStatusFromUnknown(e)),
+			),
+		),
+	);
+
+const executeUpdateLabels = (
+	gh: GHClient,
+	ownerLogin: string,
+	repoName: string,
+	input: Record<string, unknown>,
+): Effect.Effect<ExecutionResult> =>
+	Effect.gen(function* () {
+		const issueNumber = num(input.number) ?? 0;
+		const labelsToAdd = toStringArray(input.labelsToAdd);
+		const labelsToRemove = toStringArray(input.labelsToRemove);
+
+		if (labelsToAdd.length > 0) {
+			yield* gh.client.issuesAddLabels(
+				ownerLogin,
+				repoName,
+				String(issueNumber),
+				{
+					payload: labelsToAdd,
+				},
+			);
+		}
+
+		for (const label of labelsToRemove) {
+			yield* gh.client.issuesRemoveLabel(
+				ownerLogin,
+				repoName,
+				String(issueNumber),
+				encodeURIComponent(label),
+			);
+		}
+
+		return {
+			success: true,
+			resultData: {
+				number: issueNumber,
+				labelsAdded: labelsToAdd,
+				labelsRemoved: labelsToRemove,
+			},
+			entityNumber: issueNumber,
+			errorStatus: 0,
+			errorMessage: null,
+		};
+	}).pipe(
+		Effect.catchAll((e) =>
+			Effect.succeed(
+				failedResult(errorMessageFromUnknown(e), errorStatusFromUnknown(e)),
+			),
+		),
+	);
+
+const executeUpdateAssignees = (
+	gh: GHClient,
+	ownerLogin: string,
+	repoName: string,
+	input: Record<string, unknown>,
+): Effect.Effect<ExecutionResult> =>
+	Effect.gen(function* () {
+		const issueNumber = num(input.number) ?? 0;
+		const assigneesToAdd = toStringArray(input.assigneesToAdd);
+		const assigneesToRemove = toStringArray(input.assigneesToRemove);
+
+		if (assigneesToAdd.length > 0) {
+			yield* gh.client.issuesAddAssignees(
+				ownerLogin,
+				repoName,
+				String(issueNumber),
+				{ payload: { assignees: assigneesToAdd } },
+			);
+		}
+
+		if (assigneesToRemove.length > 0) {
+			yield* gh.client.issuesRemoveAssignees(
+				ownerLogin,
+				repoName,
+				String(issueNumber),
+				{ payload: { assignees: assigneesToRemove } },
+			);
+		}
+
+		return {
+			success: true,
+			resultData: {
+				number: issueNumber,
+				assigneesAdded: assigneesToAdd,
+				assigneesRemoved: assigneesToRemove,
+			},
+			entityNumber: issueNumber,
+			errorStatus: 0,
+			errorMessage: null,
+		};
+	}).pipe(
+		Effect.catchAll((e) =>
+			Effect.succeed(
+				failedResult(errorMessageFromUnknown(e), errorStatusFromUnknown(e)),
+			),
+		),
 	);
 
 // ---------------------------------------------------------------------------
 // 3. Internal mutations — mark completed / failed / confirmed
 // ---------------------------------------------------------------------------
 
-const markWriteCompletedDef = factory.internalMutation({
+const markIssueCreateAcceptedDef = factory.internalMutation({
 	payload: {
 		correlationId: Schema.String,
-		resultDataJson: Schema.NullOr(Schema.String),
-		githubEntityNumber: Schema.NullOr(Schema.Number),
+		githubIssueId: Schema.Number,
+		githubIssueNumber: Schema.Number,
 	},
 	success: Schema.Struct({ updated: Schema.Boolean }),
 });
 
-markWriteCompletedDef.implement((args) =>
+markIssueCreateAcceptedDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
-		const op = yield* ctx.db
-			.query("github_write_operations")
-			.withIndex("by_correlationId", (q) =>
-				q.eq("correlationId", args.correlationId),
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
 			)
 			.first();
 
-		if (Option.isNone(op)) return { updated: false };
-		if (op.value.state !== "pending") return { updated: false };
+		if (Option.isNone(issue)) return { updated: false };
 
-		yield* ctx.db.patch(op.value._id, {
-			state: "completed",
-			resultDataJson: args.resultDataJson,
-			githubEntityNumber: args.githubEntityNumber,
-			updatedAt: Date.now(),
+		yield* ctx.db.patch(issue.value._id, {
+			githubIssueId: args.githubIssueId,
+			number: args.githubIssueNumber,
+			optimisticState: "pending",
+			optimisticErrorMessage: null,
+			optimisticErrorStatus: null,
+			optimisticUpdatedAt: Date.now(),
 		});
 
 		return { updated: true };
 	}),
 );
 
-const markWriteFailedDef = factory.internalMutation({
+const markIssueCreateFailedDef = factory.internalMutation({
 	payload: {
 		correlationId: Schema.String,
 		errorMessage: Schema.String,
@@ -1032,74 +2078,594 @@ const markWriteFailedDef = factory.internalMutation({
 	success: Schema.Struct({ updated: Schema.Boolean }),
 });
 
-markWriteFailedDef.implement((args) =>
+markIssueCreateFailedDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
-		const op = yield* ctx.db
-			.query("github_write_operations")
-			.withIndex("by_correlationId", (q) =>
-				q.eq("correlationId", args.correlationId),
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
 			)
 			.first();
 
-		if (Option.isNone(op)) return { updated: false };
-		if (op.value.state !== "pending") return { updated: false };
+		if (Option.isNone(issue)) return { updated: false };
 
-		yield* ctx.db.patch(op.value._id, {
-			state: "failed",
-			errorMessage: args.errorMessage,
-			errorStatus: args.errorStatus,
-			updatedAt: Date.now(),
+		yield* ctx.db.patch(issue.value._id, {
+			optimisticState: "failed",
+			optimisticErrorMessage: args.errorMessage,
+			optimisticErrorStatus: args.errorStatus,
+			optimisticUpdatedAt: Date.now(),
 		});
 
 		return { updated: true };
 	}),
 );
 
-/**
- * Confirm a write operation when the webhook arrives.
- * Called from webhookProcessor when it detects a matching write op.
- */
-const confirmWriteOperationDef = factory.internalMutation({
+const markCommentCreateAcceptedDef = factory.internalMutation({
 	payload: {
-		repositoryId: Schema.Number,
-		operationType: OperationType,
-		githubEntityNumber: Schema.Number,
+		correlationId: Schema.String,
+		githubCommentId: Schema.Number,
 	},
-	success: Schema.Struct({ confirmed: Schema.Boolean }),
+	success: Schema.Struct({ updated: Schema.Boolean }),
 });
 
-confirmWriteOperationDef.implement((args) =>
+markCommentCreateAcceptedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const comment = yield* ctx.db
+			.query("github_issue_comments")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (Option.isNone(comment)) return { updated: false };
+
+		yield* ctx.db.patch(comment.value._id, {
+			githubCommentId: args.githubCommentId,
+			optimisticState: "pending",
+			optimisticErrorMessage: null,
+			optimisticErrorStatus: null,
+			optimisticUpdatedAt: Date.now(),
+		});
+
+		return { updated: true };
+	}),
+);
+
+const markCommentCreateFailedDef = factory.internalMutation({
+	payload: {
+		correlationId: Schema.String,
+		errorMessage: Schema.String,
+		errorStatus: Schema.Number,
+	},
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markCommentCreateFailedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const comment = yield* ctx.db
+			.query("github_issue_comments")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (Option.isNone(comment)) return { updated: false };
+
+		yield* ctx.db.patch(comment.value._id, {
+			optimisticState: "failed",
+			optimisticErrorMessage: args.errorMessage,
+			optimisticErrorStatus: args.errorStatus,
+			optimisticUpdatedAt: Date.now(),
+		});
+
+		return { updated: true };
+	}),
+);
+
+const markIssueStateUpdateAcceptedDef = factory.internalMutation({
+	payload: {
+		correlationId: Schema.String,
+	},
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markIssueStateUpdateAcceptedDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 
-		// Find the most recent pending or completed operation matching this entity
-		const ops = yield* ctx.db
-			.query("github_write_operations")
-			.withIndex(
-				"by_repositoryId_and_operationType_and_githubEntityNumber",
-				(q) =>
-					q
-						.eq("repositoryId", args.repositoryId)
-						.eq("operationType", args.operationType)
-						.eq("githubEntityNumber", args.githubEntityNumber),
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
 			)
-			.order("desc")
-			.take(5);
-
-		let confirmed = false;
-		for (const op of ops) {
-			if (op.state === "pending" || op.state === "completed") {
-				yield* ctx.db.patch(op._id, {
-					state: "confirmed",
-					updatedAt: Date.now(),
-				});
-				confirmed = true;
-				break;
-			}
+			.first();
+		if (Option.isSome(issue)) {
+			yield* ctx.db.patch(issue.value._id, {
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: Date.now(),
+			});
+			return { updated: true };
 		}
 
-		return { confirmed };
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (Option.isNone(pr)) return { updated: false };
+
+		yield* ctx.db.patch(pr.value._id, {
+			optimisticState: "pending",
+			optimisticErrorMessage: null,
+			optimisticErrorStatus: null,
+			optimisticUpdatedAt: Date.now(),
+		});
+		return { updated: true };
+	}),
+);
+
+const markIssueStateUpdateFailedDef = factory.internalMutation({
+	payload: {
+		correlationId: Schema.String,
+		errorMessage: Schema.String,
+		errorStatus: Schema.Number,
+	},
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markIssueStateUpdateFailedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (Option.isSome(issue)) {
+			yield* ctx.db.patch(issue.value._id, {
+				optimisticState: "failed",
+				optimisticErrorMessage: args.errorMessage,
+				optimisticErrorStatus: args.errorStatus,
+				optimisticUpdatedAt: Date.now(),
+			});
+			return { updated: true };
+		}
+
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (Option.isNone(pr)) return { updated: false };
+
+		yield* ctx.db.patch(pr.value._id, {
+			optimisticState: "failed",
+			optimisticErrorMessage: args.errorMessage,
+			optimisticErrorStatus: args.errorStatus,
+			optimisticUpdatedAt: Date.now(),
+		});
+		return { updated: true };
+	}),
+);
+
+const markMergePullRequestAcceptedDef = factory.internalMutation({
+	payload: {
+		correlationId: Schema.String,
+	},
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markMergePullRequestAcceptedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (Option.isNone(pr)) return { updated: false };
+
+		yield* ctx.db.patch(pr.value._id, {
+			optimisticState: "pending",
+			optimisticErrorMessage: null,
+			optimisticErrorStatus: null,
+			optimisticUpdatedAt: Date.now(),
+		});
+
+		return { updated: true };
+	}),
+);
+
+const markMergePullRequestFailedDef = factory.internalMutation({
+	payload: {
+		correlationId: Schema.String,
+		errorMessage: Schema.String,
+		errorStatus: Schema.Number,
+	},
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markMergePullRequestFailedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (Option.isNone(pr)) return { updated: false };
+
+		yield* ctx.db.patch(pr.value._id, {
+			optimisticState: "failed",
+			optimisticErrorMessage: args.errorMessage,
+			optimisticErrorStatus: args.errorStatus,
+			optimisticUpdatedAt: Date.now(),
+		});
+
+		return { updated: true };
+	}),
+);
+
+const markPullRequestBranchUpdateAcceptedDef = factory.internalMutation({
+	payload: {
+		correlationId: Schema.String,
+	},
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markPullRequestBranchUpdateAcceptedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (
+			Option.isNone(pr) ||
+			pr.value.optimisticOperationType !== "update_pull_request_branch"
+		) {
+			return { updated: false };
+		}
+
+		yield* ctx.db.patch(pr.value._id, {
+			optimisticState: "pending",
+			optimisticErrorMessage: null,
+			optimisticErrorStatus: null,
+			optimisticUpdatedAt: Date.now(),
+		});
+
+		return { updated: true };
+	}),
+);
+
+const markPullRequestBranchUpdateFailedDef = factory.internalMutation({
+	payload: {
+		correlationId: Schema.String,
+		errorMessage: Schema.String,
+		errorStatus: Schema.Number,
+	},
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markPullRequestBranchUpdateFailedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (
+			Option.isNone(pr) ||
+			pr.value.optimisticOperationType !== "update_pull_request_branch"
+		) {
+			return { updated: false };
+		}
+
+		yield* ctx.db.patch(pr.value._id, {
+			optimisticState: "failed",
+			optimisticErrorMessage: args.errorMessage,
+			optimisticErrorStatus: args.errorStatus,
+			optimisticUpdatedAt: Date.now(),
+		});
+
+		return { updated: true };
+	}),
+);
+
+const markPrReviewAcceptedDef = factory.internalMutation({
+	payload: {
+		correlationId: Schema.String,
+		githubReviewId: Schema.Number,
+	},
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markPrReviewAcceptedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const review = yield* ctx.db
+			.query("github_pull_request_reviews")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (Option.isNone(review)) return { updated: false };
+
+		yield* ctx.db.patch(review.value._id, {
+			githubReviewId: args.githubReviewId,
+			optimisticState: "pending",
+			optimisticErrorMessage: null,
+			optimisticErrorStatus: null,
+			optimisticUpdatedAt: Date.now(),
+		});
+		return { updated: true };
+	}),
+);
+
+const markPrReviewFailedDef = factory.internalMutation({
+	payload: {
+		correlationId: Schema.String,
+		errorMessage: Schema.String,
+		errorStatus: Schema.Number,
+	},
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markPrReviewFailedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		const review = yield* ctx.db
+			.query("github_pull_request_reviews")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (Option.isNone(review)) return { updated: false };
+
+		yield* ctx.db.patch(review.value._id, {
+			optimisticState: "failed",
+			optimisticErrorMessage: args.errorMessage,
+			optimisticErrorStatus: args.errorStatus,
+			optimisticUpdatedAt: Date.now(),
+		});
+		return { updated: true };
+	}),
+);
+
+const markLabelsUpdateAcceptedDef = factory.internalMutation({
+	payload: { correlationId: Schema.String },
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markLabelsUpdateAcceptedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		let updated = false;
+
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(issue) &&
+			issue.value.optimisticOperationType === "update_labels"
+		) {
+			yield* ctx.db.patch(issue.value._id, {
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: Date.now(),
+			});
+			updated = true;
+		}
+
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(pr) &&
+			pr.value.optimisticOperationType === "update_labels"
+		) {
+			yield* ctx.db.patch(pr.value._id, {
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: Date.now(),
+			});
+			updated = true;
+		}
+
+		return { updated };
+	}),
+);
+
+const markLabelsUpdateFailedDef = factory.internalMutation({
+	payload: {
+		correlationId: Schema.String,
+		errorMessage: Schema.String,
+		errorStatus: Schema.Number,
+	},
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markLabelsUpdateFailedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		let updated = false;
+
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(issue) &&
+			issue.value.optimisticOperationType === "update_labels"
+		) {
+			yield* ctx.db.patch(issue.value._id, {
+				optimisticState: "failed",
+				optimisticErrorMessage: args.errorMessage,
+				optimisticErrorStatus: args.errorStatus,
+				optimisticUpdatedAt: Date.now(),
+			});
+			updated = true;
+		}
+
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(pr) &&
+			pr.value.optimisticOperationType === "update_labels"
+		) {
+			yield* ctx.db.patch(pr.value._id, {
+				optimisticState: "failed",
+				optimisticErrorMessage: args.errorMessage,
+				optimisticErrorStatus: args.errorStatus,
+				optimisticUpdatedAt: Date.now(),
+			});
+			updated = true;
+		}
+
+		return { updated };
+	}),
+);
+
+const markAssigneesUpdateAcceptedDef = factory.internalMutation({
+	payload: { correlationId: Schema.String },
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markAssigneesUpdateAcceptedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		let updated = false;
+
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(issue) &&
+			issue.value.optimisticOperationType === "update_assignees"
+		) {
+			yield* ctx.db.patch(issue.value._id, {
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: Date.now(),
+			});
+			updated = true;
+		}
+
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(pr) &&
+			pr.value.optimisticOperationType === "update_assignees"
+		) {
+			yield* ctx.db.patch(pr.value._id, {
+				optimisticState: "pending",
+				optimisticErrorMessage: null,
+				optimisticErrorStatus: null,
+				optimisticUpdatedAt: Date.now(),
+			});
+			updated = true;
+		}
+
+		return { updated };
+	}),
+);
+
+const markAssigneesUpdateFailedDef = factory.internalMutation({
+	payload: {
+		correlationId: Schema.String,
+		errorMessage: Schema.String,
+		errorStatus: Schema.Number,
+	},
+	success: Schema.Struct({ updated: Schema.Boolean }),
+});
+
+markAssigneesUpdateFailedDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		let updated = false;
+
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(issue) &&
+			issue.value.optimisticOperationType === "update_assignees"
+		) {
+			yield* ctx.db.patch(issue.value._id, {
+				optimisticState: "failed",
+				optimisticErrorMessage: args.errorMessage,
+				optimisticErrorStatus: args.errorStatus,
+				optimisticUpdatedAt: Date.now(),
+			});
+			updated = true;
+		}
+
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(pr) &&
+			pr.value.optimisticOperationType === "update_assignees"
+		) {
+			yield* ctx.db.patch(pr.value._id, {
+				optimisticState: "failed",
+				optimisticErrorMessage: args.errorMessage,
+				optimisticErrorStatus: args.errorStatus,
+				optimisticUpdatedAt: Date.now(),
+			});
+			updated = true;
+		}
+
+		return { updated };
 	}),
 );
 
@@ -1107,36 +2673,522 @@ confirmWriteOperationDef.implement((args) =>
 // 4. Internal query — read operation (used by the action)
 // ---------------------------------------------------------------------------
 
-const getWriteOperationDef = factory.internalQuery({
+const getPendingIssueCreateDef = factory.internalQuery({
 	payload: { correlationId: Schema.String },
 	success: Schema.Struct({
 		found: Schema.Boolean,
-		operationType: Schema.optional(Schema.String),
-		inputPayloadJson: Schema.optional(Schema.String),
+		repositoryId: Schema.optional(Schema.Number),
 		ownerLogin: Schema.optional(Schema.String),
 		repoName: Schema.optional(Schema.String),
+		title: Schema.optional(Schema.String),
+		body: Schema.optional(Schema.NullOr(Schema.String)),
+		labels: Schema.optional(Schema.Array(Schema.String)),
 	}),
 });
 
-getWriteOperationDef.implement((args) =>
+getPendingIssueCreateDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectQueryCtx;
-		const op = yield* ctx.db
-			.query("github_write_operations")
-			.withIndex("by_correlationId", (q) =>
-				q.eq("correlationId", args.correlationId),
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
 			)
 			.first();
 
-		if (Option.isNone(op)) return { found: false };
+		if (Option.isNone(issue)) return { found: false };
+		if (issue.value.optimisticOperationType !== "create_issue") {
+			return { found: false };
+		}
+		if (issue.value.optimisticState !== "pending") return { found: false };
+
+		const repo = yield* ctx.db
+			.query("github_repositories")
+			.withIndex("by_githubRepoId", (q) =>
+				q.eq("githubRepoId", issue.value.repositoryId),
+			)
+			.first();
+
+		if (Option.isNone(repo)) return { found: false };
 
 		return {
 			found: true,
-			operationType: op.value.operationType,
-			inputPayloadJson: op.value.inputPayloadJson,
-			ownerLogin: op.value.ownerLogin,
-			repoName: op.value.repoName,
+			repositoryId: issue.value.repositoryId,
+			ownerLogin: repo.value.ownerLogin,
+			repoName: repo.value.name,
+			title: issue.value.title,
+			body: issue.value.body,
+			labels: [...issue.value.labelNames],
 		};
+	}),
+);
+
+const getPendingCommentCreateDef = factory.internalQuery({
+	payload: { correlationId: Schema.String },
+	success: Schema.Struct({
+		found: Schema.Boolean,
+		ownerLogin: Schema.optional(Schema.String),
+		repoName: Schema.optional(Schema.String),
+		number: Schema.optional(Schema.Number),
+		body: Schema.optional(Schema.String),
+	}),
+});
+
+getPendingCommentCreateDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectQueryCtx;
+		const comment = yield* ctx.db
+			.query("github_issue_comments")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (Option.isNone(comment)) return { found: false };
+		if (comment.value.optimisticOperationType !== "create_comment") {
+			return { found: false };
+		}
+		if (comment.value.optimisticState !== "pending") return { found: false };
+
+		const repo = yield* ctx.db
+			.query("github_repositories")
+			.withIndex("by_githubRepoId", (q) =>
+				q.eq("githubRepoId", comment.value.repositoryId),
+			)
+			.first();
+		if (Option.isNone(repo)) return { found: false };
+
+		return {
+			found: true,
+			ownerLogin: repo.value.ownerLogin,
+			repoName: repo.value.name,
+			number: comment.value.issueNumber,
+			body: comment.value.body,
+		};
+	}),
+);
+
+const getPendingIssueStateUpdateDef = factory.internalQuery({
+	payload: { correlationId: Schema.String },
+	success: Schema.Struct({
+		found: Schema.Boolean,
+		ownerLogin: Schema.optional(Schema.String),
+		repoName: Schema.optional(Schema.String),
+		number: Schema.optional(Schema.Number),
+		state: Schema.optional(Schema.Literal("open", "closed")),
+	}),
+});
+
+getPendingIssueStateUpdateDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectQueryCtx;
+
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(issue) &&
+			issue.value.optimisticOperationType === "update_issue_state" &&
+			issue.value.optimisticState === "pending"
+		) {
+			const repo = yield* ctx.db
+				.query("github_repositories")
+				.withIndex("by_githubRepoId", (q) =>
+					q.eq("githubRepoId", issue.value.repositoryId),
+				)
+				.first();
+			if (Option.isNone(repo)) return { found: false };
+			return {
+				found: true,
+				ownerLogin: repo.value.ownerLogin,
+				repoName: repo.value.name,
+				number: issue.value.number,
+				state: issue.value.state,
+			};
+		}
+
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(pr) &&
+			pr.value.optimisticOperationType === "update_issue_state" &&
+			pr.value.optimisticState === "pending"
+		) {
+			const repo = yield* ctx.db
+				.query("github_repositories")
+				.withIndex("by_githubRepoId", (q) =>
+					q.eq("githubRepoId", pr.value.repositoryId),
+				)
+				.first();
+			if (Option.isNone(repo)) return { found: false };
+			return {
+				found: true,
+				ownerLogin: repo.value.ownerLogin,
+				repoName: repo.value.name,
+				number: pr.value.number,
+				state: pr.value.state,
+			};
+		}
+
+		return { found: false };
+	}),
+);
+
+const getPendingPullRequestMergeDef = factory.internalQuery({
+	payload: { correlationId: Schema.String },
+	success: Schema.Struct({
+		found: Schema.Boolean,
+		ownerLogin: Schema.optional(Schema.String),
+		repoName: Schema.optional(Schema.String),
+		number: Schema.optional(Schema.Number),
+		mergeMethod: Schema.optional(
+			Schema.NullOr(Schema.Literal("merge", "squash", "rebase")),
+		),
+		commitTitle: Schema.optional(Schema.NullOr(Schema.String)),
+		commitMessage: Schema.optional(Schema.NullOr(Schema.String)),
+	}),
+});
+
+getPendingPullRequestMergeDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectQueryCtx;
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (Option.isNone(pr)) return { found: false };
+		if (pr.value.optimisticOperationType !== "merge_pull_request") {
+			return { found: false };
+		}
+		if (pr.value.optimisticState !== "pending") return { found: false };
+
+		const repo = yield* ctx.db
+			.query("github_repositories")
+			.withIndex("by_githubRepoId", (q) =>
+				q.eq("githubRepoId", pr.value.repositoryId),
+			)
+			.first();
+		if (Option.isNone(repo)) return { found: false };
+
+		const payloadJson = pr.value.optimisticPayloadJson ?? "{}";
+		const parsed = JSON.parse(payloadJson) as Record<string, unknown>;
+		const mergeMethod =
+			parsed.mergeMethod === "merge" ||
+			parsed.mergeMethod === "squash" ||
+			parsed.mergeMethod === "rebase"
+				? parsed.mergeMethod
+				: null;
+		const commitTitle =
+			typeof parsed.commitTitle === "string" ? parsed.commitTitle : null;
+		const commitMessage =
+			typeof parsed.commitMessage === "string" ? parsed.commitMessage : null;
+
+		return {
+			found: true,
+			ownerLogin: repo.value.ownerLogin,
+			repoName: repo.value.name,
+			number: pr.value.number,
+			mergeMethod,
+			commitTitle,
+			commitMessage,
+		};
+	}),
+);
+
+const getPendingPullRequestBranchUpdateDef = factory.internalQuery({
+	payload: { correlationId: Schema.String },
+	success: Schema.Struct({
+		found: Schema.Boolean,
+		ownerLogin: Schema.optional(Schema.String),
+		repoName: Schema.optional(Schema.String),
+		number: Schema.optional(Schema.Number),
+		expectedHeadSha: Schema.optional(Schema.NullOr(Schema.String)),
+	}),
+});
+
+getPendingPullRequestBranchUpdateDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectQueryCtx;
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (Option.isNone(pr)) return { found: false };
+		if (pr.value.optimisticOperationType !== "update_pull_request_branch") {
+			return { found: false };
+		}
+		if (pr.value.optimisticState !== "pending") return { found: false };
+
+		const repo = yield* ctx.db
+			.query("github_repositories")
+			.withIndex("by_githubRepoId", (q) =>
+				q.eq("githubRepoId", pr.value.repositoryId),
+			)
+			.first();
+		if (Option.isNone(repo)) return { found: false };
+
+		const payload = parseJsonObject(pr.value.optimisticPayloadJson);
+		const expectedHeadSha =
+			typeof payload.expectedHeadSha === "string"
+				? payload.expectedHeadSha
+				: null;
+
+		return {
+			found: true,
+			ownerLogin: repo.value.ownerLogin,
+			repoName: repo.value.name,
+			number: pr.value.number,
+			expectedHeadSha,
+		};
+	}),
+);
+
+const getPendingPrReviewDef = factory.internalQuery({
+	payload: { correlationId: Schema.String },
+	success: Schema.Struct({
+		found: Schema.Boolean,
+		ownerLogin: Schema.optional(Schema.String),
+		repoName: Schema.optional(Schema.String),
+		number: Schema.optional(Schema.Number),
+		event: Schema.optional(
+			Schema.Literal("APPROVE", "REQUEST_CHANGES", "COMMENT"),
+		),
+		body: Schema.optional(Schema.NullOr(Schema.String)),
+	}),
+});
+
+getPendingPrReviewDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectQueryCtx;
+		const review = yield* ctx.db
+			.query("github_pull_request_reviews")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+
+		if (Option.isNone(review)) return { found: false };
+		if (review.value.optimisticOperationType !== "submit_pr_review") {
+			return { found: false };
+		}
+		if (review.value.optimisticState !== "pending") return { found: false };
+
+		const repo = yield* ctx.db
+			.query("github_repositories")
+			.withIndex("by_githubRepoId", (q) =>
+				q.eq("githubRepoId", review.value.repositoryId),
+			)
+			.first();
+		if (Option.isNone(repo)) return { found: false };
+
+		const parsedPayload = parseJsonObject(review.value.optimisticPayloadJson);
+		const event =
+			typeof parsedPayload.event === "string" &&
+			(parsedPayload.event === "APPROVE" ||
+				parsedPayload.event === "REQUEST_CHANGES" ||
+				parsedPayload.event === "COMMENT")
+				? parsedPayload.event
+				: review.value.state === "APPROVED"
+					? "APPROVE"
+					: review.value.state === "CHANGES_REQUESTED"
+						? "REQUEST_CHANGES"
+						: "COMMENT";
+		const body =
+			typeof parsedPayload.body === "string" ? parsedPayload.body : null;
+
+		return {
+			found: true,
+			ownerLogin: repo.value.ownerLogin,
+			repoName: repo.value.name,
+			number: review.value.pullRequestNumber,
+			event,
+			body,
+		};
+	}),
+);
+
+const getPendingLabelsUpdateDef = factory.internalQuery({
+	payload: { correlationId: Schema.String },
+	success: Schema.Struct({
+		found: Schema.Boolean,
+		ownerLogin: Schema.optional(Schema.String),
+		repoName: Schema.optional(Schema.String),
+		number: Schema.optional(Schema.Number),
+		labelsToAdd: Schema.optional(Schema.Array(Schema.String)),
+		labelsToRemove: Schema.optional(Schema.Array(Schema.String)),
+	}),
+});
+
+getPendingLabelsUpdateDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectQueryCtx;
+
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(issue) &&
+			issue.value.optimisticOperationType === "update_labels" &&
+			issue.value.optimisticState === "pending"
+		) {
+			const repo = yield* ctx.db
+				.query("github_repositories")
+				.withIndex("by_githubRepoId", (q) =>
+					q.eq("githubRepoId", issue.value.repositoryId),
+				)
+				.first();
+			if (Option.isNone(repo)) return { found: false };
+
+			const parsedPayload = parseJsonObject(issue.value.optimisticPayloadJson);
+			const labelsToAdd = toStringArray(parsedPayload.labelsToAdd);
+			const labelsToRemove = toStringArray(parsedPayload.labelsToRemove);
+
+			return {
+				found: true,
+				ownerLogin: repo.value.ownerLogin,
+				repoName: repo.value.name,
+				number: issue.value.number,
+				labelsToAdd,
+				labelsToRemove,
+			};
+		}
+
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(pr) &&
+			pr.value.optimisticOperationType === "update_labels" &&
+			pr.value.optimisticState === "pending"
+		) {
+			const repo = yield* ctx.db
+				.query("github_repositories")
+				.withIndex("by_githubRepoId", (q) =>
+					q.eq("githubRepoId", pr.value.repositoryId),
+				)
+				.first();
+			if (Option.isNone(repo)) return { found: false };
+
+			const parsedPayload = parseJsonObject(pr.value.optimisticPayloadJson);
+			const labelsToAdd = toStringArray(parsedPayload.labelsToAdd);
+			const labelsToRemove = toStringArray(parsedPayload.labelsToRemove);
+
+			return {
+				found: true,
+				ownerLogin: repo.value.ownerLogin,
+				repoName: repo.value.name,
+				number: pr.value.number,
+				labelsToAdd,
+				labelsToRemove,
+			};
+		}
+
+		return { found: false };
+	}),
+);
+
+const getPendingAssigneesUpdateDef = factory.internalQuery({
+	payload: { correlationId: Schema.String },
+	success: Schema.Struct({
+		found: Schema.Boolean,
+		ownerLogin: Schema.optional(Schema.String),
+		repoName: Schema.optional(Schema.String),
+		number: Schema.optional(Schema.Number),
+		assigneesToAdd: Schema.optional(Schema.Array(Schema.String)),
+		assigneesToRemove: Schema.optional(Schema.Array(Schema.String)),
+	}),
+});
+
+getPendingAssigneesUpdateDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectQueryCtx;
+
+		const issue = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(issue) &&
+			issue.value.optimisticOperationType === "update_assignees" &&
+			issue.value.optimisticState === "pending"
+		) {
+			const repo = yield* ctx.db
+				.query("github_repositories")
+				.withIndex("by_githubRepoId", (q) =>
+					q.eq("githubRepoId", issue.value.repositoryId),
+				)
+				.first();
+			if (Option.isNone(repo)) return { found: false };
+
+			const parsedPayload = parseJsonObject(issue.value.optimisticPayloadJson);
+			const assigneesToAdd = toStringArray(parsedPayload.assigneesToAdd);
+			const assigneesToRemove = toStringArray(parsedPayload.assigneesToRemove);
+
+			return {
+				found: true,
+				ownerLogin: repo.value.ownerLogin,
+				repoName: repo.value.name,
+				number: issue.value.number,
+				assigneesToAdd,
+				assigneesToRemove,
+			};
+		}
+
+		const pr = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_optimisticCorrelationId", (q) =>
+				q.eq("optimisticCorrelationId", args.correlationId),
+			)
+			.first();
+		if (
+			Option.isSome(pr) &&
+			pr.value.optimisticOperationType === "update_assignees" &&
+			pr.value.optimisticState === "pending"
+		) {
+			const repo = yield* ctx.db
+				.query("github_repositories")
+				.withIndex("by_githubRepoId", (q) =>
+					q.eq("githubRepoId", pr.value.repositoryId),
+				)
+				.first();
+			if (Option.isNone(repo)) return { found: false };
+
+			const parsedPayload = parseJsonObject(pr.value.optimisticPayloadJson);
+			const assigneesToAdd = toStringArray(parsedPayload.assigneesToAdd);
+			const assigneesToRemove = toStringArray(parsedPayload.assigneesToRemove);
+
+			return {
+				found: true,
+				ownerLogin: repo.value.ownerLogin,
+				repoName: repo.value.name,
+				number: pr.value.number,
+				assigneesToAdd,
+				assigneesToRemove,
+			};
+		}
+
+		return { found: false };
 	}),
 );
 
@@ -1171,64 +3223,413 @@ listWriteOperationsDef.implement((args) =>
 		).pipe(Effect.either);
 		if (access._tag === "Left") return [];
 
-		if (args.stateFilter !== undefined) {
-			const ops = yield* ctx.db
-				.query("github_write_operations")
-				.withIndex("by_repositoryId_and_state_and_createdAt", (q) =>
-					q
-						.eq("repositoryId", args.repositoryId)
-						.eq("state", args.stateFilter!),
-				)
-				.order("desc")
-				.take(50);
-
-			return ops.map((op) => ({
-				_id: String(op._id),
-				_creationTime: op._creationTime,
-				correlationId: op.correlationId,
-				operationType: op.operationType,
-				state: op.state,
-				repositoryId: op.repositoryId,
-				ownerLogin: op.ownerLogin,
-				repoName: op.repoName,
-				inputPayloadJson: op.inputPayloadJson,
-				optimisticDataJson: op.optimisticDataJson,
-				resultDataJson: op.resultDataJson,
-				errorMessage: op.errorMessage,
-				errorStatus: op.errorStatus,
-				githubEntityNumber: op.githubEntityNumber,
-				createdAt: op.createdAt,
-				updatedAt: op.updatedAt,
-			}));
-		}
-
-		// No state filter — get recent ops across all states
-		const ops = yield* ctx.db
-			.query("github_write_operations")
-			.withIndex("by_repositoryId_and_state_and_createdAt", (q) =>
+		const issueRows = yield* ctx.db
+			.query("github_issues")
+			.withIndex("by_repositoryId_and_state_and_githubUpdatedAt", (q) =>
 				q.eq("repositoryId", args.repositoryId),
 			)
 			.order("desc")
-			.take(50);
+			.take(100);
 
-		return ops.map((op) => ({
-			_id: String(op._id),
-			_creationTime: op._creationTime,
-			correlationId: op.correlationId,
-			operationType: op.operationType,
-			state: op.state,
-			repositoryId: op.repositoryId,
-			ownerLogin: op.ownerLogin,
-			repoName: op.repoName,
-			inputPayloadJson: op.inputPayloadJson,
-			optimisticDataJson: op.optimisticDataJson,
-			resultDataJson: op.resultDataJson,
-			errorMessage: op.errorMessage,
-			errorStatus: op.errorStatus,
-			githubEntityNumber: op.githubEntityNumber,
-			createdAt: op.createdAt,
-			updatedAt: op.updatedAt,
-		}));
+		const issueOps = issueRows
+			.map((issue) => {
+				const correlationId = issue.optimisticCorrelationId;
+				const operationType = issue.optimisticOperationType;
+				const optimisticState = issue.optimisticState;
+				const payload = parseJsonObject(issue.optimisticPayloadJson);
+				const labelsToAdd = toStringArray(payload.labelsToAdd);
+				const labelsToRemove = toStringArray(payload.labelsToRemove);
+				const assigneesToAdd = toStringArray(payload.assigneesToAdd);
+				const assigneesToRemove = toStringArray(payload.assigneesToRemove);
+				if (correlationId === null || correlationId === undefined) return null;
+				if (
+					operationType !== "create_issue" &&
+					operationType !== "update_issue_state" &&
+					operationType !== "update_labels" &&
+					operationType !== "update_assignees"
+				)
+					return null;
+				if (
+					optimisticState !== "pending" &&
+					optimisticState !== "failed" &&
+					optimisticState !== "confirmed"
+				) {
+					return null;
+				}
+				const inputPayload =
+					operationType === "create_issue"
+						? {
+								ownerLogin: repo.value.ownerLogin,
+								name: repo.value.name,
+								title: issue.title,
+								body: issue.body,
+								labels: [...issue.labelNames],
+							}
+						: operationType === "update_issue_state"
+							? {
+									ownerLogin: repo.value.ownerLogin,
+									name: repo.value.name,
+									number: issue.number,
+									state: issue.state,
+								}
+							: operationType === "update_labels"
+								? {
+										ownerLogin: repo.value.ownerLogin,
+										name: repo.value.name,
+										number: issue.number,
+										labelsToAdd,
+										labelsToRemove,
+									}
+								: {
+										ownerLogin: repo.value.ownerLogin,
+										name: repo.value.name,
+										number: issue.number,
+										assigneesToAdd,
+										assigneesToRemove,
+									};
+				const optimisticData =
+					operationType === "create_issue"
+						? {
+								title: issue.title,
+								body: issue.body,
+								labels: [...issue.labelNames],
+							}
+						: operationType === "update_issue_state"
+							? {
+									number: issue.number,
+									state: issue.state,
+								}
+							: operationType === "update_labels"
+								? {
+										number: issue.number,
+										labelNames: [...issue.labelNames],
+										labelsToAdd,
+										labelsToRemove,
+									}
+								: {
+										number: issue.number,
+										assigneeUserIds: [...issue.assigneeUserIds],
+										assigneesToAdd,
+										assigneesToRemove,
+									};
+
+				return {
+					_id: String(issue._id),
+					_creationTime: issue._creationTime,
+					correlationId,
+					operationType,
+					state: optimisticState,
+					repositoryId: issue.repositoryId,
+					ownerLogin: repo.value.ownerLogin,
+					repoName: repo.value.name,
+					inputPayloadJson: JSON.stringify(inputPayload),
+					optimisticDataJson: JSON.stringify(optimisticData),
+					resultDataJson:
+						issue.number > 0
+							? JSON.stringify(
+									operationType === "create_issue"
+										? { number: issue.number }
+										: operationType === "update_issue_state"
+											? { number: issue.number, state: issue.state }
+											: operationType === "update_labels"
+												? {
+														number: issue.number,
+														labelNames: [...issue.labelNames],
+													}
+												: {
+														number: issue.number,
+														assigneeUserIds: [...issue.assigneeUserIds],
+													},
+								)
+							: null,
+					errorMessage: issue.optimisticErrorMessage ?? null,
+					errorStatus: issue.optimisticErrorStatus ?? null,
+					githubEntityNumber: issue.number > 0 ? issue.number : null,
+					createdAt: issue._creationTime,
+					updatedAt: issue.optimisticUpdatedAt ?? issue.githubUpdatedAt,
+				};
+			})
+			.filter((op) => op !== null)
+			.filter((op) =>
+				args.stateFilter === undefined ? true : op.state === args.stateFilter,
+			);
+
+		const commentRows = yield* ctx.db
+			.query("github_issue_comments")
+			.withIndex("by_repositoryId_and_issueNumber", (q) =>
+				q.eq("repositoryId", args.repositoryId),
+			)
+			.take(200);
+
+		const commentOps = commentRows
+			.map((comment) => {
+				const correlationId = comment.optimisticCorrelationId;
+				const optimisticState = comment.optimisticState;
+				if (correlationId === null || correlationId === undefined) return null;
+				if (comment.optimisticOperationType !== "create_comment") return null;
+				if (
+					optimisticState !== "pending" &&
+					optimisticState !== "failed" &&
+					optimisticState !== "confirmed"
+				) {
+					return null;
+				}
+
+				const inputPayload = {
+					ownerLogin: repo.value.ownerLogin,
+					name: repo.value.name,
+					number: comment.issueNumber,
+					body: comment.body,
+				};
+				const optimisticData = {
+					number: comment.issueNumber,
+					body: comment.body,
+				};
+
+				return {
+					_id: String(comment._id),
+					_creationTime: comment._creationTime,
+					correlationId,
+					operationType: "create_comment",
+					state: optimisticState,
+					repositoryId: comment.repositoryId,
+					ownerLogin: repo.value.ownerLogin,
+					repoName: repo.value.name,
+					inputPayloadJson: JSON.stringify(inputPayload),
+					optimisticDataJson: JSON.stringify(optimisticData),
+					resultDataJson:
+						comment.githubCommentId > 0
+							? JSON.stringify({ commentId: comment.githubCommentId })
+							: null,
+					errorMessage: comment.optimisticErrorMessage ?? null,
+					errorStatus: comment.optimisticErrorStatus ?? null,
+					githubEntityNumber:
+						comment.issueNumber > 0 ? comment.issueNumber : null,
+					createdAt: comment.createdAt,
+					updatedAt: comment.optimisticUpdatedAt ?? comment.updatedAt,
+				};
+			})
+			.filter((op) => op !== null)
+			.filter((op) =>
+				args.stateFilter === undefined ? true : op.state === args.stateFilter,
+			);
+
+		const prRows = yield* ctx.db
+			.query("github_pull_requests")
+			.withIndex("by_repositoryId_and_state_and_githubUpdatedAt", (q) =>
+				q.eq("repositoryId", args.repositoryId),
+			)
+			.order("desc")
+			.take(100);
+
+		const prOps = prRows
+			.map((pr) => {
+				const correlationId = pr.optimisticCorrelationId;
+				const operationType = pr.optimisticOperationType;
+				const optimisticState = pr.optimisticState;
+				if (correlationId === null || correlationId === undefined) return null;
+				if (
+					operationType !== "update_issue_state" &&
+					operationType !== "merge_pull_request" &&
+					operationType !== "update_pull_request_branch" &&
+					operationType !== "update_labels" &&
+					operationType !== "update_assignees"
+				) {
+					return null;
+				}
+				if (
+					optimisticState !== "pending" &&
+					optimisticState !== "failed" &&
+					optimisticState !== "confirmed"
+				) {
+					return null;
+				}
+				const payload = parseJsonObject(pr.optimisticPayloadJson);
+				const labelsToAdd = toStringArray(payload.labelsToAdd);
+				const labelsToRemove = toStringArray(payload.labelsToRemove);
+				const assigneesToAdd = toStringArray(payload.assigneesToAdd);
+				const assigneesToRemove = toStringArray(payload.assigneesToRemove);
+				const expectedHeadSha =
+					typeof payload.expectedHeadSha === "string"
+						? payload.expectedHeadSha
+						: null;
+
+				const inputPayload =
+					operationType === "merge_pull_request"
+						? {
+								ownerLogin: repo.value.ownerLogin,
+								name: repo.value.name,
+								number: pr.number,
+								mergeMethod:
+									typeof payload.mergeMethod === "string"
+										? payload.mergeMethod
+										: null,
+								commitTitle:
+									typeof payload.commitTitle === "string"
+										? payload.commitTitle
+										: null,
+								commitMessage:
+									typeof payload.commitMessage === "string"
+										? payload.commitMessage
+										: null,
+							}
+						: operationType === "update_pull_request_branch"
+							? {
+									ownerLogin: repo.value.ownerLogin,
+									name: repo.value.name,
+									number: pr.number,
+									expectedHeadSha,
+								}
+							: operationType === "update_issue_state"
+								? {
+										ownerLogin: repo.value.ownerLogin,
+										name: repo.value.name,
+										number: pr.number,
+										state: pr.state,
+									}
+								: operationType === "update_labels"
+									? {
+											ownerLogin: repo.value.ownerLogin,
+											name: repo.value.name,
+											number: pr.number,
+											labelsToAdd,
+											labelsToRemove,
+										}
+									: {
+											ownerLogin: repo.value.ownerLogin,
+											name: repo.value.name,
+											number: pr.number,
+											assigneesToAdd,
+											assigneesToRemove,
+										};
+
+				return {
+					_id: String(pr._id),
+					_creationTime: pr._creationTime,
+					correlationId,
+					operationType,
+					state: optimisticState,
+					repositoryId: pr.repositoryId,
+					ownerLogin: repo.value.ownerLogin,
+					repoName: repo.value.name,
+					inputPayloadJson: JSON.stringify(inputPayload),
+					optimisticDataJson: JSON.stringify({
+						number: pr.number,
+						state: pr.state,
+						labelNames: [...(pr.labelNames ?? [])],
+						assigneeUserIds: [...pr.assigneeUserIds],
+					}),
+					resultDataJson:
+						operationType === "merge_pull_request"
+							? JSON.stringify({
+									merged: pr.mergedAt !== null,
+									number: pr.number,
+								})
+							: operationType === "update_pull_request_branch"
+								? JSON.stringify({
+										number: pr.number,
+										headSha: pr.headSha,
+									})
+								: operationType === "update_issue_state"
+									? JSON.stringify({ number: pr.number, state: pr.state })
+									: operationType === "update_labels"
+										? JSON.stringify({
+												number: pr.number,
+												labelNames: [...(pr.labelNames ?? [])],
+											})
+										: JSON.stringify({
+												number: pr.number,
+												assigneeUserIds: [...pr.assigneeUserIds],
+											}),
+					errorMessage: pr.optimisticErrorMessage ?? null,
+					errorStatus: pr.optimisticErrorStatus ?? null,
+					githubEntityNumber: pr.number,
+					createdAt: pr._creationTime,
+					updatedAt: pr.optimisticUpdatedAt ?? pr.githubUpdatedAt,
+				};
+			})
+			.filter((op) => op !== null)
+			.filter((op) =>
+				args.stateFilter === undefined ? true : op.state === args.stateFilter,
+			);
+
+		const reviewRows = yield* ctx.db
+			.query("github_pull_request_reviews")
+			.withIndex("by_repositoryId_and_pullRequestNumber", (q) =>
+				q.eq("repositoryId", args.repositoryId),
+			)
+			.take(200);
+
+		const reviewOps = reviewRows
+			.map((review) => {
+				const correlationId = review.optimisticCorrelationId;
+				const optimisticState = review.optimisticState;
+				if (correlationId === null || correlationId === undefined) return null;
+				if (review.optimisticOperationType !== "submit_pr_review") return null;
+				if (
+					optimisticState !== "pending" &&
+					optimisticState !== "failed" &&
+					optimisticState !== "confirmed"
+				) {
+					return null;
+				}
+
+				const payload = parseJsonObject(review.optimisticPayloadJson);
+				const event =
+					payload.event === "APPROVE" ||
+					payload.event === "REQUEST_CHANGES" ||
+					payload.event === "COMMENT"
+						? payload.event
+						: "COMMENT";
+				const body = typeof payload.body === "string" ? payload.body : null;
+
+				return {
+					_id: String(review._id),
+					_creationTime: review._creationTime,
+					correlationId,
+					operationType: "submit_pr_review",
+					state: optimisticState,
+					repositoryId: review.repositoryId,
+					ownerLogin: repo.value.ownerLogin,
+					repoName: repo.value.name,
+					inputPayloadJson: JSON.stringify({
+						ownerLogin: repo.value.ownerLogin,
+						name: repo.value.name,
+						number: review.pullRequestNumber,
+						event,
+						body,
+					}),
+					optimisticDataJson: JSON.stringify({
+						pullRequestNumber: review.pullRequestNumber,
+						state: review.state,
+						event,
+						body,
+					}),
+					resultDataJson:
+						review.githubReviewId > 0
+							? JSON.stringify({ reviewId: review.githubReviewId })
+							: null,
+					errorMessage: review.optimisticErrorMessage ?? null,
+					errorStatus: review.optimisticErrorStatus ?? null,
+					githubEntityNumber:
+						review.pullRequestNumber > 0 ? review.pullRequestNumber : null,
+					createdAt: review._creationTime,
+					updatedAt:
+						review.optimisticUpdatedAt ??
+						review.submittedAt ??
+						review._creationTime,
+				};
+			})
+			.filter((op) => op !== null)
+			.filter((op) =>
+				args.stateFilter === undefined ? true : op.state === args.stateFilter,
+			);
+
+		const decodeWriteOperation = Schema.decodeUnknownSync(WriteOperation);
+		return [...issueOps, ...commentOps, ...prOps, ...reviewOps]
+			.sort((a, b) => b.createdAt - a.createdAt)
+			.slice(0, 50)
+			.map((op) => decodeWriteOperation(op));
 	}),
 );
 
@@ -1243,14 +3644,38 @@ const githubWriteModule = makeRpcModule(
 		createComment: createCommentDef,
 		updateIssueState: updateIssueStateDef,
 		mergePullRequest: mergePullRequestDef,
+		updatePullRequestBranch: updatePullRequestBranchDef,
+		submitPrReview: submitPrReviewDef,
+		updateLabels: updateLabelsDef,
+		updateAssignees: updateAssigneesDef,
 		// Internal action (executes the GitHub API call)
 		executeWriteOperation: executeWriteOperationDef,
 		// Internal mutations (state transitions)
-		markWriteCompleted: markWriteCompletedDef,
-		markWriteFailed: markWriteFailedDef,
-		confirmWriteOperation: confirmWriteOperationDef,
+		markIssueCreateAccepted: markIssueCreateAcceptedDef,
+		markIssueCreateFailed: markIssueCreateFailedDef,
+		markCommentCreateAccepted: markCommentCreateAcceptedDef,
+		markCommentCreateFailed: markCommentCreateFailedDef,
+		markIssueStateUpdateAccepted: markIssueStateUpdateAcceptedDef,
+		markIssueStateUpdateFailed: markIssueStateUpdateFailedDef,
+		markMergePullRequestAccepted: markMergePullRequestAcceptedDef,
+		markMergePullRequestFailed: markMergePullRequestFailedDef,
+		markPullRequestBranchUpdateAccepted: markPullRequestBranchUpdateAcceptedDef,
+		markPullRequestBranchUpdateFailed: markPullRequestBranchUpdateFailedDef,
+		markPrReviewAccepted: markPrReviewAcceptedDef,
+		markPrReviewFailed: markPrReviewFailedDef,
+		markLabelsUpdateAccepted: markLabelsUpdateAcceptedDef,
+		markLabelsUpdateFailed: markLabelsUpdateFailedDef,
+		markAssigneesUpdateAccepted: markAssigneesUpdateAcceptedDef,
+		markAssigneesUpdateFailed: markAssigneesUpdateFailedDef,
 		// Internal query (used by action)
-		getWriteOperation: getWriteOperationDef,
+		getPendingIssueCreate: getPendingIssueCreateDef,
+		getPendingCommentCreate: getPendingCommentCreateDef,
+		getPendingIssueStateUpdate: getPendingIssueStateUpdateDef,
+		getPendingPullRequestMerge: getPendingPullRequestMergeDef,
+		getPendingPullRequestBranchUpdate: getPendingPullRequestBranchUpdateDef,
+		getPendingPrReview: getPendingPrReviewDef,
+		getPendingLabelsUpdate: getPendingLabelsUpdateDef,
+		getPendingAssigneesUpdate: getPendingAssigneesUpdateDef,
 		// Public query (UI consumption)
 		listWriteOperations: listWriteOperationsDef,
 	},
@@ -1262,11 +3687,35 @@ export const {
 	createComment,
 	updateIssueState,
 	mergePullRequest,
+	updatePullRequestBranch,
+	submitPrReview,
+	updateLabels,
+	updateAssignees,
 	executeWriteOperation,
-	markWriteCompleted,
-	markWriteFailed,
-	confirmWriteOperation,
-	getWriteOperation,
+	markIssueCreateAccepted,
+	markIssueCreateFailed,
+	markCommentCreateAccepted,
+	markCommentCreateFailed,
+	markIssueStateUpdateAccepted,
+	markIssueStateUpdateFailed,
+	markMergePullRequestAccepted,
+	markMergePullRequestFailed,
+	markPullRequestBranchUpdateAccepted,
+	markPullRequestBranchUpdateFailed,
+	markPrReviewAccepted,
+	markPrReviewFailed,
+	markLabelsUpdateAccepted,
+	markLabelsUpdateFailed,
+	markAssigneesUpdateAccepted,
+	markAssigneesUpdateFailed,
+	getPendingIssueCreate,
+	getPendingCommentCreate,
+	getPendingIssueStateUpdate,
+	getPendingPullRequestMerge,
+	getPendingPullRequestBranchUpdate,
+	getPendingPrReview,
+	getPendingLabelsUpdate,
+	getPendingAssigneesUpdate,
 	listWriteOperations,
 } = githubWriteModule.handlers;
 export {

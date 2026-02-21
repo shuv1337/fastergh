@@ -73,38 +73,6 @@ const GitHubDeadLetterSchema = Schema.Struct({
 	createdAt: Schema.Number,
 });
 
-const GitHubWriteOperationSchema = Schema.Struct({
-	/** Unique client-generated ID for deduplication & correlation */
-	correlationId: Schema.String,
-	/** Type of write operation */
-	operationType: Schema.Literal(
-		"create_issue",
-		"create_comment",
-		"update_issue_state",
-		"merge_pull_request",
-	),
-	/** pending → completed/failed → confirmed (webhook received) */
-	state: Schema.Literal("pending", "completed", "failed", "confirmed"),
-	/** Repo coordinates */
-	repositoryId: Schema.Number,
-	ownerLogin: Schema.String,
-	repoName: Schema.String,
-	/** Original input arguments as JSON */
-	inputPayloadJson: Schema.String,
-	/** Optimistic data the UI can display while pending (e.g. issue title, body preview) */
-	optimisticDataJson: Schema.NullOr(Schema.String),
-	/** GitHub API response data filled on completion */
-	resultDataJson: Schema.NullOr(Schema.String),
-	/** Error message filled on failure */
-	errorMessage: Schema.NullOr(Schema.String),
-	/** HTTP status code from GitHub on failure */
-	errorStatus: Schema.NullOr(Schema.Number),
-	/** GitHub entity number (issue/PR number) — filled on completion, used for webhook matching */
-	githubEntityNumber: Schema.NullOr(Schema.Number),
-	createdAt: Schema.Number,
-	updatedAt: Schema.Number,
-});
-
 // ============================================================
 // B) Normalized Domain Tables
 // ============================================================
@@ -184,6 +152,7 @@ const GitHubPullRequestSchema = Schema.Struct({
 	authorUserId: Schema.NullOr(Schema.Number),
 	assigneeUserIds: Schema.Array(Schema.Number),
 	requestedReviewerUserIds: Schema.Array(Schema.Number),
+	labelNames: Schema.optional(Schema.Array(Schema.String)),
 	baseRefName: Schema.String,
 	headRefName: Schema.String,
 	headSha: Schema.String,
@@ -192,6 +161,25 @@ const GitHubPullRequestSchema = Schema.Struct({
 	closedAt: Schema.NullOr(Schema.Number),
 	githubUpdatedAt: Schema.Number,
 	cachedAt: Schema.Number,
+	optimisticCorrelationId: Schema.optional(Schema.NullOr(Schema.String)),
+	optimisticOperationType: Schema.optional(
+		Schema.NullOr(
+			Schema.Literal(
+				"update_issue_state",
+				"merge_pull_request",
+				"update_pull_request_branch",
+				"update_labels",
+				"update_assignees",
+			),
+		),
+	),
+	optimisticState: Schema.optional(
+		Schema.NullOr(Schema.Literal("pending", "failed", "confirmed")),
+	),
+	optimisticErrorMessage: Schema.optional(Schema.NullOr(Schema.String)),
+	optimisticErrorStatus: Schema.optional(Schema.NullOr(Schema.Number)),
+	optimisticUpdatedAt: Schema.optional(Schema.NullOr(Schema.Number)),
+	optimisticPayloadJson: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
 const GitHubPullRequestReviewSchema = Schema.Struct({
@@ -202,6 +190,17 @@ const GitHubPullRequestReviewSchema = Schema.Struct({
 	state: Schema.String,
 	submittedAt: Schema.NullOr(Schema.Number),
 	commitSha: Schema.NullOr(Schema.String),
+	optimisticCorrelationId: Schema.optional(Schema.NullOr(Schema.String)),
+	optimisticOperationType: Schema.optional(
+		Schema.NullOr(Schema.Literal("submit_pr_review")),
+	),
+	optimisticState: Schema.optional(
+		Schema.NullOr(Schema.Literal("pending", "failed", "confirmed")),
+	),
+	optimisticErrorMessage: Schema.optional(Schema.NullOr(Schema.String)),
+	optimisticErrorStatus: Schema.optional(Schema.NullOr(Schema.Number)),
+	optimisticUpdatedAt: Schema.optional(Schema.NullOr(Schema.Number)),
+	optimisticPayloadJson: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
 const GitHubPullRequestReviewCommentSchema = Schema.Struct({
@@ -240,6 +239,26 @@ const GitHubIssueSchema = Schema.Struct({
 	closedAt: Schema.NullOr(Schema.Number),
 	githubUpdatedAt: Schema.Number,
 	cachedAt: Schema.Number,
+	optimisticCorrelationId: Schema.optional(Schema.NullOr(Schema.String)),
+	optimisticOperationType: Schema.optional(
+		Schema.NullOr(
+			Schema.Literal(
+				"create_issue",
+				"create_comment",
+				"update_issue_state",
+				"merge_pull_request",
+				"update_labels",
+				"update_assignees",
+			),
+		),
+	),
+	optimisticState: Schema.optional(
+		Schema.NullOr(Schema.Literal("pending", "failed", "confirmed")),
+	),
+	optimisticErrorMessage: Schema.optional(Schema.NullOr(Schema.String)),
+	optimisticErrorStatus: Schema.optional(Schema.NullOr(Schema.Number)),
+	optimisticUpdatedAt: Schema.optional(Schema.NullOr(Schema.Number)),
+	optimisticPayloadJson: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
 const GitHubIssueCommentSchema = Schema.Struct({
@@ -250,6 +269,16 @@ const GitHubIssueCommentSchema = Schema.Struct({
 	body: Schema.String,
 	createdAt: Schema.Number,
 	updatedAt: Schema.Number,
+	optimisticCorrelationId: Schema.optional(Schema.NullOr(Schema.String)),
+	optimisticOperationType: Schema.optional(
+		Schema.NullOr(Schema.Literal("create_comment")),
+	),
+	optimisticState: Schema.optional(
+		Schema.NullOr(Schema.Literal("pending", "failed", "confirmed")),
+	),
+	optimisticErrorMessage: Schema.optional(Schema.NullOr(Schema.String)),
+	optimisticErrorStatus: Schema.optional(Schema.NullOr(Schema.Number)),
+	optimisticUpdatedAt: Schema.optional(Schema.NullOr(Schema.Number)),
 });
 
 const GitHubPullRequestFileSchema = Schema.Struct({
@@ -365,6 +394,84 @@ const ViewActivityFeedSchema = Schema.Struct({
 });
 
 // ============================================================
+// E) Notifications (polled from GitHub per-user)
+// ============================================================
+
+const GitHubNotificationSchema = Schema.Struct({
+	/** Better Auth user ID */
+	userId: Schema.String,
+	/** GitHub notification ID (unique per user) */
+	githubNotificationId: Schema.String,
+	/** Repository full name */
+	repositoryFullName: Schema.String,
+	repositoryId: Schema.NullOr(Schema.Number),
+	/** Subject info */
+	subjectTitle: Schema.String,
+	subjectType: Schema.Literal(
+		"Issue",
+		"PullRequest",
+		"Release",
+		"Commit",
+		"Discussion",
+		"CheckSuite",
+		"RepositoryVulnerabilityAlert",
+		"RepositoryDependabotAlertsThread",
+	),
+	subjectUrl: Schema.NullOr(Schema.String),
+	/** Reason for notification */
+	reason: Schema.Literal(
+		"assign",
+		"author",
+		"ci_activity",
+		"comment",
+		"manual",
+		"mention",
+		"push",
+		"review_requested",
+		"security_alert",
+		"state_change",
+		"subscribed",
+		"team_mention",
+		"approval_requested",
+	),
+	unread: Schema.Boolean,
+	updatedAt: Schema.Number,
+	lastReadAt: Schema.NullOr(Schema.Number),
+	/** Entity number parsed from subject URL (e.g. issue/PR number) */
+	entityNumber: Schema.NullOr(Schema.Number),
+});
+
+// ============================================================
+// F) Code Cache (on-demand file tree + content)
+// ============================================================
+
+const GitHubTreeCacheSchema = Schema.Struct({
+	repositoryId: Schema.Number,
+	/** Git tree SHA (typically the commit SHA) */
+	sha: Schema.String,
+	/** JSON-serialized tree array from GitHub API */
+	treeJson: Schema.String,
+	/** Whether the tree was truncated by GitHub */
+	truncated: Schema.Boolean,
+	cachedAt: Schema.Number,
+});
+
+const GitHubFileCacheSchema = Schema.Struct({
+	repositoryId: Schema.Number,
+	/** Git blob SHA — immutable, so this is the cache key */
+	sha: Schema.String,
+	/** File path for display */
+	path: Schema.String,
+	/** File content (UTF-8 text; null for binary) */
+	content: Schema.NullOr(Schema.String),
+	/** File size in bytes */
+	size: Schema.Number,
+	/** Encoding returned by GitHub */
+	encoding: Schema.NullOr(Schema.String),
+	cachedAt: Schema.Number,
+});
+
+// ============================================================
 // Schema Definition
 // ============================================================
 
@@ -398,19 +505,6 @@ export const confectSchema = defineSchema({
 		["createdAt"],
 	),
 
-	github_write_operations: defineTable(GitHubWriteOperationSchema)
-		.index("by_correlationId", ["correlationId"])
-		.index("by_repositoryId_and_state_and_createdAt", [
-			"repositoryId",
-			"state",
-			"createdAt",
-		])
-		.index("by_repositoryId_and_operationType_and_githubEntityNumber", [
-			"repositoryId",
-			"operationType",
-			"githubEntityNumber",
-		]),
-
 	// B) Normalized Domain
 	github_users: defineTable(GitHubUserSchema)
 		.index("by_githubUserId", ["githubUserId"])
@@ -439,18 +533,24 @@ export const confectSchema = defineSchema({
 
 	github_pull_requests: defineTable(GitHubPullRequestSchema)
 		.index("by_repositoryId_and_number", ["repositoryId", "number"])
+		.index("by_optimisticCorrelationId", ["optimisticCorrelationId"])
 		.index("by_repositoryId_and_state_and_githubUpdatedAt", [
 			"repositoryId",
 			"state",
 			"githubUpdatedAt",
 		])
-		.index("by_repositoryId_and_headSha", ["repositoryId", "headSha"]),
+		.index("by_repositoryId_and_headSha", ["repositoryId", "headSha"])
+		.searchIndex("search_title", {
+			searchField: "title",
+			filterFields: ["repositoryId", "state"],
+		}),
 
 	github_pull_request_reviews: defineTable(GitHubPullRequestReviewSchema)
 		.index("by_repositoryId_and_pullRequestNumber", [
 			"repositoryId",
 			"pullRequestNumber",
 		])
+		.index("by_optimisticCorrelationId", ["optimisticCorrelationId"])
 		.index("by_repositoryId_and_githubReviewId", [
 			"repositoryId",
 			"githubReviewId",
@@ -470,14 +570,20 @@ export const confectSchema = defineSchema({
 
 	github_issues: defineTable(GitHubIssueSchema)
 		.index("by_repositoryId_and_number", ["repositoryId", "number"])
+		.index("by_optimisticCorrelationId", ["optimisticCorrelationId"])
 		.index("by_repositoryId_and_state_and_githubUpdatedAt", [
 			"repositoryId",
 			"state",
 			"githubUpdatedAt",
-		]),
+		])
+		.searchIndex("search_title", {
+			searchField: "title",
+			filterFields: ["repositoryId", "state"],
+		}),
 
 	github_issue_comments: defineTable(GitHubIssueCommentSchema)
 		.index("by_repositoryId_and_issueNumber", ["repositoryId", "issueNumber"])
+		.index("by_optimisticCorrelationId", ["optimisticCorrelationId"])
 		.index("by_repositoryId_and_githubCommentId", [
 			"repositoryId",
 			"githubCommentId",
@@ -504,6 +610,7 @@ export const confectSchema = defineSchema({
 
 	github_workflow_runs: defineTable(GitHubWorkflowRunSchema)
 		.index("by_repositoryId_and_githubRunId", ["repositoryId", "githubRunId"])
+		.index("by_repositoryId_and_runNumber", ["repositoryId", "runNumber"])
 		.index("by_repositoryId_and_updatedAt", ["repositoryId", "updatedAt"]),
 
 	github_workflow_jobs: defineTable(GitHubWorkflowJobSchema)
@@ -522,6 +629,26 @@ export const confectSchema = defineSchema({
 	view_activity_feed: defineTable(ViewActivityFeedSchema)
 		.index("by_repositoryId_and_createdAt", ["repositoryId", "createdAt"])
 		.index("by_installationId_and_createdAt", ["installationId", "createdAt"]),
+
+	// E) Notifications
+	github_notifications: defineTable(GitHubNotificationSchema)
+		.index("by_userId_and_updatedAt", ["userId", "updatedAt"])
+		.index("by_userId_and_unread", ["userId", "unread"])
+		.index("by_userId_and_githubNotificationId", [
+			"userId",
+			"githubNotificationId",
+		]),
+
+	// F) Code Cache
+	github_tree_cache: defineTable(GitHubTreeCacheSchema).index(
+		"by_repositoryId_and_sha",
+		["repositoryId", "sha"],
+	),
+
+	github_file_cache: defineTable(GitHubFileCacheSchema).index(
+		"by_repositoryId_and_sha",
+		["repositoryId", "sha"],
+	),
 });
 
 export default confectSchema.convexSchemaDefinition;

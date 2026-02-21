@@ -1,4 +1,12 @@
+import * as HttpClient from "@effect/platform/HttpClient";
+import * as HttpClientError from "@effect/platform/HttpClientError";
+import * as HttpClientRequest from "@effect/platform/HttpClientRequest";
+import * as HttpClientResponse from "@effect/platform/HttpClientResponse";
 import { Context, Data, Effect, Layer } from "effect";
+import {
+	type GitHubClient,
+	make as makeGeneratedClient,
+} from "./generated_github_client";
 import { getInstallationToken } from "./githubApp";
 
 // ---------------------------------------------------------------------------
@@ -26,6 +34,36 @@ export class GitHubRateLimitError extends Data.TaggedError(
 }> {}
 
 // ---------------------------------------------------------------------------
+// Rate-limit detection helpers
+// ---------------------------------------------------------------------------
+
+const parseRetryAfterMs = (headers: Headers): number => {
+	const retryAfter = headers.get("Retry-After");
+	if (retryAfter) {
+		const secs = Number(retryAfter);
+		if (!Number.isNaN(secs) && secs > 0) return secs * 1_000;
+	}
+
+	const resetEpoch = headers.get("X-RateLimit-Reset");
+	if (resetEpoch) {
+		const resetMs = Number(resetEpoch) * 1_000;
+		const delta = resetMs - Date.now();
+		if (delta > 0) return delta;
+	}
+
+	return 60_000;
+};
+
+const isRateLimitResponse = (status: number, headers: Headers): boolean => {
+	if (status === 429) return true;
+	if (status === 403) {
+		const remaining = headers.get("X-RateLimit-Remaining");
+		if (remaining === "0") return true;
+	}
+	return false;
+};
+
+// ---------------------------------------------------------------------------
 // GitHub API Client
 // ---------------------------------------------------------------------------
 
@@ -33,111 +71,118 @@ const BASE_URL = "https://api.github.com";
 
 type IGitHubApiClient = Readonly<{
 	/**
-	 * Execute any fetch against the GitHub REST API.
-	 * Handles auth headers, base URL resolution, and error wrapping.
+	 * The fully typed GitHub API client generated from the OpenAPI spec.
+	 * Each method returns a typed `Effect` with proper request/response types.
 	 *
-	 * May fail with `GitHubRateLimitError` when GitHub returns 429
-	 * or a 403 with `X-RateLimit-Remaining: 0`.
+	 * Usage:
+	 * ```ts
+	 * const gh = yield* GitHubApiClient;
+	 * const pr = yield* gh.client.pullsGet(owner, repo, String(number));
+	 * ```
 	 */
-	use: <A>(
-		fn: (
-			fetch: (path: string, init?: RequestInit) => Promise<Response>,
-		) => Promise<A>,
-	) => Effect.Effect<A, GitHubApiError | GitHubRateLimitError>;
+	client: GitHubClient;
+
+	/**
+	 * The underlying `@effect/platform` HttpClient with auth headers baked in.
+	 * Useful for endpoints that need custom Accept headers (e.g. diff format).
+	 */
+	httpClient: HttpClient.HttpClient;
 }>;
-
-// ---------------------------------------------------------------------------
-// Rate-limit detection helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Parse the number of milliseconds to wait from GitHub rate-limit response
- * headers. Checks `Retry-After` (seconds) first, then falls back to
- * `X-RateLimit-Reset` (Unix epoch seconds).
- */
-const parseRetryAfterMs = (res: Response): number => {
-	const retryAfter = res.headers.get("Retry-After");
-	if (retryAfter) {
-		const secs = Number(retryAfter);
-		if (!Number.isNaN(secs) && secs > 0) return secs * 1_000;
-	}
-
-	const resetEpoch = res.headers.get("X-RateLimit-Reset");
-	if (resetEpoch) {
-		const resetMs = Number(resetEpoch) * 1_000;
-		const delta = resetMs - Date.now();
-		if (delta > 0) return delta;
-	}
-
-	// Fallback: 60 seconds (conservative)
-	return 60_000;
-};
-
-/**
- * Returns true when a GitHub response indicates a rate limit.
- * GitHub uses 429 for primary rate limits and 403 with specific
- * headers/messages for secondary (abuse) rate limits.
- */
-const isRateLimitResponse = (res: Response): boolean => {
-	if (res.status === 429) return true;
-	if (res.status === 403) {
-		const remaining = res.headers.get("X-RateLimit-Remaining");
-		if (remaining === "0") return true;
-	}
-	return false;
-};
 
 // ---------------------------------------------------------------------------
 // Client implementation
 // ---------------------------------------------------------------------------
 
-const makeClient = (token: string): IGitHubApiClient => {
-	const headers: Record<string, string> = {
-		Authorization: `token ${token}`,
-		Accept: "application/vnd.github+json",
-		"X-GitHub-Api-Version": "2022-11-28",
-	};
+/**
+ * Build an `@effect/platform` HttpClient backed by the global `fetch`,
+ * with GitHub auth headers, base URL, and rate-limit detection baked in.
+ *
+ * We use `HttpClient.mapRequest` to rewrite relative paths to absolute
+ * URLs BEFORE the platform's internal `UrlParams.makeUrl` tries to parse
+ * the request URL. Without this, `new URL("/repos/...", undefined)` throws
+ * in runtimes that lack `globalThis.location` (like Convex).
+ */
+const makeAuthedHttpClient = (token: string): HttpClient.HttpClient =>
+	HttpClient.mapRequest(
+		HttpClient.make((request, url, signal, _fiber) =>
+			Effect.gen(function* () {
+				// Convert HttpClientRequest body to a BodyInit for native fetch.
+				// bodyUnsafeJson produces a Uint8Array body (JSON.stringify → TextEncoder.encode).
+				// Raw bodies may also appear from manual request construction.
+				let body: string | undefined;
+				if (
+					request.body._tag === "Uint8Array" &&
+					request.body.body !== undefined
+				) {
+					body = new TextDecoder().decode(request.body.body);
+				} else if (
+					request.body._tag === "Raw" &&
+					request.body.body !== undefined
+				) {
+					body = String(request.body.body);
+				}
 
-	const authedFetch = async (
-		path: string,
-		init?: RequestInit,
-	): Promise<Response> => {
-		const url = path.startsWith("http") ? path : `${BASE_URL}${path}`;
-		const res = await fetch(url, {
-			...init,
-			headers: { ...headers, ...init?.headers },
-		});
+				// Merge auth headers with any request-specific headers.
+				// Effect Headers is a branded record — extract entries to merge cleanly.
+				const requestHeaders = Object.fromEntries(
+					Object.entries(request.headers),
+				);
+				const mergedHeaders: Record<string, string> = {
+					Authorization: `Bearer ${token}`,
+					Accept: "application/vnd.github+json",
+					"X-GitHub-Api-Version": "2022-11-28",
+					// bodyUnsafeJson sets the body as raw pre-serialized JSON but
+					// doesn't add Content-Type since we bypass the platform layer.
+					...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+					...requestHeaders,
+				};
 
-		// Detect rate-limit responses before returning to the caller.
-		// Throwing here causes the outer Effect.tryPromise to surface the
-		// error, which the workflow retry policy will handle.
-		if (isRateLimitResponse(res)) {
-			throw new GitHubRateLimitError({
-				status: res.status,
-				message: `GitHub rate limit hit (${res.status}). Retry after ${Math.round(parseRetryAfterMs(res) / 1_000)}s.`,
-				url: res.url,
-				retryAfterMs: parseRetryAfterMs(res),
-			});
-		}
-
-		return res;
-	};
-
-	const use: IGitHubApiClient["use"] = (fn) =>
-		Effect.tryPromise({
-			try: () => fn(authedFetch),
-			catch: (cause) => {
-				// Preserve GitHubRateLimitError so it propagates with its tag
-				if (cause instanceof GitHubRateLimitError) return cause;
-				return new GitHubApiError({
-					status: 0,
-					message: String(cause),
-					url: "unknown",
+				const res = yield* Effect.tryPromise({
+					try: () =>
+						fetch(url.href, {
+							method: request.method,
+							headers: mergedHeaders,
+							body,
+							signal,
+						}),
+					catch: (cause) =>
+						new HttpClientError.RequestError({
+							request,
+							reason: "Transport",
+							description: String(cause),
+						}),
 				});
-			},
-		}).pipe(Effect.withSpan("github_api.use"));
 
-	return { use };
+				// Detect rate limits at the transport layer.
+				// We surface these as HttpClientError.ResponseError so the type
+				// fits HttpClient's error channel. Callers can catchTag on it.
+				if (isRateLimitResponse(res.status, res.headers)) {
+					return yield* new HttpClientError.ResponseError({
+						request,
+						response: HttpClientResponse.fromWeb(request, res),
+						reason: "StatusCode",
+						description: `GitHub rate limit hit (${res.status}). Retry after ${Math.round(parseRetryAfterMs(res.headers) / 1_000)}s.`,
+					});
+				}
+
+				return HttpClientResponse.fromWeb(request, res);
+			}).pipe(Effect.withSpan("github_api.request")),
+		),
+		(request) => {
+			// Prepend base URL to relative paths so the platform's URL parser
+			// receives an absolute URL it can parse without a base.
+			const url = request.url;
+			if (typeof url === "string" && url.startsWith("/")) {
+				return HttpClientRequest.setUrl(request, `${BASE_URL}${url}`);
+			}
+			return request;
+		},
+	);
+
+const makeClient = (token: string): IGitHubApiClient => {
+	const httpClient = makeAuthedHttpClient(token);
+	const typedClient = makeGeneratedClient(httpClient);
+	return { client: typedClient, httpClient };
 };
 
 export class GitHubApiClient extends Context.Tag("@quickhub/GitHubApiClient")<
@@ -151,14 +196,6 @@ export class GitHubApiClient extends Context.Tag("@quickhub/GitHubApiClient")<
 
 	/**
 	 * Construct a client layer from a GitHub App installation ID.
-	 *
-	 * Fetches a short-lived installation access token via the App's JWT,
-	 * then builds a client using that token. The token is cached in-memory
-	 * by `getInstallationToken` (see `githubApp.ts`).
-	 *
-	 * Use this when no user OAuth token is available — e.g. repos added
-	 * via the GitHub App installation flow (webhooks) where there is no
-	 * `connectedByUserId`.
 	 */
 	static fromInstallation = (installationId: number) =>
 		Layer.effect(
@@ -169,3 +206,5 @@ export class GitHubApiClient extends Context.Tag("@quickhub/GitHubApiClient")<
 			}),
 		);
 }
+
+export type { GitHubClient, IGitHubApiClient };
