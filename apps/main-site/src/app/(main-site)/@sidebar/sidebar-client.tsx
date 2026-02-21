@@ -117,10 +117,8 @@ export function SidebarClient({
 export function SidebarSkeleton() {
 	return (
 		<div className="flex h-full flex-col bg-sidebar">
-			<div className="shrink-0 px-2 pt-2 pb-1.5 border-b border-sidebar-border">
-				<Skeleton className="h-8 w-full rounded-sm mb-1.5" />
-				<Skeleton className="h-8 w-full rounded-sm mb-1.5" />
-				<Skeleton className="h-6 w-full rounded-sm" />
+			<div className="shrink-0 px-2 pt-2.5 pb-1.5 border-b border-sidebar-border">
+				<Skeleton className="h-8 w-full rounded-sm" />
 			</div>
 			<div className="flex-1 overflow-y-auto">
 				<div className="space-y-px py-1 px-2">
