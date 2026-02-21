@@ -6,8 +6,8 @@ import {
 	AvatarImage,
 } from "@packages/ui/components/avatar";
 import { Button } from "@packages/ui/components/button";
-import { Loader2 } from "@packages/ui/components/icons";
 import { Link } from "@packages/ui/components/link";
+import { Skeleton } from "@packages/ui/components/skeleton";
 import { useInfinitePaginationWithInitial } from "@packages/ui/hooks/use-paginated-atom";
 import { cn } from "@packages/ui/lib/utils";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
@@ -197,34 +197,40 @@ function WorkflowRunListLoaded({
 
 			<div ref={pagination.sentinelRef} className="h-1" />
 
-			<div className="py-2">
-				{pagination.hasMore && (
-					<div className="flex items-center justify-center">
-						<Button
-							variant="ghost"
-							size="sm"
-							className="h-7 text-[10px]"
-							disabled={isLoading}
-							onClick={() => pagination.loadMore()}
-						>
-							{isLoading ? (
-								<>
-									<Loader2 className="size-3 animate-spin" />
-									Loading...
-								</>
-							) : (
-								"Load more"
-							)}
-						</Button>
-					</div>
-				)}
-				{!pagination.hasMore && isLoading && (
-					<div className="flex items-center justify-center py-3">
-						<Loader2 className="size-4 animate-spin text-muted-foreground" />
-					</div>
-				)}
-			</div>
+			{pagination.hasMore && !isLoading && (
+				<div className="flex items-center justify-center py-2">
+					<Button
+						variant="ghost"
+						size="sm"
+						className="h-7 text-[10px]"
+						onClick={() => pagination.loadMore()}
+					>
+						Load more
+					</Button>
+				</div>
+			)}
+			{isLoading && <WorkflowRunListLoadingSkeleton />}
 		</>
+	);
+}
+
+function WorkflowRunListLoadingSkeleton() {
+	return (
+		<div className="animate-pulse">
+			{[1, 2, 3].map((i) => (
+				<div key={i} className="flex items-start gap-2 rounded-md px-2 py-1.5">
+					<Skeleton className="mt-0.5 size-3.5 rounded-full shrink-0" />
+					<div className="min-w-0 flex-1 space-y-1.5">
+						<Skeleton className="h-3 w-2/3 rounded" />
+						<div className="flex items-center gap-1.5">
+							<Skeleton className="h-2.5 w-8 rounded" />
+							<Skeleton className="h-2.5 w-16 rounded" />
+							<Skeleton className="h-2.5 w-12 rounded" />
+						</div>
+					</div>
+				</div>
+			))}
+		</div>
 	);
 }
 

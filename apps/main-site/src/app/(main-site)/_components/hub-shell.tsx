@@ -7,6 +7,7 @@ import {
 	ResizablePanel,
 	ResizablePanelGroup,
 } from "@packages/ui/components/resizable";
+import { Skeleton } from "@packages/ui/components/skeleton";
 import { useHotkey } from "@tanstack/react-hotkeys";
 import { ArrowLeft } from "lucide-react";
 import { usePathname } from "next/navigation";
@@ -103,7 +104,7 @@ export function HubShell({
 
 						{/* Panel 2: Detail/Content */}
 						<ResizablePanel defaultSize={82} minSize={60} className="min-w-0">
-							<Suspense fallback={null}>{detail}</Suspense>
+							<Suspense fallback={<DetailPanelSkeleton />}>{detail}</Suspense>
 						</ResizablePanel>
 					</ResizablePanelGroup>
 				</div>
@@ -186,4 +187,50 @@ function MobileView({
 
 	// Repo selected or root: show the sidebar (which contains repo list OR item list)
 	return sidebar;
+}
+
+// ---------------------------------------------------------------------------
+// Detail panel skeleton — shown when the detail slot suspends during
+// route transitions (e.g. navigating from PR list to PR detail).
+// Matches a generic content shape so the panel doesn't flash blank.
+// ---------------------------------------------------------------------------
+
+function DetailPanelSkeleton() {
+	return (
+		<div className="h-full overflow-y-auto animate-pulse">
+			<div className="p-4 space-y-3">
+				<div className="flex items-start gap-2.5">
+					<Skeleton className="size-5 rounded-full shrink-0 mt-1" />
+					<div className="min-w-0 flex-1 space-y-1.5">
+						<Skeleton className="h-4 w-3/4 rounded" />
+						<div className="flex items-center gap-2">
+							<Skeleton className="h-3 w-8 rounded" />
+							<Skeleton className="h-4 w-12 rounded-full" />
+							<Skeleton className="size-4 rounded-full" />
+							<Skeleton className="h-3 w-20 rounded" />
+						</div>
+					</div>
+				</div>
+				<div className="rounded-lg border p-4 space-y-2">
+					<Skeleton className="h-3 w-full rounded" />
+					<Skeleton className="h-3 w-5/6 rounded" />
+					<Skeleton className="h-3 w-4/6 rounded" />
+					<Skeleton className="h-3 w-3/4 rounded" />
+				</div>
+				<div className="space-y-1.5 pt-1">
+					<Skeleton className="h-2.5 w-20 rounded" />
+					{[1, 2].map((i) => (
+						<div key={i} className="rounded-lg border p-3 space-y-1.5">
+							<div className="flex items-center gap-1.5">
+								<Skeleton className="size-4 rounded-full" />
+								<Skeleton className="h-3 w-16 rounded" />
+							</div>
+							<Skeleton className="h-3 w-full rounded" />
+							<Skeleton className="h-3 w-3/4 rounded" />
+						</div>
+					))}
+				</div>
+			</div>
+		</div>
+	);
 }

@@ -5,12 +5,12 @@ import { Button } from "@packages/ui/components/button";
 import {
 	CheckCircle2,
 	CircleDot,
-	Loader2,
 	MessageCircle,
 	Plus,
 } from "@packages/ui/components/icons";
 import { Link } from "@packages/ui/components/link";
 import { LinkButton } from "@packages/ui/components/link-button";
+import { Skeleton } from "@packages/ui/components/skeleton";
 import { useInfinitePaginationWithInitial } from "@packages/ui/hooks/use-paginated-atom";
 import { cn } from "@packages/ui/lib/utils";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
@@ -251,11 +251,23 @@ export function IssueListClient({
 			))}
 
 			<div ref={sentinelRef} className="h-1" />
-			{isLoading && (
-				<div className="flex items-center justify-center py-3">
-					<Loader2 className="size-4 animate-spin text-muted-foreground" />
+			{isLoading && <IssueListLoadingSkeleton />}
+		</div>
+	);
+}
+
+function IssueListLoadingSkeleton() {
+	return (
+		<div className="animate-pulse">
+			{[1, 2, 3].map((i) => (
+				<div key={i} className="flex items-start gap-2 rounded-md px-2 py-1.5">
+					<Skeleton className="mt-0.5 size-3.5 rounded-full shrink-0" />
+					<div className="min-w-0 flex-1 space-y-1.5">
+						<Skeleton className="h-3 w-3/4 rounded" />
+						<Skeleton className="h-2.5 w-1/2 rounded" />
+					</div>
 				</div>
-			)}
+			))}
 		</div>
 	);
 }
