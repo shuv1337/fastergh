@@ -672,13 +672,13 @@ function ChangeStatsBar({
 					{Array.from({ length: addSquares }, (_, i) => (
 						<span
 							key={`a-${String(i)}`}
-							className="inline-block size-[7px] rounded-[2px] bg-green-500"
+							className="inline-block size-[7px] rounded-[2px] bg-github-open"
 						/>
 					))}
 					{Array.from({ length: delSquares }, (_, i) => (
 						<span
 							key={`d-${String(i)}`}
-							className="inline-block size-[7px] rounded-[2px] bg-red-500"
+							className="inline-block size-[7px] rounded-[2px] bg-github-closed"
 						/>
 					))}
 				</span>
@@ -1541,9 +1541,7 @@ const DiffPanel = forwardRef<
 				{/* Selection notice */}
 				{selectionNotice !== null && (
 					<div className="border-t px-2.5 py-1.5">
-						<p className="text-[11px] text-amber-600 dark:text-amber-400">
-							{selectionNotice}
-						</p>
+						<p className="text-[11px] text-github-warning">{selectionNotice}</p>
 					</div>
 				)}
 			</div>
@@ -1556,10 +1554,10 @@ const DiffPanel = forwardRef<
 						<span className="font-medium text-foreground">
 							{files.length} file{files.length !== 1 ? "s" : ""} changed
 						</span>
-						<span className="inline-flex items-center gap-1 text-green-600 font-mono tabular-nums">
+						<span className="inline-flex items-center gap-1 text-github-open font-mono tabular-nums">
 							+{totalAdditions}
 						</span>
-						<span className="inline-flex items-center gap-1 text-red-600 font-mono tabular-nums">
+						<span className="inline-flex items-center gap-1 text-github-closed font-mono tabular-nums">
 							-{totalDeletions}
 						</span>
 						<ChangeStatsBar
@@ -1809,10 +1807,10 @@ const DiffPanel = forwardRef<
 												)}
 												{totalChanges > 0 && (
 													<>
-														<span className="text-[11px] font-mono tabular-nums text-green-600">
+														<span className="text-[11px] font-mono tabular-nums text-github-open">
 															+{entry.additions}
 														</span>
-														<span className="text-[11px] font-mono tabular-nums text-red-600">
+														<span className="text-[11px] font-mono tabular-nums text-github-closed">
 															-{entry.deletions}
 														</span>
 														<ChangeStatsBar
@@ -2123,8 +2121,8 @@ function InlineReviewCommentComposer({
 	const lineLabel = `${target.filename}:${lineRange}${target.side === "LEFT" ? " (old)" : ""}`;
 
 	return (
-		<div className="rounded-md border border-amber-300/60 bg-amber-50/60 p-2.5 dark:border-amber-500/40 dark:bg-amber-950/20">
-			<p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">
+		<div className="rounded-md border border-github-warning/30 bg-github-warning/10 p-2.5">
+			<p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-github-warning">
 				Inline review comment
 			</p>
 			<p className="mb-2 text-[11px] text-muted-foreground">{lineLabel}</p>
@@ -2270,7 +2268,7 @@ function ReviewThreadConversation({
 						</span>
 					)}
 					{isSuccess && (
-						<span className="text-[10px] text-green-600">Reply posted</span>
+						<span className="text-[10px] text-github-open">Reply posted</span>
 					)}
 				</div>
 
@@ -2590,7 +2588,7 @@ function InfoSidebar({
 					pendingChecksCount > 0) && (
 					<div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-xs">
 						{approvedCount > 0 && (
-							<span className="inline-flex items-center gap-1 text-green-600">
+							<span className="inline-flex items-center gap-1 text-github-open">
 								<svg
 									className="size-3.5"
 									viewBox="0 0 16 16"
@@ -2628,7 +2626,7 @@ function InfoSidebar({
 						{passingChecksCount > 0 &&
 							failingChecksCount === 0 &&
 							pendingChecksCount === 0 && (
-								<span className="inline-flex items-center gap-1 text-green-600">
+								<span className="inline-flex items-center gap-1 text-github-open">
 									<svg
 										className="size-3.5"
 										viewBox="0 0 16 16"
@@ -3076,7 +3074,8 @@ function PrActionBar({
 					}}
 					className={cn(
 						"h-8 text-xs w-full mt-2",
-						isMergeable && "bg-green-600 hover:bg-green-700 text-white",
+						isMergeable &&
+							"bg-github-open hover:bg-github-open/90 text-primary-foreground",
 					)}
 				>
 					{isMerging ? "Merging..." : "Merge pull request"}
@@ -3170,11 +3169,11 @@ function ReviewSubmitSection({
 
 	const reviewOptions = [
 		{ value: "COMMENT" as const, label: "Comment", dot: "bg-muted-foreground" },
-		{ value: "APPROVE" as const, label: "Approve", dot: "bg-green-500" },
+		{ value: "APPROVE" as const, label: "Approve", dot: "bg-github-open" },
 		{
 			value: "REQUEST_CHANGES" as const,
 			label: "Request changes",
-			dot: "bg-orange-500",
+			dot: "bg-github-warning",
 		},
 	];
 
@@ -3284,7 +3283,7 @@ function ReviewSubmitSection({
 				</p>
 			)}
 			{isSuccess && (
-				<p className="mt-1.5 text-[11px] text-green-600 dark:text-green-500">
+				<p className="mt-1.5 text-[11px] text-github-open">
 					Review queued. Syncing with GitHub...
 				</p>
 			)}
@@ -3310,7 +3309,7 @@ function PrStateIconLarge({
 	if (state === "open")
 		return (
 			<svg
-				className="mt-1 size-5 text-green-600 shrink-0"
+				className="mt-1 size-5 text-github-open shrink-0"
 				viewBox="0 0 16 16"
 				fill="currentColor"
 			>
@@ -3319,7 +3318,7 @@ function PrStateIconLarge({
 		);
 	return (
 		<svg
-			className="mt-1 size-5 text-purple-600 shrink-0"
+			className="mt-1 size-5 text-github-merged shrink-0"
 			viewBox="0 0 16 16"
 			fill="currentColor"
 		>
@@ -3339,7 +3338,7 @@ function PrStateBadge({
 }) {
 	if (mergedAt !== null)
 		return (
-			<Badge className="bg-purple-600 hover:bg-purple-700 text-xs">
+			<Badge className="bg-github-merged hover:bg-github-merged/90 text-xs">
 				Merged
 			</Badge>
 		);
@@ -3351,7 +3350,9 @@ function PrStateBadge({
 		);
 	if (state === "open")
 		return (
-			<Badge className="bg-green-600 hover:bg-green-700 text-xs">Open</Badge>
+			<Badge className="bg-github-open hover:bg-github-open/90 text-xs">
+				Open
+			</Badge>
 		);
 	return (
 		<Badge variant="secondary" className="text-xs">
@@ -3372,19 +3373,19 @@ function MergeableStateBadge({ state }: { state: string }) {
 		clean: {
 			label: "Ready to merge",
 			variant: "secondary",
-			className: "text-green-600",
+			className: "text-github-open",
 		},
 		dirty: { label: "Has conflicts", variant: "destructive" },
 		blocked: { label: "Blocked", variant: "outline" },
 		unstable: {
 			label: "Unstable",
 			variant: "outline",
-			className: "text-yellow-600",
+			className: "text-github-warning",
 		},
 		behind: {
 			label: "Behind base",
 			variant: "outline",
-			className: "text-yellow-600",
+			className: "text-github-warning",
 		},
 	};
 	const c = config[state] ?? { label: state, variant: "outline" as const };
@@ -3414,11 +3415,11 @@ function ReviewerChip({
 }) {
 	const stateConfig: Record<string, { dotClass: string; label: string }> = {
 		APPROVED: {
-			dotClass: "bg-green-500",
+			dotClass: "bg-github-open",
 			label: "Approved",
 		},
 		CHANGES_REQUESTED: {
-			dotClass: "bg-red-500",
+			dotClass: "bg-github-closed",
 			label: "Changes requested",
 		},
 		COMMENTED: {
@@ -3466,10 +3467,10 @@ function ReviewerChip({
 					/>
 					{/* Optimistic indicator */}
 					{review.optimisticState === "pending" && (
-						<span className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-yellow-500 ring-1 ring-background animate-pulse" />
+						<span className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-github-warning ring-1 ring-background animate-pulse" />
 					)}
 					{review.optimisticState === "failed" && (
-						<span className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-red-500 ring-1 ring-background" />
+						<span className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-github-closed ring-1 ring-background" />
 					)}
 				</div>
 			</TooltipTrigger>
@@ -3490,7 +3491,7 @@ function ReviewStateBadge({ state }: { state: string }) {
 		APPROVED: {
 			label: "Approved",
 			variant: "secondary",
-			className: "text-green-600",
+			className: "text-github-open",
 		},
 		CHANGES_REQUESTED: { label: "Changes requested", variant: "destructive" },
 		COMMENTED: { label: "Commented", variant: "outline" },
@@ -3532,7 +3533,7 @@ function ReviewOptimisticBadge({
 	}
 	if (optimisticState === "confirmed") {
 		return (
-			<Badge variant="secondary" className="text-xs text-green-600">
+			<Badge variant="secondary" className="text-xs text-github-open">
 				Confirmed
 			</Badge>
 		);
@@ -3550,7 +3551,7 @@ function CheckIcon({
 	if (conclusion === "success")
 		return (
 			<svg
-				className="size-3.5 text-green-600"
+				className="size-3.5 text-github-open"
 				viewBox="0 0 16 16"
 				fill="currentColor"
 			>
@@ -3560,7 +3561,7 @@ function CheckIcon({
 	if (conclusion === "failure")
 		return (
 			<svg
-				className="size-3.5 text-red-600"
+				className="size-3.5 text-github-closed"
 				viewBox="0 0 16 16"
 				fill="currentColor"
 			>
@@ -3569,7 +3570,7 @@ function CheckIcon({
 		);
 	if (status === "in_progress")
 		return (
-			<div className="size-3.5 rounded-full border-2 border-yellow-500 border-t-transparent animate-spin" />
+			<div className="size-3.5 rounded-full border-2 border-github-warning border-t-transparent animate-spin" />
 		);
 	return (
 		<div className="size-3.5 rounded-full border-2 border-muted-foreground" />
@@ -3580,25 +3581,22 @@ function FileStatusBadge({ status }: { status: string }) {
 	const config: Record<string, { label: string; className: string }> = {
 		added: {
 			label: "A",
-			className:
-				"bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200",
+			className: "bg-github-open/15 text-github-open",
 		},
 		removed: {
 			label: "D",
-			className: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200",
+			className: "bg-github-closed/15 text-github-closed",
 		},
 		modified: {
 			label: "M",
-			className:
-				"bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200",
+			className: "bg-github-warning/15 text-github-warning",
 		},
 		renamed: {
 			label: "R",
-			className:
-				"bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200",
+			className: "bg-github-info/15 text-github-info",
 		},
 	};
-	const c = config[status] ?? { label: "?", className: "bg-gray-100" };
+	const c = config[status] ?? { label: "?", className: "bg-muted" };
 	return (
 		<span
 			className={`inline-flex items-center justify-center size-4 rounded text-[9px] font-bold ${c.className}`}
