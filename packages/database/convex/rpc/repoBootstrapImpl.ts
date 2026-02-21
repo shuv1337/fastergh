@@ -9,27 +9,23 @@
  * Imported as a side-effect from `repoBootstrap.ts` to wire up `.implement()`
  * at module load time.
  */
-import { Effect } from "effect";
+import { Array as Arr, Effect, Predicate } from "effect";
 import { internal } from "../_generated/api";
 import { ConfectActionCtx } from "../confect";
+import { toOpenClosedState } from "../shared/coerce";
 import type {
 	Issue,
 	PullRequestSimple,
 	SimpleUser,
 } from "../shared/generated_github_client";
 import { GitHubApiClient } from "../shared/githubApi";
-import { lookupGitHubTokenByUserIdConfect } from "../shared/githubToken";
+import { getInstallationToken } from "../shared/githubApp";
+import { parseIsoToMsOrNull as isoToMs } from "../shared/time";
 import { bootstrapRepoDef } from "./repoBootstrap";
 
 // ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
-
-const isoToMs = (v: string | null | undefined): number | null => {
-	if (v == null) return null;
-	const ms = new Date(v).getTime();
-	return Number.isNaN(ms) ? null : ms;
-};
 
 // ---------------------------------------------------------------------------
 // User collector type
@@ -51,11 +47,10 @@ bootstrapRepoDef.implement((args) =>
 		// Split owner/repo early
 		const [owner = "", repo = ""] = args.fullName.split("/");
 
-		// Resolve the GitHub token from the connected user
-		const token = yield* lookupGitHubTokenByUserIdConfect(
-			ctx.runQuery,
-			args.connectedByUserId,
-		).pipe(Effect.orDie);
+		// Resolve the GitHub App installation token for background sync
+		const token = yield* getInstallationToken(args.installationId).pipe(
+			Effect.orDie,
+		);
 		const gh = yield* Effect.provide(
 			GitHubApiClient,
 			GitHubApiClient.fromToken(token),
@@ -125,17 +120,17 @@ bootstrapRepoDef.implement((args) =>
 				return {
 					githubPrId: pr.id,
 					number: pr.number,
-					state: (pr.state === "open" ? "open" : "closed") as "open" | "closed",
+					state: toOpenClosedState(pr.state),
 					draft: pr.draft ?? false,
 					title: pr.title,
 					body: pr.body,
 					authorUserId,
-					assigneeUserIds: [] as Array<number>,
-					requestedReviewerUserIds: [] as Array<number>,
+					assigneeUserIds: [],
+					requestedReviewerUserIds: [],
 					baseRefName: pr.base.ref,
 					headRefName: pr.head.ref,
 					headSha: pr.head.sha,
-					mergeableState: null as string | null,
+					mergeableState: null,
 					mergedAt: isoToMs(pr.merged_at),
 					closedAt: isoToMs(pr.closed_at),
 					githubUpdatedAt: isoToMs(pr.updated_at) ?? Date.now(),
@@ -175,20 +170,21 @@ bootstrapRepoDef.implement((args) =>
 
 			const issues = allIssues.map((issue) => {
 				const authorUserId = collectUser(issue.user);
-				const labels = issue.labels
-					.map((l) => (typeof l === "string" ? l : (l.name ?? null)))
-					.filter((n): n is string => n !== null);
+				const labels = Arr.filter(
+					Arr.map(issue.labels, (label) =>
+						typeof label === "string" ? label : (label.name ?? null),
+					),
+					Predicate.isNotNull,
+				);
 
 				return {
 					githubIssueId: issue.id,
 					number: issue.number,
-					state: (issue.state === "open" ? "open" : "closed") as
-						| "open"
-						| "closed",
+					state: toOpenClosedState(issue.state),
 					title: issue.title,
 					body: issue.body ?? null,
 					authorUserId,
-					assigneeUserIds: [] as Array<number>,
+					assigneeUserIds: [],
 					labelNames: labels,
 					commentCount: issue.comments,
 					isPullRequest: false,
@@ -229,9 +225,9 @@ bootstrapRepoDef.implement((args) =>
 					messageHeadline: message.split("\n")[0] ?? "",
 					authoredAt: isoToMs(c.commit.author?.date),
 					committedAt: isoToMs(c.commit.committer?.date),
-					additions: null as number | null,
-					deletions: null as number | null,
-					changedFiles: null as number | null,
+					additions: null,
+					deletions: null,
+					changedFiles: null,
 				};
 			});
 
@@ -382,11 +378,12 @@ bootstrapRepoDef.implement((args) =>
 				login: u.login,
 				avatarUrl: u.avatar_url,
 				siteAdmin: u.site_admin,
-				type: (u.type === "Bot"
-					? "Bot"
-					: u.type === "Organization"
-						? "Organization"
-						: "User") as "User" | "Bot" | "Organization",
+				type:
+					u.type === "Bot"
+						? "Bot"
+						: u.type === "Organization"
+							? "Organization"
+							: "User",
 			}));
 			if (users.length > 0) {
 				for (let i = 0; i < users.length; i += 50) {
@@ -441,8 +438,7 @@ bootstrapRepoDef.implement((args) =>
 						repositoryId: args.githubRepoId,
 						pullRequestNumber: pr.pullRequestNumber,
 						headSha: pr.headSha,
-						connectedByUserId: args.connectedByUserId,
-						installationId: 0,
+						installationId: args.installationId,
 					}),
 				);
 			}

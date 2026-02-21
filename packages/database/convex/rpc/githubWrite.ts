@@ -23,16 +23,16 @@ import {
 	ConfectQueryCtx,
 	confectSchema,
 } from "../confect";
+import { toNumberOrNull as num } from "../shared/coerce";
 import { GitHubApiClient, type GitHubClient } from "../shared/githubApi";
 import { lookupGitHubTokenByUserIdConfect } from "../shared/githubToken";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
 import {
-	RepoPushAccess,
-	RepoTriageAccess,
-	requirePushAccessForMutation,
-	requireTriageAccessForMutation,
-	resolveRepoAccess,
-} from "../shared/permissions";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+	RepoPermissionContext,
+	RepoPullByIdMiddleware,
+	RepoPushByIdMiddleware,
+	RepoTriageByIdMiddleware,
+} from "./security";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -119,9 +119,6 @@ class InsufficientPermission extends Schema.TaggedError<InsufficientPermission>(
 // Helpers
 // ---------------------------------------------------------------------------
 
-const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
-const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
-
 const toSyntheticIssueNumber = (correlationId: string): number => {
 	let hash = 0;
 	for (const char of correlationId) {
@@ -131,28 +128,6 @@ const toSyntheticIssueNumber = (correlationId: string): number => {
 	if (hash > 0) return -hash;
 	return hash;
 };
-
-const triageProofForMutation = (userId: string, repositoryId: number) =>
-	requireTriageAccessForMutation(userId, repositoryId).pipe(
-		Effect.mapError(
-			() =>
-				new InsufficientPermission({
-					repositoryId,
-					required: "triage",
-				}),
-		),
-	);
-
-const pushProofForMutation = (userId: string, repositoryId: number) =>
-	requirePushAccessForMutation(userId, repositoryId).pipe(
-		Effect.mapError(
-			() =>
-				new InsufficientPermission({
-					repositoryId,
-					required: "push",
-				}),
-		),
-	);
 
 const hasExistingCorrelationId = (
 	ctx: ConfectMutationCtx,
@@ -203,12 +178,6 @@ const getActingUserId = (ctx: {
 		return identity.value.subject;
 	});
 
-const getRepositoryById = (ctx: ConfectMutationCtx, repositoryId: number) =>
-	ctx.db
-		.query("github_repositories")
-		.withIndex("by_githubRepoId", (q) => q.eq("githubRepoId", repositoryId))
-		.first();
-
 // ---------------------------------------------------------------------------
 // 1. Public mutations — create pending write ops + schedule actions
 // ---------------------------------------------------------------------------
@@ -217,35 +186,30 @@ const getRepositoryById = (ctx: ConfectMutationCtx, repositoryId: number) =>
  * Create a new issue (optimistic).
  * Inserts a pending write operation and schedules the GitHub API call.
  */
-const createIssueDef = factory.mutation({
-	payload: {
-		correlationId: Schema.String,
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		repositoryId: Schema.Number,
-		title: Schema.String,
-		body: Schema.optional(Schema.String),
-		labels: Schema.optional(Schema.Array(Schema.String)),
-	},
-	success: Schema.Struct({ correlationId: Schema.String }),
-	error: Schema.Union(
-		DuplicateOperationError,
-		NotAuthenticated,
-		InsufficientPermission,
-	),
-});
+const createIssueDef = factory
+	.mutation({
+		payload: {
+			correlationId: Schema.String,
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			repositoryId: Schema.Number,
+			title: Schema.String,
+			body: Schema.optional(Schema.String),
+			labels: Schema.optional(Schema.Array(Schema.String)),
+		},
+		success: Schema.Struct({ correlationId: Schema.String }),
+		error: Schema.Union(
+			DuplicateOperationError,
+			NotAuthenticated,
+			InsufficientPermission,
+		),
+	})
+	.middleware(RepoTriageByIdMiddleware);
 
 createIssueDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		const triageProof = yield* triageProofForMutation(
-			actingUserId,
-			args.repositoryId,
-		);
-		yield* RepoTriageAccess.pipe(
-			Effect.provideService(RepoTriageAccess, triageProof),
-		);
 		const now = Date.now();
 
 		const hasDuplicate = yield* hasExistingCorrelationId(
@@ -306,34 +270,29 @@ createIssueDef.implement((args) =>
 /**
  * Create a comment on an issue or PR (optimistic).
  */
-const createCommentDef = factory.mutation({
-	payload: {
-		correlationId: Schema.String,
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		repositoryId: Schema.Number,
-		number: Schema.Number,
-		body: Schema.String,
-	},
-	success: Schema.Struct({ correlationId: Schema.String }),
-	error: Schema.Union(
-		DuplicateOperationError,
-		NotAuthenticated,
-		InsufficientPermission,
-	),
-});
+const createCommentDef = factory
+	.mutation({
+		payload: {
+			correlationId: Schema.String,
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			repositoryId: Schema.Number,
+			number: Schema.Number,
+			body: Schema.String,
+		},
+		success: Schema.Struct({ correlationId: Schema.String }),
+		error: Schema.Union(
+			DuplicateOperationError,
+			NotAuthenticated,
+			InsufficientPermission,
+		),
+	})
+	.middleware(RepoTriageByIdMiddleware);
 
 createCommentDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		const triageProof = yield* triageProofForMutation(
-			actingUserId,
-			args.repositoryId,
-		);
-		yield* RepoTriageAccess.pipe(
-			Effect.provideService(RepoTriageAccess, triageProof),
-		);
 		const now = Date.now();
 
 		const hasDuplicate = yield* hasExistingCorrelationId(
@@ -380,34 +339,29 @@ createCommentDef.implement((args) =>
 /**
  * Update issue/PR state (optimistic).
  */
-const updateIssueStateDef = factory.mutation({
-	payload: {
-		correlationId: Schema.String,
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		repositoryId: Schema.Number,
-		number: Schema.Number,
-		state: Schema.Literal("open", "closed"),
-	},
-	success: Schema.Struct({ correlationId: Schema.String }),
-	error: Schema.Union(
-		DuplicateOperationError,
-		NotAuthenticated,
-		InsufficientPermission,
-	),
-});
+const updateIssueStateDef = factory
+	.mutation({
+		payload: {
+			correlationId: Schema.String,
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			repositoryId: Schema.Number,
+			number: Schema.Number,
+			state: Schema.Literal("open", "closed"),
+		},
+		success: Schema.Struct({ correlationId: Schema.String }),
+		error: Schema.Union(
+			DuplicateOperationError,
+			NotAuthenticated,
+			InsufficientPermission,
+		),
+	})
+	.middleware(RepoTriageByIdMiddleware);
 
 updateIssueStateDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		const triageProof = yield* triageProofForMutation(
-			actingUserId,
-			args.repositoryId,
-		);
-		yield* RepoTriageAccess.pipe(
-			Effect.provideService(RepoTriageAccess, triageProof),
-		);
 		const now = Date.now();
 
 		const hasDuplicate = yield* hasExistingCorrelationId(
@@ -497,36 +451,31 @@ updateIssueStateDef.implement((args) =>
 /**
  * Merge a pull request (optimistic).
  */
-const mergePullRequestDef = factory.mutation({
-	payload: {
-		correlationId: Schema.String,
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		repositoryId: Schema.Number,
-		number: Schema.Number,
-		mergeMethod: Schema.optional(Schema.Literal("merge", "squash", "rebase")),
-		commitTitle: Schema.optional(Schema.String),
-		commitMessage: Schema.optional(Schema.String),
-	},
-	success: Schema.Struct({ correlationId: Schema.String }),
-	error: Schema.Union(
-		DuplicateOperationError,
-		NotAuthenticated,
-		InsufficientPermission,
-	),
-});
+const mergePullRequestDef = factory
+	.mutation({
+		payload: {
+			correlationId: Schema.String,
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			repositoryId: Schema.Number,
+			number: Schema.Number,
+			mergeMethod: Schema.optional(Schema.Literal("merge", "squash", "rebase")),
+			commitTitle: Schema.optional(Schema.String),
+			commitMessage: Schema.optional(Schema.String),
+		},
+		success: Schema.Struct({ correlationId: Schema.String }),
+		error: Schema.Union(
+			DuplicateOperationError,
+			NotAuthenticated,
+			InsufficientPermission,
+		),
+	})
+	.middleware(RepoPushByIdMiddleware);
 
 mergePullRequestDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		const pushProof = yield* pushProofForMutation(
-			actingUserId,
-			args.repositoryId,
-		);
-		yield* RepoPushAccess.pipe(
-			Effect.provideService(RepoPushAccess, pushProof),
-		);
 		const now = Date.now();
 
 		const hasDuplicate = yield* hasExistingCorrelationId(
@@ -611,34 +560,29 @@ mergePullRequestDef.implement((args) =>
 /**
  * Update pull request branch (optimistic).
  */
-const updatePullRequestBranchDef = factory.mutation({
-	payload: {
-		correlationId: Schema.String,
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		repositoryId: Schema.Number,
-		number: Schema.Number,
-		expectedHeadSha: Schema.optional(Schema.String),
-	},
-	success: Schema.Struct({ correlationId: Schema.String }),
-	error: Schema.Union(
-		DuplicateOperationError,
-		NotAuthenticated,
-		InsufficientPermission,
-	),
-});
+const updatePullRequestBranchDef = factory
+	.mutation({
+		payload: {
+			correlationId: Schema.String,
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			repositoryId: Schema.Number,
+			number: Schema.Number,
+			expectedHeadSha: Schema.optional(Schema.String),
+		},
+		success: Schema.Struct({ correlationId: Schema.String }),
+		error: Schema.Union(
+			DuplicateOperationError,
+			NotAuthenticated,
+			InsufficientPermission,
+		),
+	})
+	.middleware(RepoPushByIdMiddleware);
 
 updatePullRequestBranchDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		const pushProof = yield* pushProofForMutation(
-			actingUserId,
-			args.repositoryId,
-		);
-		yield* RepoPushAccess.pipe(
-			Effect.provideService(RepoPushAccess, pushProof),
-		);
 		const now = Date.now();
 
 		const hasDuplicate = yield* hasExistingCorrelationId(
@@ -715,35 +659,30 @@ updatePullRequestBranchDef.implement((args) =>
 	}),
 );
 
-const submitPrReviewDef = factory.mutation({
-	payload: {
-		correlationId: Schema.String,
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		repositoryId: Schema.Number,
-		number: Schema.Number,
-		event: Schema.Literal("APPROVE", "REQUEST_CHANGES", "COMMENT"),
-		body: Schema.optional(Schema.String),
-	},
-	success: Schema.Struct({ correlationId: Schema.String }),
-	error: Schema.Union(
-		DuplicateOperationError,
-		NotAuthenticated,
-		InsufficientPermission,
-	),
-});
+const submitPrReviewDef = factory
+	.mutation({
+		payload: {
+			correlationId: Schema.String,
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			repositoryId: Schema.Number,
+			number: Schema.Number,
+			event: Schema.Literal("APPROVE", "REQUEST_CHANGES", "COMMENT"),
+			body: Schema.optional(Schema.String),
+		},
+		success: Schema.Struct({ correlationId: Schema.String }),
+		error: Schema.Union(
+			DuplicateOperationError,
+			NotAuthenticated,
+			InsufficientPermission,
+		),
+	})
+	.middleware(RepoTriageByIdMiddleware);
 
 submitPrReviewDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		const triageProof = yield* triageProofForMutation(
-			actingUserId,
-			args.repositoryId,
-		);
-		yield* RepoTriageAccess.pipe(
-			Effect.provideService(RepoTriageAccess, triageProof),
-		);
 
 		const hasDuplicate = yield* hasExistingCorrelationId(
 			ctx,
@@ -796,35 +735,30 @@ submitPrReviewDef.implement((args) =>
 	}),
 );
 
-const updateLabelsDef = factory.mutation({
-	payload: {
-		correlationId: Schema.String,
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		repositoryId: Schema.Number,
-		number: Schema.Number,
-		labelsToAdd: Schema.Array(Schema.String),
-		labelsToRemove: Schema.Array(Schema.String),
-	},
-	success: Schema.Struct({ correlationId: Schema.String }),
-	error: Schema.Union(
-		DuplicateOperationError,
-		NotAuthenticated,
-		InsufficientPermission,
-	),
-});
+const updateLabelsDef = factory
+	.mutation({
+		payload: {
+			correlationId: Schema.String,
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			repositoryId: Schema.Number,
+			number: Schema.Number,
+			labelsToAdd: Schema.Array(Schema.String),
+			labelsToRemove: Schema.Array(Schema.String),
+		},
+		success: Schema.Struct({ correlationId: Schema.String }),
+		error: Schema.Union(
+			DuplicateOperationError,
+			NotAuthenticated,
+			InsufficientPermission,
+		),
+	})
+	.middleware(RepoTriageByIdMiddleware);
 
 updateLabelsDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		const triageProof = yield* triageProofForMutation(
-			actingUserId,
-			args.repositoryId,
-		);
-		yield* RepoTriageAccess.pipe(
-			Effect.provideService(RepoTriageAccess, triageProof),
-		);
 
 		const hasDuplicate = yield* hasExistingCorrelationId(
 			ctx,
@@ -932,35 +866,30 @@ updateLabelsDef.implement((args) =>
 	}),
 );
 
-const updateAssigneesDef = factory.mutation({
-	payload: {
-		correlationId: Schema.String,
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		repositoryId: Schema.Number,
-		number: Schema.Number,
-		assigneesToAdd: Schema.Array(Schema.String),
-		assigneesToRemove: Schema.Array(Schema.String),
-	},
-	success: Schema.Struct({ correlationId: Schema.String }),
-	error: Schema.Union(
-		DuplicateOperationError,
-		NotAuthenticated,
-		InsufficientPermission,
-	),
-});
+const updateAssigneesDef = factory
+	.mutation({
+		payload: {
+			correlationId: Schema.String,
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			repositoryId: Schema.Number,
+			number: Schema.Number,
+			assigneesToAdd: Schema.Array(Schema.String),
+			assigneesToRemove: Schema.Array(Schema.String),
+		},
+		success: Schema.Struct({ correlationId: Schema.String }),
+		error: Schema.Union(
+			DuplicateOperationError,
+			NotAuthenticated,
+			InsufficientPermission,
+		),
+	})
+	.middleware(RepoTriageByIdMiddleware);
 
 updateAssigneesDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
 		const actingUserId = yield* getActingUserId(ctx);
-		const triageProof = yield* triageProofForMutation(
-			actingUserId,
-			args.repositoryId,
-		);
-		yield* RepoTriageAccess.pipe(
-			Effect.provideService(RepoTriageAccess, triageProof),
-		);
 
 		const hasDuplicate = yield* hasExistingCorrelationId(
 			ctx,
@@ -2881,7 +2810,7 @@ getPendingPullRequestMergeDef.implement((args) =>
 		if (Option.isNone(repo)) return { found: false };
 
 		const payloadJson = pr.value.optimisticPayloadJson ?? "{}";
-		const parsed = JSON.parse(payloadJson) as Record<string, unknown>;
+		const parsed = parseJsonObject(payloadJson);
 		const mergeMethod =
 			parsed.mergeMethod === "merge" ||
 			parsed.mergeMethod === "squash" ||
@@ -3196,37 +3125,29 @@ getPendingAssigneesUpdateDef.implement((args) =>
 // 5. Public query — list write operations for a repo
 // ---------------------------------------------------------------------------
 
-const listWriteOperationsDef = factory.query({
-	payload: {
-		repositoryId: Schema.Number,
-		/** Optionally filter by state */
-		stateFilter: Schema.optional(OperationState),
-	},
-	success: Schema.Array(WriteOperation),
-});
+const listWriteOperationsDef = factory
+	.query({
+		payload: {
+			repositoryId: Schema.Number,
+			/** Optionally filter by state */
+			stateFilter: Schema.optional(OperationState),
+		},
+		success: Schema.Array(WriteOperation),
+	})
+	.middleware(RepoPullByIdMiddleware);
 
 listWriteOperationsDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectQueryCtx;
-		const repo = yield* ctx.db
-			.query("github_repositories")
-			.withIndex("by_githubRepoId", (q) =>
-				q.eq("githubRepoId", args.repositoryId),
-			)
-			.first();
-
-		if (Option.isNone(repo)) return [];
-
-		const access = yield* resolveRepoAccess(
-			repo.value.githubRepoId,
-			repo.value.private,
-		).pipe(Effect.either);
-		if (access._tag === "Left") return [];
+		const permissionContext = yield* RepoPermissionContext;
+		const repositoryId = permissionContext.repositoryId;
+		const ownerLogin = permissionContext.ownerLogin;
+		const repoName = permissionContext.name;
 
 		const issueRows = yield* ctx.db
 			.query("github_issues")
 			.withIndex("by_repositoryId_and_state_and_githubUpdatedAt", (q) =>
-				q.eq("repositoryId", args.repositoryId),
+				q.eq("repositoryId", repositoryId),
 			)
 			.order("desc")
 			.take(100);
@@ -3259,30 +3180,30 @@ listWriteOperationsDef.implement((args) =>
 				const inputPayload =
 					operationType === "create_issue"
 						? {
-								ownerLogin: repo.value.ownerLogin,
-								name: repo.value.name,
+								ownerLogin,
+								name: repoName,
 								title: issue.title,
 								body: issue.body,
 								labels: [...issue.labelNames],
 							}
 						: operationType === "update_issue_state"
 							? {
-									ownerLogin: repo.value.ownerLogin,
-									name: repo.value.name,
+									ownerLogin,
+									name: repoName,
 									number: issue.number,
 									state: issue.state,
 								}
 							: operationType === "update_labels"
 								? {
-										ownerLogin: repo.value.ownerLogin,
-										name: repo.value.name,
+										ownerLogin,
+										name: repoName,
 										number: issue.number,
 										labelsToAdd,
 										labelsToRemove,
 									}
 								: {
-										ownerLogin: repo.value.ownerLogin,
-										name: repo.value.name,
+										ownerLogin,
+										name: repoName,
 										number: issue.number,
 										assigneesToAdd,
 										assigneesToRemove,
@@ -3320,8 +3241,8 @@ listWriteOperationsDef.implement((args) =>
 					operationType,
 					state: optimisticState,
 					repositoryId: issue.repositoryId,
-					ownerLogin: repo.value.ownerLogin,
-					repoName: repo.value.name,
+					ownerLogin,
+					repoName,
 					inputPayloadJson: JSON.stringify(inputPayload),
 					optimisticDataJson: JSON.stringify(optimisticData),
 					resultDataJson:
@@ -3357,7 +3278,7 @@ listWriteOperationsDef.implement((args) =>
 		const commentRows = yield* ctx.db
 			.query("github_issue_comments")
 			.withIndex("by_repositoryId_and_issueNumber", (q) =>
-				q.eq("repositoryId", args.repositoryId),
+				q.eq("repositoryId", repositoryId),
 			)
 			.take(200);
 
@@ -3376,8 +3297,8 @@ listWriteOperationsDef.implement((args) =>
 				}
 
 				const inputPayload = {
-					ownerLogin: repo.value.ownerLogin,
-					name: repo.value.name,
+					ownerLogin,
+					name: repoName,
 					number: comment.issueNumber,
 					body: comment.body,
 				};
@@ -3393,8 +3314,8 @@ listWriteOperationsDef.implement((args) =>
 					operationType: "create_comment",
 					state: optimisticState,
 					repositoryId: comment.repositoryId,
-					ownerLogin: repo.value.ownerLogin,
-					repoName: repo.value.name,
+					ownerLogin,
+					repoName,
 					inputPayloadJson: JSON.stringify(inputPayload),
 					optimisticDataJson: JSON.stringify(optimisticData),
 					resultDataJson:
@@ -3417,7 +3338,7 @@ listWriteOperationsDef.implement((args) =>
 		const prRows = yield* ctx.db
 			.query("github_pull_requests")
 			.withIndex("by_repositoryId_and_state_and_githubUpdatedAt", (q) =>
-				q.eq("repositoryId", args.repositoryId),
+				q.eq("repositoryId", repositoryId),
 			)
 			.order("desc")
 			.take(100);
@@ -3457,8 +3378,8 @@ listWriteOperationsDef.implement((args) =>
 				const inputPayload =
 					operationType === "merge_pull_request"
 						? {
-								ownerLogin: repo.value.ownerLogin,
-								name: repo.value.name,
+								ownerLogin,
+								name: repoName,
 								number: pr.number,
 								mergeMethod:
 									typeof payload.mergeMethod === "string"
@@ -3475,29 +3396,29 @@ listWriteOperationsDef.implement((args) =>
 							}
 						: operationType === "update_pull_request_branch"
 							? {
-									ownerLogin: repo.value.ownerLogin,
-									name: repo.value.name,
+									ownerLogin,
+									name: repoName,
 									number: pr.number,
 									expectedHeadSha,
 								}
 							: operationType === "update_issue_state"
 								? {
-										ownerLogin: repo.value.ownerLogin,
-										name: repo.value.name,
+										ownerLogin,
+										name: repoName,
 										number: pr.number,
 										state: pr.state,
 									}
 								: operationType === "update_labels"
 									? {
-											ownerLogin: repo.value.ownerLogin,
-											name: repo.value.name,
+											ownerLogin,
+											name: repoName,
 											number: pr.number,
 											labelsToAdd,
 											labelsToRemove,
 										}
 									: {
-											ownerLogin: repo.value.ownerLogin,
-											name: repo.value.name,
+											ownerLogin,
+											name: repoName,
 											number: pr.number,
 											assigneesToAdd,
 											assigneesToRemove,
@@ -3510,8 +3431,8 @@ listWriteOperationsDef.implement((args) =>
 					operationType,
 					state: optimisticState,
 					repositoryId: pr.repositoryId,
-					ownerLogin: repo.value.ownerLogin,
-					repoName: repo.value.name,
+					ownerLogin,
+					repoName,
 					inputPayloadJson: JSON.stringify(inputPayload),
 					optimisticDataJson: JSON.stringify({
 						number: pr.number,
@@ -3556,7 +3477,7 @@ listWriteOperationsDef.implement((args) =>
 		const reviewRows = yield* ctx.db
 			.query("github_pull_request_reviews")
 			.withIndex("by_repositoryId_and_pullRequestNumber", (q) =>
-				q.eq("repositoryId", args.repositoryId),
+				q.eq("repositoryId", repositoryId),
 			)
 			.take(200);
 
@@ -3590,11 +3511,11 @@ listWriteOperationsDef.implement((args) =>
 					operationType: "submit_pr_review",
 					state: optimisticState,
 					repositoryId: review.repositoryId,
-					ownerLogin: repo.value.ownerLogin,
-					repoName: repo.value.name,
+					ownerLogin,
+					repoName,
 					inputPayloadJson: JSON.stringify({
-						ownerLogin: repo.value.ownerLogin,
-						name: repo.value.name,
+						ownerLogin,
+						name: repoName,
 						number: review.pullRequestNumber,
 						event,
 						body,
@@ -3679,7 +3600,7 @@ const githubWriteModule = makeRpcModule(
 		// Public query (UI consumption)
 		listWriteOperations: listWriteOperationsDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const {

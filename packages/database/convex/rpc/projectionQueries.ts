@@ -16,7 +16,7 @@ import {
 	reviewsByPrNumber,
 } from "../shared/aggregates";
 import { resolveRepoAccess } from "../shared/permissions";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -25,7 +25,7 @@ const factory = createRpcFactory({ schema: confectSchema });
 // ---------------------------------------------------------------------------
 
 /**
- * Get all connected repositories with their overview stats.
+ * Get personalized sidebar repositories with overview stats.
  */
 const listReposDef = factory.query({
 	success: Schema.Array(
@@ -604,6 +604,20 @@ const DashboardPrItem = Schema.Struct({
 	authorAvatarUrl: Schema.NullOr(Schema.String),
 	commentCount: Schema.Number,
 	lastCheckConclusion: Schema.NullOr(Schema.String),
+	failingCheckNames: Schema.Array(Schema.String),
+	githubUpdatedAt: Schema.Number,
+});
+
+const DashboardIssueItem = Schema.Struct({
+	ownerLogin: Schema.String,
+	repoName: Schema.String,
+	number: Schema.Number,
+	state: Schema.Literal("open", "closed"),
+	title: Schema.String,
+	authorLogin: Schema.NullOr(Schema.String),
+	authorAvatarUrl: Schema.NullOr(Schema.String),
+	labelNames: Schema.Array(Schema.String),
+	commentCount: Schema.Number,
 	githubUpdatedAt: Schema.Number,
 });
 
@@ -629,6 +643,78 @@ const RepoQuickAccess = Schema.Struct({
 	lastPushAt: Schema.NullOr(Schema.Number),
 });
 
+const DashboardScopeSchema = Schema.Literal("org", "personal");
+
+const DashboardPortfolioPrItem = Schema.Struct({
+	ownerLogin: Schema.String,
+	repoName: Schema.String,
+	number: Schema.Number,
+	state: Schema.Literal("open", "closed"),
+	draft: Schema.Boolean,
+	title: Schema.String,
+	authorLogin: Schema.NullOr(Schema.String),
+	authorAvatarUrl: Schema.NullOr(Schema.String),
+	commentCount: Schema.Number,
+	lastCheckConclusion: Schema.NullOr(Schema.String),
+	failingCheckNames: Schema.Array(Schema.String),
+	githubUpdatedAt: Schema.Number,
+	assigneeCount: Schema.Number,
+	requestedReviewerCount: Schema.Number,
+	attentionLevel: Schema.Literal("critical", "high", "normal"),
+	attentionReason: Schema.String,
+	isViewerAuthor: Schema.Boolean,
+	isViewerReviewer: Schema.Boolean,
+	isViewerAssignee: Schema.Boolean,
+	isStale: Schema.Boolean,
+});
+
+const DashboardThroughputPoint = Schema.Struct({
+	dayStart: Schema.Number,
+	dayLabel: Schema.String,
+	closedPrCount: Schema.Number,
+	closedIssueCount: Schema.Number,
+	pushCount: Schema.Number,
+});
+
+const DashboardWorkloadItem = Schema.Struct({
+	ownerLogin: Schema.String,
+	openPrCount: Schema.Number,
+	reviewRequestedCount: Schema.Number,
+	failingPrCount: Schema.Number,
+	stalePrCount: Schema.Number,
+});
+
+const DashboardBlockedItem = Schema.Struct({
+	type: Schema.Literal("ci_failure", "stale_pr", "review_queue"),
+	ownerLogin: Schema.String,
+	repoName: Schema.String,
+	number: Schema.Number,
+	title: Schema.String,
+	reason: Schema.String,
+	githubUpdatedAt: Schema.Number,
+});
+
+const DashboardRepoOption = Schema.Struct({
+	ownerLogin: Schema.String,
+	name: Schema.String,
+	fullName: Schema.String,
+});
+
+const DashboardOwnerOption = Schema.Struct({
+	ownerLogin: Schema.String,
+	repoCount: Schema.Number,
+});
+
+const DashboardSummary = Schema.Struct({
+	repoCount: Schema.Number,
+	openPrCount: Schema.Number,
+	openIssueCount: Schema.Number,
+	failingCheckCount: Schema.Number,
+	attentionCount: Schema.Number,
+	reviewQueueCount: Schema.Number,
+	stalePrCount: Schema.Number,
+});
+
 /**
  * Get a personalized cross-repo home dashboard.
  *
@@ -641,12 +727,31 @@ const RepoQuickAccess = Schema.Struct({
  * - `githubLogin`         — the user's GitHub username (for display)
  */
 const getHomeDashboardDef = factory.query({
+	payload: {
+		scope: Schema.optional(DashboardScopeSchema),
+		ownerLogin: Schema.optional(Schema.String),
+		repoFullName: Schema.optional(Schema.String),
+		days: Schema.optional(Schema.Number),
+	},
 	success: Schema.Struct({
+		scope: DashboardScopeSchema,
+		rangeDays: Schema.Number,
+		ownerFilter: Schema.NullOr(Schema.String),
+		repoFilter: Schema.NullOr(Schema.String),
 		githubLogin: Schema.NullOr(Schema.String),
+		yourOwners: Schema.Array(DashboardOwnerOption),
+		availableOwners: Schema.Array(DashboardOwnerOption),
+		availableRepos: Schema.Array(DashboardRepoOption),
+		summary: DashboardSummary,
 		yourPrs: Schema.Array(DashboardPrItem),
 		needsAttentionPrs: Schema.Array(DashboardPrItem),
 		recentPrs: Schema.Array(DashboardPrItem),
+		recentIssues: Schema.Array(DashboardIssueItem),
+		portfolioPrs: Schema.Array(DashboardPortfolioPrItem),
 		recentActivity: Schema.Array(RecentActivityItem),
+		throughput: Schema.Array(DashboardThroughputPoint),
+		workloadByOwner: Schema.Array(DashboardWorkloadItem),
+		blockedItems: Schema.Array(DashboardBlockedItem),
 		repos: Schema.Array(RepoQuickAccess),
 	}),
 });
@@ -765,19 +870,167 @@ const computeRepoCounts = (repositoryId: number) =>
 		return { openPrCount, openIssueCount, failingCheckCount };
 	});
 
+const ANONYMOUS_FEATURED_REPO_LIMIT = 10;
+const PERSONALIZED_REPO_LIMIT = 120;
+const REPOSITORY_SCAN_LIMIT = 400;
+const INSTALLATION_SCAN_LIMIT = 200;
+const INTERACTION_NOTIFICATION_LIMIT = 250;
+
+const sortByRecentActivity = <
+	T extends {
+		readonly pushedAt: number | null;
+		readonly githubUpdatedAt: number;
+		readonly fullName: string;
+	},
+>(
+	repos: ReadonlyArray<T>,
+): Array<T> =>
+	[...repos].sort((a, b) => {
+		const pushDelta = (b.pushedAt ?? 0) - (a.pushedAt ?? 0);
+		if (pushDelta !== 0) return pushDelta;
+		const updateDelta = b.githubUpdatedAt - a.githubUpdatedAt;
+		if (updateDelta !== 0) return updateDelta;
+		return a.fullName.localeCompare(b.fullName);
+	});
+
+const sortFeaturedPublicRepos = <
+	T extends {
+		readonly stargazersCount?: number;
+		readonly githubUpdatedAt: number;
+		readonly pushedAt: number | null;
+		readonly fullName: string;
+	},
+>(
+	repos: ReadonlyArray<T>,
+): Array<T> =>
+	[...repos].sort((a, b) => {
+		const starDelta = (b.stargazersCount ?? 0) - (a.stargazersCount ?? 0);
+		if (starDelta !== 0) return starDelta;
+		const pushDelta = (b.pushedAt ?? 0) - (a.pushedAt ?? 0);
+		if (pushDelta !== 0) return pushDelta;
+		const updateDelta = b.githubUpdatedAt - a.githubUpdatedAt;
+		if (updateDelta !== 0) return updateDelta;
+		return a.fullName.localeCompare(b.fullName);
+	});
+
+const selectSidebarAndDashboardRepos = Effect.gen(function* () {
+	const ctx = yield* ConfectQueryCtx;
+	const identity = yield* ctx.auth.getUserIdentity();
+	const allRepos = yield* ctx.db
+		.query("github_repositories")
+		.take(REPOSITORY_SCAN_LIMIT);
+
+	const publicRepos = allRepos.filter((repo) => !repo.private);
+	const featuredPublicRepos = sortFeaturedPublicRepos(publicRepos).slice(
+		0,
+		ANONYMOUS_FEATURED_REPO_LIMIT,
+	);
+
+	if (Option.isNone(identity)) {
+		return featuredPublicRepos;
+	}
+
+	const userId = identity.value.subject;
+	const permissions = yield* ctx.db
+		.query("github_user_repo_permissions")
+		.withIndex("by_userId", (q) => q.eq("userId", userId))
+		.collect();
+
+	const memberRepoIds = new Set<number>();
+	for (const permission of permissions) {
+		if (!hasPullPermission(permission)) continue;
+		memberRepoIds.add(permission.repositoryId);
+	}
+
+	const reposById = new Map<number, (typeof allRepos)[number]>();
+	for (const repo of allRepos) {
+		reposById.set(repo.githubRepoId, repo);
+	}
+
+	const memberRepos = [];
+	for (const repositoryId of memberRepoIds) {
+		const repo = reposById.get(repositoryId);
+		if (repo === undefined) continue;
+		memberRepos.push(repo);
+	}
+
+	const notifications = yield* ctx.db
+		.query("github_notifications")
+		.withIndex("by_userId_and_updatedAt", (q) => q.eq("userId", userId))
+		.order("desc")
+		.take(INTERACTION_NOTIFICATION_LIMIT);
+
+	const interactedRepoIds = new Set<number>();
+	for (const notification of notifications) {
+		if (notification.repositoryId === null) continue;
+		if (memberRepoIds.has(notification.repositoryId)) continue;
+		interactedRepoIds.add(notification.repositoryId);
+	}
+
+	const interactedRepos = [];
+	for (const repositoryId of interactedRepoIds) {
+		const repo = reposById.get(repositoryId);
+		if (repo === undefined) continue;
+		if (repo.private) continue;
+		interactedRepos.push(repo);
+	}
+
+	const installations = yield* ctx.db
+		.query("github_installations")
+		.take(INSTALLATION_SCAN_LIMIT);
+	const organizationInstallationIds = new Set<number>();
+	for (const installation of installations) {
+		if (installation.accountType === "Organization") {
+			organizationInstallationIds.add(installation.installationId);
+		}
+	}
+
+	const memberOrgRepos = [];
+	const memberPersonalRepos = [];
+	for (const repo of memberRepos) {
+		if (organizationInstallationIds.has(repo.installationId)) {
+			memberOrgRepos.push(repo);
+			continue;
+		}
+		memberPersonalRepos.push(repo);
+	}
+
+	const interactedOrgRepos = [];
+	const interactedPersonalRepos = [];
+	for (const repo of interactedRepos) {
+		if (organizationInstallationIds.has(repo.installationId)) {
+			interactedOrgRepos.push(repo);
+			continue;
+		}
+		interactedPersonalRepos.push(repo);
+	}
+
+	const sortedMemberOrgRepos = sortByRecentActivity(memberOrgRepos);
+	const sortedInteractedOrgRepos = sortByRecentActivity(interactedOrgRepos);
+	const sortedMemberPersonalRepos = sortByRecentActivity(memberPersonalRepos);
+	const sortedInteractedPersonalRepos = sortByRecentActivity(
+		interactedPersonalRepos,
+	);
+
+	const hasOrganizationContext =
+		sortedMemberOrgRepos.length > 0 || sortedInteractedOrgRepos.length > 0;
+
+	const personalizedRepos = hasOrganizationContext
+		? [...sortedMemberOrgRepos, ...sortedInteractedOrgRepos]
+		: [...sortedMemberPersonalRepos, ...sortedInteractedPersonalRepos];
+
+	if (personalizedRepos.length > 0) {
+		return personalizedRepos.slice(0, PERSONALIZED_REPO_LIMIT);
+	}
+
+	return featuredPublicRepos;
+});
+
 listReposDef.implement(() =>
 	Effect.gen(function* () {
-		const ctx = yield* ConfectQueryCtx;
-		// Bounded — personal dashboard should have <100 repos
-		const repos = yield* ctx.db.query("github_repositories").take(100);
+		const repos = yield* selectSidebarAndDashboardRepos;
 		const results = [];
 		for (const repo of repos) {
-			const access = yield* resolveRepoAccess(
-				repo.githubRepoId,
-				repo.private,
-			).pipe(Effect.either);
-			if (access._tag === "Left") continue;
-
 			const counts = yield* computeRepoCounts(repo.githubRepoId);
 
 			// Resolve owner avatar — check github_users first, then github_organizations
@@ -1174,8 +1427,8 @@ searchIssuesAndPrsDef.implement((args) =>
 			.split(" ")
 			.map((token) => token.trim())
 			.filter((token) => token.length > 0);
-		const normalizedAuthor = args.authorLogin?.toLowerCase() ?? null;
-		const normalizedAssignee = args.assigneeLogin?.toLowerCase() ?? null;
+		const normalizedAuthor = args.authorLogin?.toLowerCase().trim() ?? null;
+		const normalizedAssignee = args.assigneeLogin?.toLowerCase().trim() ?? null;
 		const normalizedLabels = (args.labels ?? [])
 			.map((label) => label.toLowerCase())
 			.filter((label) => label.length > 0);
@@ -1217,6 +1470,39 @@ searchIssuesAndPrsDef.implement((args) =>
 			return true;
 		};
 
+		const compactLogin = (value: string) =>
+			value.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+		const matchesLoginAlias = (login: string, queryAlias: string) => {
+			const alias = queryAlias.trim().toLowerCase();
+			if (alias.length === 0) return true;
+
+			const loginLower = login.toLowerCase();
+			if (loginLower === alias) return true;
+			if (loginLower.startsWith(alias)) return true;
+			if (loginLower.includes(alias)) return true;
+
+			const compactAlias = compactLogin(alias);
+			const compact = compactLogin(loginLower);
+			if (compactAlias.length === 0) return false;
+			if (compact === compactAlias) return true;
+			if (compact.startsWith(compactAlias)) return true;
+			if (compact.includes(compactAlias)) return true;
+
+			const aliasTokens = alias
+				.split(/[\s._-]+/)
+				.map((token) => token.trim())
+				.filter((token) => token.length > 0);
+			if (aliasTokens.length <= 1) return false;
+
+			for (const token of aliasTokens) {
+				const compactToken = compactLogin(token);
+				if (compactToken.length === 0) continue;
+				if (!compact.includes(compactToken)) return false;
+			}
+			return true;
+		};
+
 		const prCandidates = shouldSearchPrs
 			? yield* ctx.db
 					.query("github_pull_requests")
@@ -1247,7 +1533,7 @@ searchIssuesAndPrsDef.implement((args) =>
 					const authorLogin = yield* resolveLoginByUserId(pr.authorUserId);
 					if (normalizedAuthor !== null) {
 						if (authorLogin === null) return null;
-						if (authorLogin.toLowerCase() !== normalizedAuthor) return null;
+						if (!matchesLoginAlias(authorLogin, normalizedAuthor)) return null;
 					}
 
 					if (normalizedAssignee !== null) {
@@ -1258,7 +1544,7 @@ searchIssuesAndPrsDef.implement((args) =>
 						);
 						const hasMatchingAssignee = assigneeLogins.some(
 							(login) =>
-								login !== null && login.toLowerCase() === normalizedAssignee,
+								login !== null && matchesLoginAlias(login, normalizedAssignee),
 						);
 						if (!hasMatchingAssignee) return null;
 					}
@@ -1324,7 +1610,7 @@ searchIssuesAndPrsDef.implement((args) =>
 					const authorLogin = yield* resolveLoginByUserId(issue.authorUserId);
 					if (normalizedAuthor !== null) {
 						if (authorLogin === null) return null;
-						if (authorLogin.toLowerCase() !== normalizedAuthor) return null;
+						if (!matchesLoginAlias(authorLogin, normalizedAuthor)) return null;
 					}
 
 					if (normalizedAssignee !== null) {
@@ -1337,7 +1623,7 @@ searchIssuesAndPrsDef.implement((args) =>
 						);
 						const hasMatchingAssignee = assigneeLogins.some(
 							(login) =>
-								login !== null && login.toLowerCase() === normalizedAssignee,
+								login !== null && matchesLoginAlias(login, normalizedAssignee),
 						);
 						if (!hasMatchingAssignee) return null;
 					}
@@ -1430,28 +1716,98 @@ const resolveViewerGitHub = Effect.gen(function* () {
 	return githubUser.value.login;
 });
 
-getHomeDashboardDef.implement(() =>
+getHomeDashboardDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectQueryCtx;
+		const now = Date.now();
+		const identity = yield* ctx.auth.getUserIdentity();
 
-		// 0. Resolve the viewer's GitHub login
 		const githubLogin = yield* resolveViewerGitHub;
 
-		// 1. All repos (bounded to 100), sorted by most recently pushed
-		const allRepos = yield* ctx.db.query("github_repositories").take(100);
-		const accessibleRepos = [];
-		for (const repo of allRepos) {
-			const access = yield* resolveRepoAccess(
-				repo.githubRepoId,
-				repo.private,
-			).pipe(Effect.either);
-			if (access._tag === "Right") {
-				accessibleRepos.push(repo);
+		const normalizedDays =
+			args.days !== undefined && Number.isFinite(args.days)
+				? Math.floor(args.days)
+				: 14;
+		const rangeDays =
+			normalizedDays < 7 ? 7 : normalizedDays > 30 ? 30 : normalizedDays;
+		const rangeStart = now - rangeDays * 24 * 60 * 60 * 1000;
+
+		const scope = args.scope ?? "org";
+		const ownerFilter =
+			args.ownerLogin !== undefined && args.ownerLogin.length > 0
+				? args.ownerLogin
+				: null;
+		const repoFilter =
+			args.repoFullName !== undefined && args.repoFullName.length > 0
+				? args.repoFullName
+				: null;
+
+		const accessibleRepos = yield* selectSidebarAndDashboardRepos;
+
+		const yourOwnerCounts = new Map<string, number>();
+		if (Option.isSome(identity)) {
+			const permissions = yield* ctx.db
+				.query("github_user_repo_permissions")
+				.withIndex("by_userId", (q) => q.eq("userId", identity.value.subject))
+				.collect();
+
+			const memberRepoIds = new Set<number>();
+			for (const permission of permissions) {
+				if (!hasPullPermission(permission)) continue;
+				memberRepoIds.add(permission.repositoryId);
+			}
+
+			for (const repo of accessibleRepos) {
+				if (!memberRepoIds.has(repo.githubRepoId)) continue;
+				yourOwnerCounts.set(
+					repo.ownerLogin,
+					(yourOwnerCounts.get(repo.ownerLogin) ?? 0) + 1,
+				);
 			}
 		}
 
+		const yourOwners = [...yourOwnerCounts.entries()]
+			.map(([ownerLogin, repoCount]) => ({ ownerLogin, repoCount }))
+			.sort((a, b) => {
+				if (a.repoCount !== b.repoCount) return b.repoCount - a.repoCount;
+				return a.ownerLogin.localeCompare(b.ownerLogin);
+			});
+
+		const ownerCounts = new Map<string, number>();
+		for (const repo of accessibleRepos) {
+			ownerCounts.set(
+				repo.ownerLogin,
+				(ownerCounts.get(repo.ownerLogin) ?? 0) + 1,
+			);
+		}
+
+		const availableOwners = [...ownerCounts.entries()]
+			.map(([ownerLogin, repoCount]) => ({ ownerLogin, repoCount }))
+			.sort((a, b) => {
+				if (a.repoCount !== b.repoCount) return b.repoCount - a.repoCount;
+				return a.ownerLogin.localeCompare(b.ownerLogin);
+			});
+
+		const availableRepos = accessibleRepos
+			.map((repo) => ({
+				ownerLogin: repo.ownerLogin,
+				name: repo.name,
+				fullName: repo.fullName,
+			}))
+			.sort((a, b) => a.fullName.localeCompare(b.fullName));
+
+		const ownerScopedRepos =
+			ownerFilter === null
+				? accessibleRepos
+				: accessibleRepos.filter((repo) => repo.ownerLogin === ownerFilter);
+
+		const scopedRepos =
+			repoFilter === null
+				? ownerScopedRepos
+				: ownerScopedRepos.filter((repo) => repo.fullName === repoFilter);
+
 		const repoOverviews = yield* Effect.all(
-			accessibleRepos.map((repo) =>
+			scopedRepos.map((repo) =>
 				Effect.gen(function* () {
 					const counts = yield* computeRepoCounts(repo.githubRepoId);
 					return {
@@ -1471,19 +1827,35 @@ getHomeDashboardDef.implement(() =>
 
 		const repos = [...repoOverviews]
 			.sort((a, b) => (b.lastPushAt ?? 0) - (a.lastPushAt ?? 0))
-			.map((o) => ({
-				ownerLogin: o.ownerLogin,
-				name: o.name,
-				fullName: o.fullName,
-				openPrCount: o.openPrCount,
-				openIssueCount: o.openIssueCount,
-				failingCheckCount: o.failingCheckCount,
-				lastPushAt: o.lastPushAt,
+			.map((overview) => ({
+				ownerLogin: overview.ownerLogin,
+				name: overview.name,
+				fullName: overview.fullName,
+				openPrCount: overview.openPrCount,
+				openIssueCount: overview.openIssueCount,
+				failingCheckCount: overview.failingCheckCount,
+				lastPushAt: overview.lastPushAt,
 			}));
 
-		// 2. Fetch recent open PRs across all repos from normalized table
+		const userCache = new Map<
+			number,
+			{ login: string | null; avatarUrl: string | null }
+		>();
+
+		const resolveCachedUser = (userId: number | null) =>
+			Effect.gen(function* () {
+				if (userId === null) return { login: null, avatarUrl: null };
+				const cached = userCache.get(userId);
+				if (cached !== undefined) return cached;
+				const resolved = yield* resolveUser(userId);
+				userCache.set(userId, resolved);
+				return resolved;
+			});
+
+		const staleThresholdMs = 3 * 24 * 60 * 60 * 1000;
+
 		const allPrsByRepo = yield* Effect.all(
-			accessibleRepos.map((repo) =>
+			scopedRepos.map((repo) =>
 				Effect.gen(function* () {
 					const prs = yield* ctx.db
 						.query("github_pull_requests")
@@ -1491,35 +1863,34 @@ getHomeDashboardDef.implement(() =>
 							q.eq("repositoryId", repo.githubRepoId).eq("state", "open"),
 						)
 						.order("desc")
-						.take(15);
+						.take(20);
 
-					// Resolve author and assignee/reviewer logins for each PR
-					const enriched = yield* Effect.all(
+					return yield* Effect.all(
 						prs.map((pr) =>
 							Effect.gen(function* () {
-								const author = yield* resolveUser(pr.authorUserId);
+								const author = yield* resolveCachedUser(pr.authorUserId);
 
-								// Resolve assignee logins
 								const assigneeLogins = yield* Effect.all(
-									pr.assigneeUserIds.map((uid) =>
-										Effect.gen(function* () {
-											const u = yield* resolveUser(uid);
-											return u.login;
-										}),
+									pr.assigneeUserIds.map((userId) =>
+										Effect.map(resolveCachedUser(userId), (u) => u.login),
 									),
 									{ concurrency: "unbounded" },
 								);
 
-								// Resolve requested reviewer logins
 								const requestedReviewerLogins = yield* Effect.all(
-									pr.requestedReviewerUserIds.map((uid) =>
-										Effect.gen(function* () {
-											const u = yield* resolveUser(uid);
-											return u.login;
-										}),
+									pr.requestedReviewerUserIds.map((userId) =>
+										Effect.map(resolveCachedUser(userId), (u) => u.login),
 									),
 									{ concurrency: "unbounded" },
 								);
+
+								const resolvedAssigneeLogins = assigneeLogins.filter(
+									(login): login is string => login !== null,
+								);
+								const resolvedRequestedReviewerLogins =
+									requestedReviewerLogins.filter(
+										(login): login is string => login !== null,
+									);
 
 								const raw = ctx.rawCtx;
 								const commentCount = yield* tryAggregateCount(
@@ -1540,7 +1911,6 @@ getHomeDashboardDef.implement(() =>
 									}),
 								);
 
-								// Derive lastCheckConclusion
 								const checkRuns = yield* ctx.db
 									.query("github_check_runs")
 									.withIndex("by_repositoryId_and_headSha", (q) =>
@@ -1553,13 +1923,13 @@ getHomeDashboardDef.implement(() =>
 								let lastCheckConclusion: string | null = null;
 								if (checkRuns.length > 0) {
 									const hasFailure = checkRuns.some(
-										(cr) =>
-											cr.conclusion === "failure" ||
-											cr.conclusion === "timed_out" ||
-											cr.conclusion === "action_required",
+										(checkRun) =>
+											checkRun.conclusion === "failure" ||
+											checkRun.conclusion === "timed_out" ||
+											checkRun.conclusion === "action_required",
 									);
 									const hasPending = checkRuns.some(
-										(cr) => cr.status !== "completed",
+										(checkRun) => checkRun.status !== "completed",
 									);
 									if (hasFailure) {
 										lastCheckConclusion = "failure";
@@ -1568,6 +1938,47 @@ getHomeDashboardDef.implement(() =>
 									} else {
 										lastCheckConclusion = "success";
 									}
+								}
+
+								const failingCheckNames = checkRuns
+									.filter(
+										(cr) =>
+											cr.conclusion === "failure" ||
+											cr.conclusion === "timed_out" ||
+											cr.conclusion === "action_required",
+									)
+									.map((cr) => cr.name);
+
+								const isViewerAuthor =
+									githubLogin !== null && author.login === githubLogin;
+								const isViewerReviewer =
+									githubLogin !== null &&
+									resolvedRequestedReviewerLogins.includes(githubLogin);
+								const isViewerAssignee =
+									githubLogin !== null &&
+									resolvedAssigneeLogins.includes(githubLogin);
+								const isStale = now - pr.githubUpdatedAt >= staleThresholdMs;
+
+								const attentionLevel: "critical" | "high" | "normal" =
+									lastCheckConclusion === "failure"
+										? "critical"
+										: isViewerReviewer || isViewerAssignee || isStale
+											? "high"
+											: "normal";
+
+								let attentionReason = "Active";
+								if (lastCheckConclusion === "failure") {
+									attentionReason = "CI failing";
+								} else if (isViewerReviewer) {
+									attentionReason = "Review requested";
+								} else if (isViewerAssignee) {
+									attentionReason = "Assigned to you";
+								} else if (isViewerAuthor) {
+									attentionReason = "Your PR";
+								} else if (resolvedRequestedReviewerLogins.length > 0) {
+									attentionReason = "Needs review";
+								} else if (isStale) {
+									attentionReason = "No updates in 3+ days";
 								}
 
 								return {
@@ -1579,22 +1990,26 @@ getHomeDashboardDef.implement(() =>
 									title: pr.title,
 									authorLogin: author.login,
 									authorAvatarUrl: author.avatarUrl,
-									assigneeLogins: assigneeLogins.filter(
-										(l): l is string => l !== null,
-									),
-									requestedReviewerLogins: requestedReviewerLogins.filter(
-										(l): l is string => l !== null,
-									),
+									assigneeLogins: resolvedAssigneeLogins,
+									requestedReviewerLogins: resolvedRequestedReviewerLogins,
 									commentCount,
 									lastCheckConclusion,
+									failingCheckNames,
 									githubUpdatedAt: pr.githubUpdatedAt,
+									assigneeCount: resolvedAssigneeLogins.length,
+									requestedReviewerCount:
+										resolvedRequestedReviewerLogins.length,
+									attentionLevel,
+									attentionReason,
+									isViewerAuthor,
+									isViewerReviewer,
+									isViewerAssignee,
+									isStale,
 								};
 							}),
 						),
 						{ concurrency: "unbounded" },
 					);
-
-					return enriched;
 				}),
 			),
 			{ concurrency: "unbounded" },
@@ -1604,44 +2019,117 @@ getHomeDashboardDef.implement(() =>
 			.flat()
 			.sort((a, b) => b.githubUpdatedAt - a.githubUpdatedAt);
 
-		// Split into "your PRs", "needs attention", and "other recent PRs"
-		const yourPrs = githubLogin
-			? allPrs.filter((pr) => pr.authorLogin === githubLogin).slice(0, 10)
-			: [];
+		const attentionWeight = (item: (typeof allPrs)[number]) => {
+			if (item.attentionLevel === "critical") return 3;
+			if (item.attentionLevel === "high") return 2;
+			return 1;
+		};
 
-		const yourPrKeys = new Set(
-			yourPrs.map((pr) => `${pr.ownerLogin}/${pr.repoName}#${pr.number}`),
+		const yourPrsAll =
+			githubLogin === null
+				? []
+				: allPrs.filter((pr) => pr.authorLogin === githubLogin);
+
+		const reviewQueuePrs =
+			scope === "personal" && githubLogin !== null
+				? allPrs.filter((pr) => pr.isViewerReviewer || pr.isViewerAssignee)
+				: allPrs.filter((pr) => pr.requestedReviewerCount > 0);
+
+		const failingPrs = allPrs.filter(
+			(pr) => pr.lastCheckConclusion === "failure",
 		);
 
-		const needsAttentionPrs = githubLogin
-			? allPrs
-					.filter((pr) => {
-						if (yourPrKeys.has(`${pr.ownerLogin}/${pr.repoName}#${pr.number}`))
-							return false;
-						return (
-							pr.assigneeLogins.includes(githubLogin) ||
-							pr.requestedReviewerLogins.includes(githubLogin)
-						);
-					})
-					.slice(0, 10)
-			: [];
+		const stalePrs = allPrs.filter((pr) => pr.isStale);
 
-		const excludedKeys = new Set([
+		const attentionCandidates =
+			scope === "personal" && githubLogin !== null
+				? allPrs.filter(
+						(pr) =>
+							pr.lastCheckConclusion === "failure" ||
+							pr.isViewerReviewer ||
+							pr.isViewerAssignee ||
+							(pr.isViewerAuthor && pr.isStale),
+					)
+				: allPrs.filter(
+						(pr) =>
+							pr.lastCheckConclusion === "failure" ||
+							pr.requestedReviewerCount > 0 ||
+							pr.isStale,
+					);
+
+		const prioritizedAttention = [...attentionCandidates].sort((a, b) => {
+			const levelDelta = attentionWeight(b) - attentionWeight(a);
+			if (levelDelta !== 0) return levelDelta;
+			return b.githubUpdatedAt - a.githubUpdatedAt;
+		});
+
+		const needsAttentionPrs =
+			scope === "personal" && githubLogin !== null
+				? prioritizedAttention.filter((pr) => !pr.isViewerAuthor).slice(0, 12)
+				: prioritizedAttention.slice(0, 12);
+
+		const yourPrs = yourPrsAll.slice(0, 12);
+
+		const excludedPrKeys = new Set([
 			...yourPrs.map((pr) => `${pr.ownerLogin}/${pr.repoName}#${pr.number}`),
 			...needsAttentionPrs.map(
 				(pr) => `${pr.ownerLogin}/${pr.repoName}#${pr.number}`,
 			),
 		]);
+
 		const recentPrs = allPrs
 			.filter(
 				(pr) =>
-					!excludedKeys.has(`${pr.ownerLogin}/${pr.repoName}#${pr.number}`),
+					!excludedPrKeys.has(`${pr.ownerLogin}/${pr.repoName}#${pr.number}`),
 			)
-			.slice(0, 10);
+			.slice(0, 12);
 
-		// 3. Recent activity across all repos — use activity feed
-		const allRecentActivity = yield* Effect.all(
-			accessibleRepos.map((repo) =>
+		// Fetch recent issues across all scoped repos
+		const allIssuesByRepo = yield* Effect.all(
+			scopedRepos.map((repo) =>
+				Effect.gen(function* () {
+					const issues = yield* ctx.db
+						.query("github_issues")
+						.withIndex("by_repositoryId_and_state_and_githubUpdatedAt", (q) =>
+							q.eq("repositoryId", repo.githubRepoId).eq("state", "open"),
+						)
+						.order("desc")
+						.take(20);
+
+					return yield* Effect.all(
+						issues
+							.filter((issue) => !issue.isPullRequest)
+							.map((issue) =>
+								Effect.gen(function* () {
+									const author = yield* resolveCachedUser(issue.authorUserId);
+									return {
+										ownerLogin: repo.ownerLogin,
+										repoName: repo.name,
+										number: issue.number,
+										state: issue.state,
+										title: issue.title,
+										authorLogin: author.login,
+										authorAvatarUrl: author.avatarUrl,
+										labelNames: [...issue.labelNames],
+										commentCount: issue.commentCount,
+										githubUpdatedAt: issue.githubUpdatedAt,
+									};
+								}),
+							),
+						{ concurrency: "unbounded" },
+					);
+				}),
+			),
+			{ concurrency: "unbounded" },
+		);
+
+		const recentIssues = allIssuesByRepo
+			.flat()
+			.sort((a, b) => b.githubUpdatedAt - a.githubUpdatedAt)
+			.slice(0, 20);
+
+		const allRecentActivityByRepo = yield* Effect.all(
+			scopedRepos.map((repo) =>
 				Effect.gen(function* () {
 					const activities = yield* ctx.db
 						.query("view_activity_feed")
@@ -1649,31 +2137,195 @@ getHomeDashboardDef.implement(() =>
 							q.eq("repositoryId", repo.githubRepoId),
 						)
 						.order("desc")
-						.take(5);
+						.take(40);
 
-					return activities.map((a) => ({
+					return activities.map((activity) => ({
 						ownerLogin: repo.ownerLogin,
 						repoName: repo.name,
-						activityType: a.activityType,
-						title: a.title,
-						description: a.description,
-						actorLogin: a.actorLogin,
-						actorAvatarUrl: a.actorAvatarUrl,
-						entityNumber: a.entityNumber,
-						createdAt: a.createdAt,
+						activityType: activity.activityType,
+						title: activity.title,
+						description: activity.description,
+						actorLogin: activity.actorLogin,
+						actorAvatarUrl: activity.actorAvatarUrl,
+						entityNumber: activity.entityNumber,
+						createdAt: activity.createdAt,
 					}));
 				}),
 			),
 			{ concurrency: "unbounded" },
 		);
 
-		const recentActivity = allRecentActivity
+		const rangedActivity = allRecentActivityByRepo
 			.flat()
-			.sort((a, b) => b.createdAt - a.createdAt)
-			.slice(0, 20);
+			.filter((activity) => activity.createdAt >= rangeStart)
+			.sort((a, b) => b.createdAt - a.createdAt);
 
-		// Strip internal fields before returning (assigneeLogins, requestedReviewerLogins
-		// are used for filtering but not exposed in DashboardPrItem)
+		const recentActivity = rangedActivity.slice(0, 24);
+
+		const dayBuckets = new Map<
+			number,
+			{
+				dayStart: number;
+				dayLabel: string;
+				closedPrCount: number;
+				closedIssueCount: number;
+				pushCount: number;
+			}
+		>();
+
+		for (let dayOffset = rangeDays - 1; dayOffset >= 0; dayOffset -= 1) {
+			const date = new Date(now - dayOffset * 24 * 60 * 60 * 1000);
+			date.setHours(0, 0, 0, 0);
+			const dayStart = date.getTime();
+			dayBuckets.set(dayStart, {
+				dayStart,
+				dayLabel: date.toLocaleDateString(undefined, {
+					month: "short",
+					day: "numeric",
+				}),
+				closedPrCount: 0,
+				closedIssueCount: 0,
+				pushCount: 0,
+			});
+		}
+
+		for (const activity of rangedActivity) {
+			const date = new Date(activity.createdAt);
+			date.setHours(0, 0, 0, 0);
+			const dayStart = date.getTime();
+			const bucket = dayBuckets.get(dayStart);
+			if (bucket === undefined) continue;
+			if (activity.activityType === "pr.closed") {
+				bucket.closedPrCount += 1;
+			}
+			if (activity.activityType === "issue.closed") {
+				bucket.closedIssueCount += 1;
+			}
+			if (activity.activityType === "push") {
+				bucket.pushCount += 1;
+			}
+		}
+
+		const throughput = [...dayBuckets.values()].sort(
+			(a, b) => a.dayStart - b.dayStart,
+		);
+
+		const workloadByOwnerMap = new Map<
+			string,
+			{
+				ownerLogin: string;
+				openPrCount: number;
+				reviewRequestedCount: number;
+				failingPrCount: number;
+				stalePrCount: number;
+			}
+		>();
+
+		for (const pr of allPrs) {
+			const existing = workloadByOwnerMap.get(pr.ownerLogin);
+			if (existing !== undefined) {
+				existing.openPrCount += 1;
+				existing.reviewRequestedCount += pr.requestedReviewerCount > 0 ? 1 : 0;
+				existing.failingPrCount += pr.lastCheckConclusion === "failure" ? 1 : 0;
+				existing.stalePrCount += pr.isStale ? 1 : 0;
+				continue;
+			}
+
+			workloadByOwnerMap.set(pr.ownerLogin, {
+				ownerLogin: pr.ownerLogin,
+				openPrCount: 1,
+				reviewRequestedCount: pr.requestedReviewerCount > 0 ? 1 : 0,
+				failingPrCount: pr.lastCheckConclusion === "failure" ? 1 : 0,
+				stalePrCount: pr.isStale ? 1 : 0,
+			});
+		}
+
+		const workloadByOwner = [...workloadByOwnerMap.values()].sort((a, b) => {
+			if (a.failingPrCount !== b.failingPrCount) {
+				return b.failingPrCount - a.failingPrCount;
+			}
+			if (a.reviewRequestedCount !== b.reviewRequestedCount) {
+				return b.reviewRequestedCount - a.reviewRequestedCount;
+			}
+			if (a.openPrCount !== b.openPrCount) {
+				return b.openPrCount - a.openPrCount;
+			}
+			return a.ownerLogin.localeCompare(b.ownerLogin);
+		});
+
+		const blockedItems: Array<{
+			type: "ci_failure" | "stale_pr" | "review_queue";
+			ownerLogin: string;
+			repoName: string;
+			number: number;
+			title: string;
+			reason: string;
+			githubUpdatedAt: number;
+		}> = [];
+		const blockedItemKeys = new Set<string>();
+
+		const addBlocked = (
+			type: "ci_failure" | "stale_pr" | "review_queue",
+			reason: string,
+			prs: ReadonlyArray<(typeof allPrs)[number]>,
+		) => {
+			for (const pr of prs) {
+				const key = `${pr.ownerLogin}/${pr.repoName}#${pr.number}`;
+				if (blockedItemKeys.has(key)) continue;
+				blockedItemKeys.add(key);
+				blockedItems.push({
+					type,
+					ownerLogin: pr.ownerLogin,
+					repoName: pr.repoName,
+					number: pr.number,
+					title: pr.title,
+					reason,
+					githubUpdatedAt: pr.githubUpdatedAt,
+				});
+				if (blockedItems.length >= 24) return;
+			}
+		};
+
+		addBlocked("ci_failure", "Check suite is failing", failingPrs.slice(0, 12));
+		addBlocked(
+			"review_queue",
+			"Waiting for review",
+			reviewQueuePrs.slice(0, 12),
+		);
+		addBlocked("stale_pr", "No updates in 3+ days", stalePrs.slice(0, 12));
+
+		blockedItems.sort((a, b) => b.githubUpdatedAt - a.githubUpdatedAt);
+
+		const portfolioPrs = [...allPrs]
+			.sort((a, b) => {
+				const levelDelta = attentionWeight(b) - attentionWeight(a);
+				if (levelDelta !== 0) return levelDelta;
+				return b.githubUpdatedAt - a.githubUpdatedAt;
+			})
+			.slice(0, 120)
+			.map((pr) => ({
+				ownerLogin: pr.ownerLogin,
+				repoName: pr.repoName,
+				number: pr.number,
+				state: pr.state,
+				draft: pr.draft,
+				title: pr.title,
+				authorLogin: pr.authorLogin,
+				authorAvatarUrl: pr.authorAvatarUrl,
+				commentCount: pr.commentCount,
+				lastCheckConclusion: pr.lastCheckConclusion,
+				failingCheckNames: pr.failingCheckNames,
+				githubUpdatedAt: pr.githubUpdatedAt,
+				assigneeCount: pr.assigneeCount,
+				requestedReviewerCount: pr.requestedReviewerCount,
+				attentionLevel: pr.attentionLevel,
+				attentionReason: pr.attentionReason,
+				isViewerAuthor: pr.isViewerAuthor,
+				isViewerReviewer: pr.isViewerReviewer,
+				isViewerAssignee: pr.isViewerAssignee,
+				isStale: pr.isStale,
+			}));
+
 		const toDashboardPr = (pr: (typeof allPrs)[number]) => ({
 			ownerLogin: pr.ownerLogin,
 			repoName: pr.repoName,
@@ -1685,15 +2337,42 @@ getHomeDashboardDef.implement(() =>
 			authorAvatarUrl: pr.authorAvatarUrl,
 			commentCount: pr.commentCount,
 			lastCheckConclusion: pr.lastCheckConclusion,
+			failingCheckNames: pr.failingCheckNames,
 			githubUpdatedAt: pr.githubUpdatedAt,
 		});
 
+		const summary = {
+			repoCount: repos.length,
+			openPrCount: repos.reduce((sum, repo) => sum + repo.openPrCount, 0),
+			openIssueCount: repos.reduce((sum, repo) => sum + repo.openIssueCount, 0),
+			failingCheckCount: repos.reduce(
+				(sum, repo) => sum + repo.failingCheckCount,
+				0,
+			),
+			attentionCount: prioritizedAttention.length,
+			reviewQueueCount: reviewQueuePrs.length,
+			stalePrCount: stalePrs.length,
+		};
+
 		return {
+			scope,
+			rangeDays,
+			ownerFilter,
+			repoFilter,
 			githubLogin,
+			yourOwners,
+			availableOwners,
+			availableRepos,
+			summary,
 			yourPrs: yourPrs.map(toDashboardPr),
 			needsAttentionPrs: needsAttentionPrs.map(toDashboardPr),
 			recentPrs: recentPrs.map(toDashboardPr),
+			recentIssues,
+			portfolioPrs,
 			recentActivity,
+			throughput,
+			workloadByOwner,
+			blockedItems,
 			repos,
 		};
 	}),
@@ -2203,13 +2882,9 @@ requestPrFileSyncDef.implement((args) =>
 		if (Option.isSome(existingFile)) return { scheduled: false };
 
 		// 4. No files cached — schedule a background sync
-		// Use the signed-in user's token if available, otherwise fall back to installation token
-		const connectedByUserId = Option.isSome(identity)
-			? identity.value.subject
-			: (repo.value.connectedByUserId ?? null);
 		const installationId = repo.value.installationId;
 
-		if (!connectedByUserId && installationId <= 0) return { scheduled: false };
+		if (installationId <= 0) return { scheduled: false };
 
 		yield* Effect.promise(() =>
 			ctx.scheduler.runAfter(0, internal.rpc.githubActions.syncPrFiles, {
@@ -2218,7 +2893,6 @@ requestPrFileSyncDef.implement((args) =>
 				repositoryId,
 				pullRequestNumber: args.number,
 				headSha,
-				connectedByUserId,
 				installationId,
 			}),
 		);
@@ -2677,7 +3351,7 @@ const projectionQueriesModule = makeRpcModule(
 		listRepoLabels: listRepoLabelsDef,
 		listRepoAssignees: listRepoAssigneesDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const {

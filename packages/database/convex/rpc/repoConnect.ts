@@ -2,7 +2,7 @@ import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
 import { Effect, Option, Schema } from "effect";
 import { internal } from "../_generated/api";
 import { ConfectMutationCtx, confectSchema } from "../confect";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -56,6 +56,8 @@ const connectRepoDef = factory.internalMutation({
 		visibility: Schema.Literal("public", "private", "internal"),
 		/** Is private? */
 		isPrivate: Schema.Boolean,
+		/** Current GitHub stargazer count, when known. */
+		stargazersCount: Schema.optional(Schema.Number),
 		/** The better-auth user ID of whoever connected this repo. */
 		connectedByUserId: Schema.NullOr(Schema.String),
 	},
@@ -139,6 +141,7 @@ connectRepoDef.implement((args) =>
 			githubUpdatedAt: now,
 			cachedAt: now,
 			connectedByUserId: args.connectedByUserId,
+			stargazersCount: args.stargazersCount ?? 0,
 		});
 
 		// Create sync job (with dedup lockKey)
@@ -214,7 +217,7 @@ const repoConnectModule = makeRpcModule(
 	{
 		connectRepo: connectRepoDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const { connectRepo } = repoConnectModule.handlers;

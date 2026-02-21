@@ -12,7 +12,7 @@
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
 import { Schema } from "effect";
 import { confectSchema } from "../confect";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -32,8 +32,8 @@ export const bootstrapRepoDef = factory.internalAction({
 		githubRepoId: Schema.Number,
 		fullName: Schema.String,
 		lockKey: Schema.String,
-		/** better-auth user ID whose GitHub OAuth token should be used. */
-		connectedByUserId: Schema.String,
+		/** GitHub App installation ID used for background sync. */
+		installationId: Schema.Number,
 	},
 	success: Schema.Struct({
 		branches: Schema.Number,
@@ -53,7 +53,7 @@ const repoBootstrapModule = makeRpcModule(
 	{
 		bootstrapRepo: bootstrapRepoDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const { bootstrapRepo } = repoBootstrapModule.handlers;

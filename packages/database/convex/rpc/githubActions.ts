@@ -9,10 +9,16 @@ import {
 	ConfectQueryCtx,
 	confectSchema,
 } from "../confect";
+import { toStringOrNull as str, toNumberOrNull } from "../shared/coerce";
 import { GitHubApiClient, type IGitHubApiClient } from "../shared/githubApi";
 import { getInstallationToken } from "../shared/githubApp";
 import { lookupGitHubTokenByUserIdConfect } from "../shared/githubToken";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
+import {
+	RepoPullByNameMiddleware,
+	RepoPushByNameMiddleware,
+	RepoTriageByIdMiddleware,
+} from "./security";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -83,14 +89,16 @@ const PR_FILE_STATUS = [
 ] as const;
 type PrFileStatus = (typeof PR_FILE_STATUS)[number];
 
+const isPrFileStatus = (value: string): value is PrFileStatus =>
+	PR_FILE_STATUS.some((status) => status === value);
+
 const toPrFileStatus = (v: unknown): PrFileStatus => {
 	const s = typeof v === "string" ? v : "";
-	if (PR_FILE_STATUS.includes(s as PrFileStatus)) return s as PrFileStatus;
+	if (isPrFileStatus(s)) return s;
 	return "changed";
 };
 
-const num = (v: unknown): number => (typeof v === "number" ? v : 0);
-const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+const num = (v: unknown): number => toNumberOrNull(v) ?? 0;
 
 const GitHubAccountSchema = Schema.Struct({
 	accountId: Schema.String,
@@ -154,97 +162,109 @@ class ActionsControlError extends Schema.TaggedError<ActionsControlError>()(
  * Re-run an entire workflow run.
  * POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun
  */
-const rerunWorkflowRunDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		githubRunId: Schema.Number,
-	},
-	success: Schema.Struct({ accepted: Schema.Boolean }),
-	error: Schema.Union(NotAuthenticated, ActionsControlError),
-});
+const rerunWorkflowRunDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			githubRunId: Schema.Number,
+		},
+		success: Schema.Struct({ accepted: Schema.Boolean }),
+		error: Schema.Union(NotAuthenticated, ActionsControlError),
+	})
+	.middleware(RepoPushByNameMiddleware);
 
 /**
  * Re-run only failed jobs in a workflow run.
  * POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs
  */
-const rerunFailedJobsDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		githubRunId: Schema.Number,
-	},
-	success: Schema.Struct({ accepted: Schema.Boolean }),
-	error: Schema.Union(NotAuthenticated, ActionsControlError),
-});
+const rerunFailedJobsDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			githubRunId: Schema.Number,
+		},
+		success: Schema.Struct({ accepted: Schema.Boolean }),
+		error: Schema.Union(NotAuthenticated, ActionsControlError),
+	})
+	.middleware(RepoPushByNameMiddleware);
 
 /**
  * Cancel a workflow run.
  * POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel
  */
-const cancelWorkflowRunDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		githubRunId: Schema.Number,
-	},
-	success: Schema.Struct({ accepted: Schema.Boolean }),
-	error: Schema.Union(NotAuthenticated, ActionsControlError),
-});
+const cancelWorkflowRunDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			githubRunId: Schema.Number,
+		},
+		success: Schema.Struct({ accepted: Schema.Boolean }),
+		error: Schema.Union(NotAuthenticated, ActionsControlError),
+	})
+	.middleware(RepoPushByNameMiddleware);
 
 /**
  * Trigger a workflow via workflow_dispatch.
  * POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches
  */
-const dispatchWorkflowDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		workflowId: Schema.Number,
-		ref: Schema.String,
-	},
-	success: Schema.Struct({ accepted: Schema.Boolean }),
-	error: Schema.Union(NotAuthenticated, ActionsControlError),
-});
+const dispatchWorkflowDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			workflowId: Schema.Number,
+			ref: Schema.String,
+		},
+		success: Schema.Struct({ accepted: Schema.Boolean }),
+		error: Schema.Union(NotAuthenticated, ActionsControlError),
+	})
+	.middleware(RepoPushByNameMiddleware);
 
 const PullRequestCommentSideSchema = Schema.Literal("LEFT", "RIGHT");
 
-const createPrReviewCommentDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		repositoryId: Schema.Number,
-		prNumber: Schema.Number,
-		commitSha: Schema.optional(Schema.String),
-		body: Schema.String,
-		path: Schema.String,
-		line: Schema.Number,
-		side: PullRequestCommentSideSchema,
-		startLine: Schema.optional(Schema.Number),
-		startSide: Schema.optional(PullRequestCommentSideSchema),
-	},
-	success: Schema.Struct({
-		accepted: Schema.Boolean,
-		githubReviewCommentId: Schema.Number,
-	}),
-	error: Schema.Union(NotAuthenticated, ActionsControlError),
-});
+const createPrReviewCommentDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			repositoryId: Schema.Number,
+			prNumber: Schema.Number,
+			commitSha: Schema.optional(Schema.String),
+			body: Schema.String,
+			path: Schema.String,
+			line: Schema.Number,
+			side: PullRequestCommentSideSchema,
+			startLine: Schema.optional(Schema.Number),
+			startSide: Schema.optional(PullRequestCommentSideSchema),
+		},
+		success: Schema.Struct({
+			accepted: Schema.Boolean,
+			githubReviewCommentId: Schema.Number,
+		}),
+		error: Schema.Union(NotAuthenticated, ActionsControlError),
+	})
+	.middleware(RepoTriageByIdMiddleware);
 
-const createPrReviewCommentReplyDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		repositoryId: Schema.Number,
-		prNumber: Schema.Number,
-		inReplyToGithubReviewCommentId: Schema.Number,
-		body: Schema.String,
-	},
-	success: Schema.Struct({
-		accepted: Schema.Boolean,
-		githubReviewCommentId: Schema.Number,
-	}),
-	error: Schema.Union(NotAuthenticated, ActionsControlError),
-});
+const createPrReviewCommentReplyDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			repositoryId: Schema.Number,
+			prNumber: Schema.Number,
+			inReplyToGithubReviewCommentId: Schema.Number,
+			body: Schema.String,
+		},
+		success: Schema.Struct({
+			accepted: Schema.Boolean,
+			githubReviewCommentId: Schema.Number,
+		}),
+		error: Schema.Union(NotAuthenticated, ActionsControlError),
+	})
+	.middleware(RepoTriageByIdMiddleware);
 
 const GitHubReviewCommentResponseSchema = Schema.Struct({
 	id: Schema.Number,
@@ -275,14 +295,16 @@ const GitHubReviewCommentResponseSchema = Schema.Struct({
  * Fetch the unified diff for a pull request from the GitHub API.
  * Returns raw unified diff text (or null on 404/error).
  */
-const fetchPrDiffDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		number: Schema.Number,
-	},
-	success: Schema.NullOr(Schema.String),
-});
+const fetchPrDiffDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			number: Schema.Number,
+		},
+		success: Schema.NullOr(Schema.String),
+	})
+	.middleware(RepoPullByNameMiddleware);
 
 /**
  * Fetch workflow job logs on demand from GitHub.
@@ -290,19 +312,21 @@ const fetchPrDiffDef = factory.action({
  * Uses the signed-in user's OAuth token and returns log text directly.
  * Returns null when logs are unavailable or the user cannot access them.
  */
-const fetchWorkflowJobLogsDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		jobId: Schema.Number,
-	},
-	success: Schema.NullOr(
-		Schema.Struct({
-			log: Schema.String,
-			truncated: Schema.Boolean,
-		}),
-	),
-});
+const fetchWorkflowJobLogsDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			jobId: Schema.Number,
+		},
+		success: Schema.NullOr(
+			Schema.Struct({
+				log: Schema.String,
+				truncated: Schema.Boolean,
+			}),
+		),
+	})
+	.middleware(RepoPullByNameMiddleware);
 
 const RepoAssigneeSchema = Schema.Struct({
 	login: Schema.String,
@@ -363,14 +387,16 @@ query ListRepoAssignees($owner: String!, $name: String!, $query: String!, $after
  * GraphQL `repository.assignableUsers(query:, first:, after:)` to support
  * repositories where assignees are not yet represented in local projections.
  */
-const listRepoAssigneesDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		query: Schema.optional(Schema.String),
-	},
-	success: Schema.Array(RepoAssigneeListItemSchema),
-});
+const listRepoAssigneesDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			query: Schema.optional(Schema.String),
+		},
+		success: Schema.Array(RepoAssigneeListItemSchema),
+	})
+	.middleware(RepoPullByNameMiddleware);
 
 /**
  * Fetch PR file list from GitHub and persist to Convex.
@@ -390,9 +416,7 @@ const syncPrFilesDef = factory.internalAction({
 		repositoryId: Schema.Number,
 		pullRequestNumber: Schema.Number,
 		headSha: Schema.String,
-		/** better-auth user ID whose GitHub OAuth token should be used. Null for App-installed repos. */
-		connectedByUserId: Schema.NullOr(Schema.String),
-		/** GitHub App installation ID for fallback token resolution. */
+		/** GitHub App installation ID for token resolution. */
 		installationId: Schema.Number,
 	},
 	success: Schema.Struct({
@@ -1310,18 +1334,11 @@ syncPrFilesDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectActionCtx;
 
-		// Resolve the GitHub token — try user OAuth first, fall back to installation token
-		let token: string;
-		if (args.connectedByUserId) {
-			token = yield* lookupGitHubTokenByUserIdConfect(
-				ctx.runQuery,
-				args.connectedByUserId,
-			);
-		} else if (args.installationId > 0) {
-			token = yield* getInstallationToken(args.installationId);
-		} else {
+		if (args.installationId <= 0) {
 			return { fileCount: 0, truncatedPatches: 0 };
 		}
+
+		const token = yield* getInstallationToken(args.installationId);
 		const gh = yield* Effect.provide(
 			GitHubApiClient,
 			GitHubApiClient.fromToken(token),
@@ -1478,7 +1495,7 @@ const githubActionsModule = makeRpcModule(
 		createPrReviewComment: createPrReviewCommentDef,
 		createPrReviewCommentReply: createPrReviewCommentReplyDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const {

@@ -1,5 +1,13 @@
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
-import { Effect, Match, Option, Schema } from "effect";
+import {
+	Array as Arr,
+	Effect,
+	Either,
+	Match,
+	Option,
+	Predicate,
+	Schema,
+} from "effect";
 import { components, internal } from "../_generated/api";
 import { ConfectMutationCtx, ConfectQueryCtx, confectSchema } from "../confect";
 import {
@@ -20,8 +28,16 @@ import {
 	syncWebhookReplace,
 } from "../shared/aggregateSync";
 import { webhooksByState } from "../shared/aggregates";
+import {
+	toTrueBoolean as bool,
+	toNumberOrNull as num,
+	toObjectRecord as obj,
+	toStringOrNull as str,
+	toOpenClosedState,
+} from "../shared/coerce";
 import { appendActivityFeedEntry } from "../shared/projections";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { parseIsoToMsOrNull as isoToMs } from "../shared/time";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -29,29 +45,52 @@ const factory = createRpcFactory({ schema: confectSchema });
 // Helpers — extract typed fields from untyped payloads
 // ---------------------------------------------------------------------------
 
-const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
-const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
-const bool = (v: unknown): boolean => v === true;
-const isoToMs = (v: unknown): number | null => {
-	if (typeof v !== "string") return null;
-	const ms = new Date(v).getTime();
-	return Number.isNaN(ms) ? null : ms;
+const WebhookUserSchema = Schema.Struct({
+	id: Schema.Number,
+	login: Schema.String,
+	avatar_url: Schema.optional(Schema.NullOr(Schema.String)),
+	site_admin: Schema.optional(Schema.Boolean),
+	type: Schema.optional(Schema.Literal("User", "Bot", "Organization")),
+});
+
+const decodeWebhookUser = Schema.decodeUnknownEither(WebhookUserSchema);
+
+const InstallationRepositorySchema = Schema.Struct({
+	id: Schema.Number,
+	full_name: Schema.String,
+	private: Schema.Boolean,
+	default_branch: Schema.optional(Schema.String),
+	stargazers_count: Schema.optional(Schema.Number),
+});
+
+const decodeInstallationRepository = Schema.decodeUnknownEither(
+	InstallationRepositorySchema,
+);
+
+type InstallationRepository = Schema.Schema.Type<
+	typeof InstallationRepositorySchema
+>;
+
+const parseInstallationRepositories = <A>(
+	value: A,
+): Array<InstallationRepository> => {
+	if (!Array.isArray(value)) return [];
+	const parsed: Array<InstallationRepository> = [];
+	for (const entry of value) {
+		const decoded = decodeInstallationRepository(entry);
+		if (Either.isRight(decoded)) {
+			parsed.push(decoded.right);
+		}
+	}
+	return parsed;
 };
-
-const obj = (v: unknown): Record<string, unknown> =>
-	v !== null && v !== undefined && typeof v === "object"
-		? (v as Record<string, unknown>)
-		: {};
-
-const userType = (v: unknown): "User" | "Bot" | "Organization" =>
-	v === "Bot" ? "Bot" : v === "Organization" ? "Organization" : "User";
 
 /**
  * Extract a GitHub user object from a payload field.
  * Returns { githubUserId, login, avatarUrl, siteAdmin, type } or null.
  */
-const extractUser = (
-	u: unknown,
+const extractUser = <A>(
+	u: A,
 ): {
 	githubUserId: number;
 	login: string;
@@ -59,26 +98,15 @@ const extractUser = (
 	siteAdmin: boolean;
 	type: "User" | "Bot" | "Organization";
 } | null => {
-	if (
-		u !== null &&
-		u !== undefined &&
-		typeof u === "object" &&
-		"id" in u &&
-		"login" in u
-	) {
-		const id = num(u.id);
-		const login = str(u.login);
-		if (id !== null && login !== null) {
-			return {
-				githubUserId: id,
-				login,
-				avatarUrl: "avatar_url" in u ? str(u.avatar_url) : null,
-				siteAdmin: "site_admin" in u ? bool(u.site_admin) : false,
-				type: "type" in u ? userType(u.type) : "User",
-			};
-		}
-	}
-	return null;
+	const decoded = decodeWebhookUser(u);
+	if (Either.isLeft(decoded)) return null;
+	return {
+		githubUserId: decoded.right.id,
+		login: decoded.right.login,
+		avatarUrl: decoded.right.avatar_url ?? null,
+		siteAdmin: decoded.right.site_admin ?? false,
+		type: decoded.right.type ?? "User",
+	};
 };
 
 // ---------------------------------------------------------------------------
@@ -138,22 +166,24 @@ const handleIssuesEvent = (
 
 		// Extract labels
 		const labels = Array.isArray(issue.labels)
-			? issue.labels
-					.map((l: unknown) => {
-						const label = obj(l);
+			? Arr.filter(
+					Arr.map(issue.labels, (labelInput) => {
+						const label = obj(labelInput);
 						return str(label.name);
-					})
-					.filter((n: string | null): n is string => n !== null)
+					}),
+					Predicate.isNotNull,
+				)
 			: [];
 
 		// Extract assignee IDs
 		const assigneeUserIds = Array.isArray(issue.assignees)
-			? issue.assignees
-					.map((a: unknown) => {
-						const user = extractUser(a);
+			? Arr.filter(
+					Arr.map(issue.assignees, (assigneeInput) => {
+						const user = extractUser(assigneeInput);
 						return user?.githubUserId ?? null;
-					})
-					.filter((id: number | null): id is number => id !== null)
+					}),
+					Predicate.isNotNull,
+				)
 			: [];
 
 		const githubUpdatedAt = isoToMs(issue.updated_at) ?? now;
@@ -162,7 +192,7 @@ const handleIssuesEvent = (
 			repositoryId,
 			githubIssueId,
 			number: issueNumber,
-			state: (issue.state === "open" ? "open" : "closed") as "open" | "closed",
+			state: toOpenClosedState(str(issue.state)),
 			title: str(issue.title) ?? "",
 			body: str(issue.body),
 			authorUserId: authorUser?.githubUserId ?? null,
@@ -255,22 +285,24 @@ const handlePullRequestEvent = (
 
 		// Extract assignee IDs
 		const assigneeUserIds = Array.isArray(pr.assignees)
-			? pr.assignees
-					.map((a: unknown) => {
-						const user = extractUser(a);
+			? Arr.filter(
+					Arr.map(pr.assignees, (assigneeInput) => {
+						const user = extractUser(assigneeInput);
 						return user?.githubUserId ?? null;
-					})
-					.filter((id: number | null): id is number => id !== null)
+					}),
+					Predicate.isNotNull,
+				)
 			: [];
 
 		// Extract requested reviewer IDs
 		const requestedReviewerUserIds = Array.isArray(pr.requested_reviewers)
-			? pr.requested_reviewers
-					.map((r: unknown) => {
-						const user = extractUser(r);
+			? Arr.filter(
+					Arr.map(pr.requested_reviewers, (reviewerInput) => {
+						const user = extractUser(reviewerInput);
 						return user?.githubUserId ?? null;
-					})
-					.filter((id: number | null): id is number => id !== null)
+					}),
+					Predicate.isNotNull,
+				)
 			: [];
 
 		const githubUpdatedAt = isoToMs(pr.updated_at) ?? now;
@@ -279,7 +311,7 @@ const handlePullRequestEvent = (
 			repositoryId,
 			githubPrId,
 			number: prNumber,
-			state: (pr.state === "open" ? "open" : "closed") as "open" | "closed",
+			state: toOpenClosedState(str(pr.state)),
 			draft: bool(pr.draft),
 			title: str(pr.title) ?? "",
 			body: str(pr.body),
@@ -501,10 +533,6 @@ const handlePushEvent = (
 			const c = obj(rawCommit);
 			const sha = str(c.id);
 			if (!sha) continue;
-
-			// Extract author/committer user IDs from the commit
-			const authorObj = obj(c.author);
-			const committerObj = obj(c.committer);
 
 			// Push webhook commit authors don't have full user objects with IDs
 			// They have name, email, username fields instead
@@ -967,9 +995,7 @@ const handleInstallationEvent = (
 		const accountLogin = str(account.login) ?? "unknown";
 		const accountId = num(account.id) ?? 0;
 		const accountType =
-			str(account.type) === "Organization"
-				? ("Organization" as const)
-				: ("User" as const);
+			str(account.type) === "Organization" ? "Organization" : "User";
 
 		if (eventName === "installation") {
 			const existing = yield* ctx.db
@@ -1023,6 +1049,12 @@ const handleInstallationEvent = (
 					console.info(
 						`[webhookProcessor] Upgraded placeholder installation for ${accountLogin} -> ${installationId}`,
 					);
+
+					// Placeholder repos were upgraded — sync permissions for the
+					// installer so they appear in the sidebar immediately.
+					yield* scheduleInstallationPermissionSync(payload).pipe(
+						Effect.ignoreLogged,
+					);
 				} else if (Option.isNone(existing)) {
 					yield* ctx.db.insert("github_installations", {
 						installationId,
@@ -1067,12 +1099,12 @@ const handleInstallationEvent = (
 
 		if (eventName === "installation_repositories") {
 			// Repos added to the installation
-			const added = Array.isArray(payload.repositories_added)
-				? (payload.repositories_added as Array<Record<string, unknown>>)
-				: [];
+			const added = parseInstallationRepositories(payload.repositories_added);
+			let newRepoCount = 0;
 			for (const repo of added) {
 				const githubRepoId = num(repo.id);
 				const fullName = str(repo.full_name);
+				const stargazersCount = num(repo.stargazers_count);
 				if (githubRepoId === null || fullName === null) continue;
 
 				const parts = fullName.split("/");
@@ -1088,6 +1120,7 @@ const handleInstallationEvent = (
 				const isNewRepo = Option.isNone(existingRepo);
 
 				if (isNewRepo) {
+					newRepoCount += 1;
 					yield* ctx.db.insert("github_repositories", {
 						githubRepoId,
 						installationId,
@@ -1097,7 +1130,7 @@ const handleInstallationEvent = (
 						fullName,
 						private: bool(repo.private),
 						visibility: bool(repo.private) ? "private" : "public",
-						defaultBranch: str(repo.default_branch) ?? "main",
+						defaultBranch: repo.default_branch ?? "main",
 						archived: false,
 						disabled: false,
 						fork: false,
@@ -1105,6 +1138,7 @@ const handleInstallationEvent = (
 						githubUpdatedAt: now,
 						cachedAt: now,
 						connectedByUserId: null,
+						stargazersCount: stargazersCount ?? 0,
 					});
 
 					// Create sync job + start bootstrap workflow for the new repo.
@@ -1117,14 +1151,14 @@ const handleInstallationEvent = (
 
 					if (Option.isNone(existingJob)) {
 						yield* ctx.db.insert("github_sync_jobs", {
-							jobType: "backfill" as const,
-							scopeType: "repository" as const,
-							triggerReason: "install" as const,
+							jobType: "backfill",
+							scopeType: "repository",
+							triggerReason: "install",
 							lockKey,
 							installationId,
 							repositoryId: githubRepoId,
 							entityType: null,
-							state: "pending" as const,
+							state: "pending",
 							attemptCount: 0,
 							nextRunAt: now,
 							lastError: null,
@@ -1147,17 +1181,33 @@ const handleInstallationEvent = (
 						);
 					}
 				} else {
-					yield* ctx.db.patch(existingRepo.value._id, {
-						installationId,
-						cachedAt: now,
-					});
+					if (stargazersCount === null) {
+						yield* ctx.db.patch(existingRepo.value._id, {
+							installationId,
+							cachedAt: now,
+						});
+					} else {
+						yield* ctx.db.patch(existingRepo.value._id, {
+							installationId,
+							cachedAt: now,
+							stargazersCount,
+						});
+					}
 				}
 			}
 
+			// When new repos are added, sync permissions for the user who
+			// triggered the installation so their sidebar updates immediately.
+			if (newRepoCount > 0) {
+				yield* scheduleInstallationPermissionSync(payload).pipe(
+					Effect.ignoreLogged,
+				);
+			}
+
 			// Repos removed from the installation
-			const removed = Array.isArray(payload.repositories_removed)
-				? (payload.repositories_removed as Array<Record<string, unknown>>)
-				: [];
+			const removed = parseInstallationRepositories(
+				payload.repositories_removed,
+			);
 			for (const repo of removed) {
 				const githubRepoId = num(repo.id);
 				if (githubRepoId === null) continue;
@@ -1498,19 +1548,15 @@ const schedulePrFileSync = (
 		const ownerLogin = parts[0];
 		const name = parts[1];
 
-		// Look up the repo's connectedByUserId and installationId for token resolution
+		// Look up the repo installation for token resolution
 		const repoDoc = yield* ctx.db
 			.query("github_repositories")
 			.withIndex("by_githubRepoId", (q) => q.eq("githubRepoId", repositoryId))
 			.first();
-		const connectedByUserId = Option.isSome(repoDoc)
-			? (repoDoc.value.connectedByUserId ?? null)
-			: null;
 		const installationId = Option.isSome(repoDoc)
 			? repoDoc.value.installationId
 			: 0;
-		// Need at least one token source
-		if (!connectedByUserId && installationId <= 0) return;
+		if (installationId <= 0) return;
 
 		yield* Effect.promise(() =>
 			ctx.scheduler.runAfter(0, internal.rpc.githubActions.syncPrFiles, {
@@ -1519,7 +1565,6 @@ const schedulePrFileSync = (
 				repositoryId,
 				pullRequestNumber: prNumber,
 				headSha,
-				connectedByUserId,
 				installationId,
 			}),
 		);
@@ -1563,6 +1608,49 @@ const scheduleMemberPermissionSync = (
 						userId: account.userId,
 					},
 				),
+			);
+		}
+	});
+
+/**
+ * After repos are added via an installation webhook, sync permissions for the
+ * user who triggered the installation (the `sender` in the webhook payload).
+ *
+ * This closes the race condition where a user signs in *before* installing the
+ * GitHub App: their initial permission sync finds no repos, and without this
+ * trigger there is nothing to re-sync once the repos are created.
+ */
+const scheduleInstallationPermissionSync = (payload: Record<string, unknown>) =>
+	Effect.gen(function* () {
+		const sender = extractUser(payload.sender);
+		if (sender === null) return;
+
+		const ctx = yield* ConfectMutationCtx;
+		const account = yield* ctx.runQuery(components.betterAuth.adapter.findOne, {
+			model: "account",
+			where: [
+				{ field: "providerId", value: "github" },
+				{ field: "accountId", value: String(sender.githubUserId) },
+			],
+		});
+
+		if (
+			account !== null &&
+			typeof account === "object" &&
+			"userId" in account &&
+			typeof account.userId === "string"
+		) {
+			yield* Effect.promise(() =>
+				ctx.scheduler.runAfter(
+					0,
+					internal.rpc.githubActions.syncUserPermissions,
+					{
+						userId: account.userId,
+					},
+				),
+			);
+			console.info(
+				`[webhookProcessor] Scheduled permission sync for user ${account.userId} after installation change`,
 			);
 		}
 	});
@@ -1958,7 +2046,7 @@ const webhookProcessorModule = makeRpcModule(
 		promoteRetryEvents: promoteRetryEventsDef,
 		getQueueHealth: getQueueHealthDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const {

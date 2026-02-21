@@ -7,7 +7,7 @@ import {
 	prsByRepo,
 	webhooksByState,
 } from "../shared/aggregates";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -434,7 +434,7 @@ const adminModule = makeRpcModule(
 		systemStatus: systemStatusDef,
 		patchRepoConnectedUser: patchRepoConnectedUserDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const {

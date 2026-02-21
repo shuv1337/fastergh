@@ -22,19 +22,15 @@ import { Effect } from "effect";
 import { internal } from "../_generated/api";
 import type { ActionCtx } from "../_generated/server";
 import { internalAction } from "../_generated/server";
+import { toOpenClosedState } from "../shared/coerce";
 import type { Issue, SimpleUser } from "../shared/generated_github_client";
 import { GitHubApiClient } from "../shared/githubApi";
 import { resolveRepoToken } from "../shared/githubToken";
+import { parseIsoToMsOrNull as isoToMs } from "../shared/time";
 
 // ---------------------------------------------------------------------------
 // GitHub response parsing helpers
 // ---------------------------------------------------------------------------
-
-const isoToMs = (v: string | null | undefined): number | null => {
-	if (v == null) return null;
-	const ms = new Date(v).getTime();
-	return Number.isNaN(ms) ? null : ms;
-};
 
 // ---------------------------------------------------------------------------
 // Shared user collector
@@ -87,8 +83,9 @@ const createUserCollector = () => {
 
 /**
  * Auth args passed to every bootstrap step.
- * Either `connectedByUserId` (user OAuth token) or `installationId` (App token)
- * or both — `resolveRepoToken` tries user first, then falls back to App.
+ * Background sync resolves tokens from GitHub App installation IDs.
+ * `connectedByUserId` remains for payload compatibility with existing workflow
+ * records and call sites.
  */
 type TokenArgs = {
 	connectedByUserId: string | null;
@@ -162,8 +159,8 @@ const PAGES_PER_CHUNK = 10;
 
 /**
  * Common Convex validator args for token resolution.
- * Every step accepts these so the workflow can pass either a user token
- * or an installation token (or both — the resolver tries user first).
+ * Every step accepts these to keep workflow payload compatibility.
+ * Runtime token resolution uses installationId.
  */
 const tokenArgs = {
 	connectedByUserId: v.union(v.string(), v.null()),
@@ -281,17 +278,17 @@ export const fetchPullRequestsChunk = internalAction({
 				return {
 					githubPrId: pr.id,
 					number: pr.number,
-					state: (pr.state === "open" ? "open" : "closed") as "open" | "closed",
+					state: toOpenClosedState(pr.state),
 					draft: pr.draft ?? false,
 					title: pr.title,
 					body: pr.body,
 					authorUserId,
-					assigneeUserIds: [] as Array<number>,
-					requestedReviewerUserIds: [] as Array<number>,
+					assigneeUserIds: [],
+					requestedReviewerUserIds: [],
 					baseRefName: pr.base.ref,
 					headRefName: pr.head.ref,
 					headSha: pr.head.sha,
-					mergeableState: null as string | null,
+					mergeableState: null,
 					mergedAt: isoToMs(pr.merged_at),
 					closedAt: isoToMs(pr.closed_at),
 					githubUpdatedAt: isoToMs(pr.updated_at) ?? Date.now(),
@@ -400,13 +397,11 @@ export const fetchIssuesChunk = internalAction({
 					return {
 						githubIssueId: issue.id,
 						number: issue.number,
-						state: (issue.state === "open" ? "open" : "closed") as
-							| "open"
-							| "closed",
+						state: toOpenClosedState(issue.state),
 						title: issue.title,
 						body: issue.body ?? null,
 						authorUserId,
-						assigneeUserIds: [] as Array<number>,
+						assigneeUserIds: [],
 						labelNames: labels,
 						commentCount: issue.comments,
 						isPullRequest: false,
@@ -487,9 +482,9 @@ export const fetchCommits = internalAction({
 				messageHeadline: message.split("\n")[0] ?? "",
 				authoredAt: isoToMs(c.commit.author?.date ?? null),
 				committedAt: isoToMs(c.commit.committer?.date ?? null),
-				additions: null as number | null,
-				deletions: null as number | null,
-				changedFiles: null as number | null,
+				additions: null,
+				deletions: null,
+				changedFiles: null,
 			};
 		});
 
@@ -726,7 +721,6 @@ export const schedulePrFileSyncs = internalAction({
 				repositoryId: args.repositoryId,
 				pullRequestNumber: pr.pullRequestNumber,
 				headSha: pr.headSha,
-				connectedByUserId: args.connectedByUserId,
 				installationId: args.installationId,
 			});
 		}

@@ -62,24 +62,6 @@ type RunQueryFn = <Output>(
  * Confect variant: `runQuery` that returns `Effect.Effect<Output>` instead of
  * `Promise<Output>`, as used in `ConfectActionCtx` / `ConfectMutationCtx`.
  */
-type ConfectRunQueryFn = <
-	Query extends FunctionReference<"query", "public" | "internal">,
->(
-	query: Query,
-	...args: Parameters<
-		typeof components.betterAuth.adapter.findOne extends FunctionReference<
-			"query",
-			infer _V,
-			infer A,
-			infer _O
-		>
-			? (q: Query, a: A) => void
-			: never
-	> extends [infer _Q, infer A]
-		? [A]
-		: never
-) => Effect.Effect<unknown>;
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -246,16 +228,14 @@ export const lookupTokenByProviderConfect = (
 	});
 
 // ---------------------------------------------------------------------------
-// 4. Resolve token for a repo — user token preferred, installation fallback
+// 4. Resolve token for a repo — installation token for sync flows
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the best available GitHub API token for a repository.
+ * Resolve the GitHub API token for background repository sync operations.
  *
- * Prefers the user's OAuth token (via `connectedByUserId`) because it has
- * the user's permissions. Falls back to the GitHub App installation token
- * when no user token is available (e.g. repos added via the App installation
- * webhook that have no `connectedByUserId`).
+ * Background sync paths must use GitHub App installation tokens only.
+ * `connectedByUserId` is accepted for compatibility but ignored.
  *
  * Returns the token string directly — callers use it with
  * `GitHubApiClient.fromToken(token)`.
@@ -269,26 +249,16 @@ export const resolveRepoToken = (
 	NoGitHubTokenError | GitHubAppConfigMissing | GitHubAppTokenError
 > =>
 	Effect.gen(function* () {
-		// Try user token first
-		if (connectedByUserId) {
-			const userTokenResult = yield* lookupTokenViaRunQuery(
-				runQuery,
-				connectedByUserId,
-			).pipe(Effect.either);
+		void runQuery;
+		void connectedByUserId;
 
-			if (userTokenResult._tag === "Right") {
-				return userTokenResult.right;
-			}
-			// User token not available — fall through to installation token
-		}
-
-		// Fall back to installation token (only if we have a real installation ID)
+		// Background sync always uses installation token
 		if (installationId > 0) {
 			return yield* getInstallationToken(installationId);
 		}
 
-		// Neither path worked
+		// No installation token source available
 		return yield* new NoGitHubTokenError({
-			reason: `No token available: connectedByUserId=${connectedByUserId ?? "null"}, installationId=${installationId}`,
+			reason: `No installation token available: installationId=${installationId}`,
 		});
 	});

@@ -18,17 +18,22 @@ import {
 	ConfectQueryCtx,
 	confectSchema,
 } from "../confect";
+import { toNumberOrNull as num, toStringOrNull as str } from "../shared/coerce";
 import {
 	ContentFile,
 	type ReposGetContent200,
 } from "../shared/generated_github_client";
 import { GitHubApiClient } from "../shared/githubApi";
-import { lookupGitHubTokenByUserIdConfect } from "../shared/githubToken";
+import { getInstallationToken } from "../shared/githubApp";
 import {
 	resolveRepoAccess,
 	verifyRepoPermissionForMutation,
 } from "../shared/permissions";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
+import {
+	RepoPullByNameMiddleware,
+	RequireAuthenticatedMiddleware,
+} from "./security";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -76,9 +81,6 @@ class RepoNotFound extends Schema.TaggedError<RepoNotFound>()("RepoNotFound", {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
-const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
-
 type TreeEntryData = {
 	path: string;
 	mode: string;
@@ -108,6 +110,39 @@ const hasAnyPermission = (permission: {
 	permission.push ||
 	permission.maintain ||
 	permission.admin;
+
+const RepoPermissionLevelSchema = Schema.Literal(
+	"pull",
+	"triage",
+	"push",
+	"maintain",
+	"admin",
+);
+
+type RepoPermissionLevel = Schema.Schema.Type<typeof RepoPermissionLevelSchema>;
+
+const getPermissionRank = (level: RepoPermissionLevel) => {
+	if (level === "admin") return 4;
+	if (level === "maintain") return 3;
+	if (level === "push") return 2;
+	if (level === "triage") return 1;
+	return 0;
+};
+
+const highestPermissionLevel = (permission: {
+	pull: boolean;
+	triage: boolean;
+	push: boolean;
+	maintain: boolean;
+	admin: boolean;
+}): RepoPermissionLevel | null => {
+	if (permission.admin) return "admin";
+	if (permission.maintain) return "maintain";
+	if (permission.push) return "push";
+	if (permission.triage) return "triage";
+	if (permission.pull) return "pull";
+	return null;
+};
 
 type FileContentData = {
 	path: string;
@@ -175,34 +210,38 @@ const extractFileContent =
  * Get the file tree for a repo at a given ref (SHA or branch name).
  * Caches results in github_tree_cache.
  */
-const getFileTreeDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		sha: Schema.String,
-	},
-	success: Schema.Struct({
-		sha: Schema.String,
-		truncated: Schema.Boolean,
-		tree: Schema.Array(TreeEntry),
-	}),
-	error: Schema.Union(NotAuthenticated, RepoNotFound),
-});
+const getFileTreeDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			sha: Schema.String,
+		},
+		success: Schema.Struct({
+			sha: Schema.String,
+			truncated: Schema.Boolean,
+			tree: Schema.Array(TreeEntry),
+		}),
+		error: Schema.Union(NotAuthenticated, RepoNotFound),
+	})
+	.middleware(RepoPullByNameMiddleware);
 
 /**
  * Get file content for a specific path at a ref.
  * Caches results in github_file_cache.
  */
-const getFileContentDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		path: Schema.String,
-		ref: Schema.String,
-	},
-	success: Schema.NullOr(FileContentResult),
-	error: Schema.Union(NotAuthenticated, RepoNotFound),
-});
+const getFileContentDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			path: Schema.String,
+			ref: Schema.String,
+		},
+		success: Schema.NullOr(FileContentResult),
+		error: Schema.Union(NotAuthenticated, RepoNotFound),
+	})
+	.middleware(RepoPullByNameMiddleware);
 
 /**
  * Internal: upsert tree cache entry.
@@ -262,36 +301,42 @@ const getCachedFileDef = factory.internalQuery({
 /**
  * Get read states for all files in a repo tree snapshot.
  */
-const getFileReadStateDef = factory.query({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		treeSha: Schema.String,
-	},
-	success: Schema.Array(FileReadStateItem),
-	error: Schema.Union(NotAuthenticated, RepoNotFound),
-});
+const getFileReadStateDef = factory
+	.query({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			treeSha: Schema.String,
+		},
+		success: Schema.Array(FileReadStateItem),
+		error: Schema.Union(NotAuthenticated, RepoNotFound),
+	})
+	.middleware(RequireAuthenticatedMiddleware)
+	.middleware(RepoPullByNameMiddleware);
 
 /**
  * Mark a file as read for the current signed-in user.
  */
-const markFileReadDef = factory.mutation({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		treeSha: Schema.String,
-		path: Schema.String,
-		fileSha: Schema.String,
-	},
-	success: Schema.Struct({ marked: Schema.Boolean }),
-	error: Schema.Union(NotAuthenticated, RepoNotFound),
-});
+const markFileReadDef = factory
+	.mutation({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			treeSha: Schema.String,
+			path: Schema.String,
+			fileSha: Schema.String,
+		},
+		success: Schema.Struct({ marked: Schema.Boolean }),
+		error: Schema.Union(NotAuthenticated, RepoNotFound),
+	})
+	.middleware(RequireAuthenticatedMiddleware)
+	.middleware(RepoPullByNameMiddleware);
 
 // ---------------------------------------------------------------------------
-// Helper: resolve repo + token for actions
+// Helper: resolve readable repo for actions
 // ---------------------------------------------------------------------------
 
-const resolveRepoAndToken = (
+const resolveReadableRepo = (
 	ctx: {
 		auth: ConfectActionCtx["auth"];
 		runQuery: ConfectActionCtx["runQuery"];
@@ -339,27 +384,16 @@ const resolveRepoAndToken = (
 			});
 		}
 
-		const userId = repo.connectedByUserId;
-		if (!userId) {
+		const installationId = repo.installationId ?? 0;
+		if (installationId <= 0) {
 			return yield* new NotAuthenticated({
-				reason: "No connected user for this repository",
+				reason: "Repository is not connected through the GitHub App",
 			});
 		}
 
-		const token = yield* lookupGitHubTokenByUserIdConfect(
-			ctx.runQuery,
-			userId,
-		).pipe(
-			Effect.catchTag(
-				"NoGitHubTokenError",
-				(e) => new NotAuthenticated({ reason: e.reason }),
-			),
-		);
-
 		return {
 			repositoryId: repo.repositoryId,
-			installationId: repo.installationId ?? 0,
-			token,
+			installationId,
 		};
 	});
 
@@ -425,11 +459,35 @@ const getRepoInfoDef = factory.internalQuery({
 	}),
 });
 
+const getRepoInfoByIdDef = factory.internalQuery({
+	payload: {
+		repositoryId: Schema.Number,
+	},
+	success: Schema.Struct({
+		found: Schema.Boolean,
+		ownerLogin: Schema.optional(Schema.String),
+		name: Schema.optional(Schema.String),
+		installationId: Schema.optional(Schema.Number),
+		isPrivate: Schema.optional(Schema.Boolean),
+	}),
+});
+
 const hasRepoReadAccessDef = factory.internalQuery({
 	payload: {
 		repositoryId: Schema.Number,
 		isPrivate: Schema.Boolean,
 		userId: Schema.NullOr(Schema.String),
+	},
+	success: Schema.Boolean,
+});
+
+const hasRepoPermissionDef = factory.internalQuery({
+	payload: {
+		repositoryId: Schema.Number,
+		isPrivate: Schema.Boolean,
+		userId: Schema.NullOr(Schema.String),
+		required: RepoPermissionLevelSchema,
+		requireAuthenticated: Schema.optional(Schema.Boolean),
 	},
 	success: Schema.Boolean,
 });
@@ -450,6 +508,28 @@ getRepoInfoDef.implement((args) =>
 			found: true,
 			repositoryId: repo.value.githubRepoId,
 			connectedByUserId: repo.value.connectedByUserId ?? null,
+			installationId: repo.value.installationId,
+			isPrivate: repo.value.private,
+		};
+	}),
+);
+
+getRepoInfoByIdDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectQueryCtx;
+		const repo = yield* ctx.db
+			.query("github_repositories")
+			.withIndex("by_githubRepoId", (q) =>
+				q.eq("githubRepoId", args.repositoryId),
+			)
+			.first();
+
+		if (Option.isNone(repo)) return { found: false };
+
+		return {
+			found: true,
+			ownerLogin: repo.value.ownerLogin,
+			name: repo.value.name,
 			installationId: repo.value.installationId,
 			isPrivate: repo.value.private,
 		};
@@ -483,6 +563,43 @@ hasRepoReadAccessDef.implement((args) =>
 	}),
 );
 
+hasRepoPermissionDef.implement((args) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectQueryCtx;
+
+		const requireAuthenticated = args.requireAuthenticated ?? false;
+		if (requireAuthenticated && args.userId === null) {
+			return false;
+		}
+
+		if (!args.isPrivate && args.required === "pull") {
+			return true;
+		}
+
+		if (args.userId === null) {
+			return false;
+		}
+
+		const permission = yield* ctx.db
+			.query("github_user_repo_permissions")
+			.withIndex("by_userId_and_repositoryId", (q) =>
+				q.eq("userId", args.userId).eq("repositoryId", args.repositoryId),
+			)
+			.first();
+
+		if (Option.isNone(permission)) {
+			return false;
+		}
+
+		const highestLevel = highestPermissionLevel(permission.value);
+		if (highestLevel === null) {
+			return false;
+		}
+
+		return getPermissionRank(highestLevel) >= getPermissionRank(args.required);
+	}),
+);
+
 // ---------------------------------------------------------------------------
 // Implementations
 // ---------------------------------------------------------------------------
@@ -490,7 +607,7 @@ hasRepoReadAccessDef.implement((args) =>
 getFileTreeDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectActionCtx;
-		const { repositoryId, token } = yield* resolveRepoAndToken(
+		const { repositoryId, installationId } = yield* resolveReadableRepo(
 			ctx,
 			args.ownerLogin,
 			args.name,
@@ -537,6 +654,14 @@ getFileTreeDef.implement((args) =>
 		}
 
 		// Fetch from GitHub
+		const token = yield* getInstallationToken(installationId).pipe(
+			Effect.mapError(
+				() =>
+					new NotAuthenticated({
+						reason: "GitHub App token is unavailable for this repository",
+					}),
+			),
+		);
 		const gh = yield* Effect.provide(
 			GitHubApiClient,
 			GitHubApiClient.fromToken(token),
@@ -580,10 +705,18 @@ getFileTreeDef.implement((args) =>
 getFileContentDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectActionCtx;
-		const { repositoryId, token } = yield* resolveRepoAndToken(
+		const { repositoryId, installationId } = yield* resolveReadableRepo(
 			ctx,
 			args.ownerLogin,
 			args.name,
+		);
+		const token = yield* getInstallationToken(installationId).pipe(
+			Effect.mapError(
+				() =>
+					new NotAuthenticated({
+						reason: "GitHub App token is unavailable for this repository",
+					}),
+			),
 		);
 
 		// Fetch from GitHub (contents endpoint includes the blob SHA)
@@ -843,9 +976,11 @@ const codeBrowseModule = makeRpcModule(
 		getFileReadState: getFileReadStateDef,
 		markFileRead: markFileReadDef,
 		getRepoInfo: getRepoInfoDef,
+		getRepoInfoById: getRepoInfoByIdDef,
 		hasRepoReadAccess: hasRepoReadAccessDef,
+		hasRepoPermission: hasRepoPermissionDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const {
@@ -858,7 +993,9 @@ export const {
 	getFileReadState,
 	markFileRead,
 	getRepoInfo,
+	getRepoInfoById,
 	hasRepoReadAccess,
+	hasRepoPermission,
 } = codeBrowseModule.handlers;
 export { codeBrowseModule };
 export type CodeBrowseModule = typeof codeBrowseModule;

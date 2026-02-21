@@ -9,7 +9,7 @@
  *   - markNotificationReadRemote (internalAction) — call GitHub API to mark thread as read
  */
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
-import { Effect, Option, Schema } from "effect";
+import { Effect, Either, Option, Schema } from "effect";
 import { internal } from "../_generated/api";
 import {
 	ConfectActionCtx,
@@ -20,7 +20,9 @@ import {
 import type { Thread } from "../shared/generated_github_client";
 import { GitHubApiClient } from "../shared/githubApi";
 import { lookupTokenByProviderConfect } from "../shared/githubToken";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { parseIsoToMsOrNow as isoToMs } from "../shared/time";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
+import { AuthenticatedUser, RequireAuthenticatedMiddleware } from "./security";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -92,11 +94,6 @@ class GitHubSyncFailed extends Schema.TaggedError<GitHubSyncFailed>()(
 // Helpers
 // ---------------------------------------------------------------------------
 
-const isoToMs = (v: string): number => {
-	const ms = new Date(v).getTime();
-	return Number.isNaN(ms) ? Date.now() : ms;
-};
-
 /**
  * Parse entity number from a GitHub notification subject URL.
  * e.g. "https://api.github.com/repos/owner/repo/issues/42" -> 42
@@ -143,31 +140,47 @@ const toSubjectType = (s: string): ValidSubjectType =>
 
 const toReason = (s: string): ValidReason => REASON_MAP[s] ?? "subscribed";
 
+const GitHubErrorCauseSchema = Schema.Struct({
+	message: Schema.optional(Schema.String),
+	status: Schema.optional(Schema.Number),
+	documentation_url: Schema.optional(Schema.String),
+});
+
+const GitHubErrorResponseSchema = Schema.Struct({
+	status: Schema.Number,
+});
+
+const GitHubErrorSummarySchema = Schema.Struct({
+	_tag: Schema.optional(Schema.String),
+	cause: Schema.optional(GitHubErrorCauseSchema),
+	response: Schema.optional(GitHubErrorResponseSchema),
+});
+
+const decodeGitHubErrorSummary = Schema.decodeUnknownEither(
+	GitHubErrorSummarySchema,
+);
+
 /** Extract a human-readable message from a GitHub API error. */
 const formatGitHubError = (error: object): string => {
-	// Spread into a plain record for uniform property access
-	const raw = Object.fromEntries(Object.entries(error));
-	const tag = "_tag" in raw ? String(raw._tag) : "Unknown";
-	const cause =
-		typeof raw.cause === "object" && raw.cause !== null
-			? (raw.cause as Record<string, unknown>)
-			: null;
-	const causeMsg = cause?.message
-		? String(cause.message)
-		: cause?.status
-			? `status=${String(cause.status)}`
-			: null;
+	const decoded = decodeGitHubErrorSummary(error);
+	if (Either.isLeft(decoded)) {
+		return `Unknown error: ${JSON.stringify(error)}`;
+	}
+
+	const tag = decoded.right._tag ?? "Unknown";
+	const cause = decoded.right.cause;
+	const causeMsg =
+		cause?.message ??
+		(cause?.status !== undefined ? `status=${String(cause.status)}` : null);
 	const status =
-		typeof raw.response === "object" &&
-		raw.response !== null &&
-		"status" in (raw.response as Record<string, unknown>)
-			? String((raw.response as Record<string, unknown>).status)
+		decoded.right.response?.status !== undefined
+			? String(decoded.right.response.status)
 			: null;
 	const detail = [
 		tag,
 		status ? `HTTP ${status}` : null,
 		causeMsg,
-		cause?.documentation_url ? String(cause.documentation_url) : null,
+		cause?.documentation_url ?? null,
 	]
 		.filter(Boolean)
 		.join(": ");
@@ -181,28 +194,34 @@ const formatGitHubError = (error: object): string => {
 /**
  * List cached notifications for the signed-in user.
  */
-const listNotificationsDef = factory.query({
-	success: Schema.Array(NotificationItem),
-});
+const listNotificationsDef = factory
+	.query({
+		success: Schema.Array(NotificationItem),
+	})
+	.middleware(RequireAuthenticatedMiddleware);
 
 /**
  * Poll GitHub's /notifications API and upsert locally.
  */
-const syncNotificationsDef = factory.action({
-	success: Schema.Struct({ syncedCount: Schema.Number }),
-	error: Schema.Union(NotAuthenticated, GitHubSyncFailed),
-});
+const syncNotificationsDef = factory
+	.action({
+		success: Schema.Struct({ syncedCount: Schema.Number }),
+		error: Schema.Union(NotAuthenticated, GitHubSyncFailed),
+	})
+	.middleware(RequireAuthenticatedMiddleware);
 
 /**
  * Mark a notification as read locally and schedule a remote PATCH.
  */
-const markNotificationReadDef = factory.mutation({
-	payload: {
-		githubNotificationId: Schema.String,
-	},
-	success: Schema.Struct({ updated: Schema.Boolean }),
-	error: Schema.Union(NotAuthenticated, NotificationNotFound),
-});
+const markNotificationReadDef = factory
+	.mutation({
+		payload: {
+			githubNotificationId: Schema.String,
+		},
+		success: Schema.Struct({ updated: Schema.Boolean }),
+		error: Schema.Union(NotAuthenticated, NotificationNotFound),
+	})
+	.middleware(RequireAuthenticatedMiddleware);
 
 /**
  * Internal: batch upsert notification records.
@@ -241,33 +260,13 @@ const markNotificationReadRemoteDef = factory.internalAction({
 });
 
 // ---------------------------------------------------------------------------
-// Helper: resolve signed-in user ID from ctx
-// ---------------------------------------------------------------------------
-
-const getActingUserId = (ctx: {
-	auth: {
-		getUserIdentity: () => Effect.Effect<Option.Option<{ subject: string }>>;
-	};
-}): Effect.Effect<string, NotAuthenticated> =>
-	Effect.gen(function* () {
-		const identity = yield* ctx.auth.getUserIdentity();
-		if (Option.isNone(identity)) {
-			return yield* new NotAuthenticated({ reason: "User is not signed in" });
-		}
-		return identity.value.subject;
-	});
-
-// ---------------------------------------------------------------------------
 // Implementations
 // ---------------------------------------------------------------------------
 
 listNotificationsDef.implement(() =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectQueryCtx;
-		const identity = yield* ctx.auth.getUserIdentity();
-		if (Option.isNone(identity)) return [];
-
-		const userId = identity.value.subject;
+		const { userId } = yield* AuthenticatedUser;
 
 		const notifications = yield* ctx.db
 			.query("github_notifications")
@@ -294,13 +293,7 @@ listNotificationsDef.implement(() =>
 syncNotificationsDef.implement(() =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectActionCtx;
-		const identity = yield* ctx.auth.getUserIdentity();
-		if (Option.isNone(identity)) {
-			return yield* new NotAuthenticated({
-				reason: "User is not signed in",
-			});
-		}
-		const userId = identity.value.subject;
+		const { userId } = yield* AuthenticatedUser;
 
 		// Resolve the classic OAuth token for notifications
 		// GitHub App tokens (ghu_) can't access /notifications — need a
@@ -384,7 +377,7 @@ syncNotificationsDef.implement(() =>
 markNotificationReadDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
-		const userId = yield* getActingUserId(ctx);
+		const { userId } = yield* AuthenticatedUser;
 
 		const existing = yield* ctx.db
 			.query("github_notifications")
@@ -524,7 +517,7 @@ const notificationsModule = makeRpcModule(
 		upsertNotifications: upsertNotificationsDef,
 		markNotificationReadRemote: markNotificationReadRemoteDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const {

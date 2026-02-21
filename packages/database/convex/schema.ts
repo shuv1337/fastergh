@@ -117,6 +117,7 @@ const GitHubRepositorySchema = Schema.Struct({
 	 * Only set when the connecting user has admin/webhook permissions.
 	 */
 	connectedByUserId: Schema.optional(Schema.NullOr(Schema.String)),
+	stargazersCount: Schema.optional(Schema.Number),
 });
 
 const GitHubBranchSchema = Schema.Struct({

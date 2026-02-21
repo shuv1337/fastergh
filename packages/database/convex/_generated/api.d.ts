@@ -9,11 +9,13 @@
  */
 
 import type * as auth from "../auth.js";
+import type * as autumn from "../autumn.js";
 import type * as confect from "../confect.js";
 import type * as crons from "../crons.js";
 import type * as http from "../http.js";
 import type * as migrations from "../migrations.js";
 import type * as rpc_admin from "../rpc/admin.js";
+import type * as rpc_billing from "../rpc/billing.js";
 import type * as rpc_bootstrapSteps from "../rpc/bootstrapSteps.js";
 import type * as rpc_bootstrapWorkflow from "../rpc/bootstrapWorkflow.js";
 import type * as rpc_bootstrapWrite from "../rpc/bootstrapWrite.js";
@@ -21,6 +23,7 @@ import type * as rpc_codeBrowse from "../rpc/codeBrowse.js";
 import type * as rpc_githubActions from "../rpc/githubActions.js";
 import type * as rpc_githubWrite from "../rpc/githubWrite.js";
 import type * as rpc_issueTemplates from "../rpc/issueTemplates.js";
+import type * as rpc_moduleMiddlewares from "../rpc/moduleMiddlewares.js";
 import type * as rpc_notifications from "../rpc/notifications.js";
 import type * as rpc_onDemandSync from "../rpc/onDemandSync.js";
 import type * as rpc_projectionQueries from "../rpc/projectionQueries.js";
@@ -29,11 +32,13 @@ import type * as rpc_repoBootstrap from "../rpc/repoBootstrap.js";
 import type * as rpc_repoBootstrapImpl from "../rpc/repoBootstrapImpl.js";
 import type * as rpc_repoConnect from "../rpc/repoConnect.js";
 import type * as rpc_repoOnboard from "../rpc/repoOnboard.js";
+import type * as rpc_security from "../rpc/security.js";
 import type * as rpc_telemetry from "../rpc/telemetry.js";
 import type * as rpc_webhookIngestion from "../rpc/webhookIngestion.js";
 import type * as rpc_webhookProcessor from "../rpc/webhookProcessor.js";
 import type * as shared_aggregateSync from "../shared/aggregateSync.js";
 import type * as shared_aggregates from "../shared/aggregates.js";
+import type * as shared_coerce from "../shared/coerce.js";
 import type * as shared_generated_github_client from "../shared/generated_github_client.js";
 import type * as shared_githubApi from "../shared/githubApi.js";
 import type * as shared_githubApp from "../shared/githubApp.js";
@@ -41,6 +46,7 @@ import type * as shared_githubToken from "../shared/githubToken.js";
 import type * as shared_permissions from "../shared/permissions.js";
 import type * as shared_projections from "../shared/projections.js";
 import type * as shared_rateLimiter from "../shared/rateLimiter.js";
+import type * as shared_time from "../shared/time.js";
 import type * as shared_webhookVerify from "../shared/webhookVerify.js";
 import type * as shared_workflow from "../shared/workflow.js";
 
@@ -52,11 +58,13 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   auth: typeof auth;
+  autumn: typeof autumn;
   confect: typeof confect;
   crons: typeof crons;
   http: typeof http;
   migrations: typeof migrations;
   "rpc/admin": typeof rpc_admin;
+  "rpc/billing": typeof rpc_billing;
   "rpc/bootstrapSteps": typeof rpc_bootstrapSteps;
   "rpc/bootstrapWorkflow": typeof rpc_bootstrapWorkflow;
   "rpc/bootstrapWrite": typeof rpc_bootstrapWrite;
@@ -64,6 +72,7 @@ declare const fullApi: ApiFromModules<{
   "rpc/githubActions": typeof rpc_githubActions;
   "rpc/githubWrite": typeof rpc_githubWrite;
   "rpc/issueTemplates": typeof rpc_issueTemplates;
+  "rpc/moduleMiddlewares": typeof rpc_moduleMiddlewares;
   "rpc/notifications": typeof rpc_notifications;
   "rpc/onDemandSync": typeof rpc_onDemandSync;
   "rpc/projectionQueries": typeof rpc_projectionQueries;
@@ -72,11 +81,13 @@ declare const fullApi: ApiFromModules<{
   "rpc/repoBootstrapImpl": typeof rpc_repoBootstrapImpl;
   "rpc/repoConnect": typeof rpc_repoConnect;
   "rpc/repoOnboard": typeof rpc_repoOnboard;
+  "rpc/security": typeof rpc_security;
   "rpc/telemetry": typeof rpc_telemetry;
   "rpc/webhookIngestion": typeof rpc_webhookIngestion;
   "rpc/webhookProcessor": typeof rpc_webhookProcessor;
   "shared/aggregateSync": typeof shared_aggregateSync;
   "shared/aggregates": typeof shared_aggregates;
+  "shared/coerce": typeof shared_coerce;
   "shared/generated_github_client": typeof shared_generated_github_client;
   "shared/githubApi": typeof shared_githubApi;
   "shared/githubApp": typeof shared_githubApp;
@@ -84,6 +95,7 @@ declare const fullApi: ApiFromModules<{
   "shared/permissions": typeof shared_permissions;
   "shared/projections": typeof shared_projections;
   "shared/rateLimiter": typeof shared_rateLimiter;
+  "shared/time": typeof shared_time;
   "shared/webhookVerify": typeof shared_webhookVerify;
   "shared/workflow": typeof shared_workflow;
 }>;
@@ -157,6 +169,7 @@ export declare const components: {
       >;
     };
   };
+  autumn: {};
   betterAuth: {
     adapter: {
       create: FunctionReference<

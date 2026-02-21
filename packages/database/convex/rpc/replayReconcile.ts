@@ -11,7 +11,7 @@ import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
 import { Effect, Option, Schema } from "effect";
 import { internal } from "../_generated/api";
 import { ConfectMutationCtx, ConfectQueryCtx, confectSchema } from "../confect";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -257,9 +257,8 @@ reconcileRepoDef.implement((args) =>
 			return { scheduled: false, lockKey };
 		}
 
-		// Requires a connected user whose GitHub token can be used for API calls.
-		const connectedByUserId = repoDoc.connectedByUserId;
-		if (!connectedByUserId) {
+		const installationId = repoDoc.installationId;
+		if (installationId <= 0) {
 			return { scheduled: false, lockKey: null };
 		}
 
@@ -287,8 +286,8 @@ reconcileRepoDef.implement((args) =>
 			repositoryId: repoDoc.githubRepoId,
 			fullName: repoDoc.fullName,
 			lockKey,
-			connectedByUserId,
-			installationId: repoDoc.installationId,
+			connectedByUserId: repoDoc.connectedByUserId ?? null,
+			installationId,
 		});
 
 		return { scheduled: true, lockKey };
@@ -308,7 +307,7 @@ const replayReconcileModule = makeRpcModule(
 		listDeadLetters: listDeadLettersDef,
 		reconcileRepo: reconcileRepoDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const {

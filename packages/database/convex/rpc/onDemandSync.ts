@@ -21,7 +21,7 @@
  *   5. Update projections
  */
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
-import { Effect, Option, Schema } from "effect";
+import { Array as Arr, Effect, Option, Predicate, Schema } from "effect";
 import { internal } from "../_generated/api";
 import {
 	ConfectActionCtx,
@@ -29,10 +29,13 @@ import {
 	ConfectQueryCtx,
 	confectSchema,
 } from "../confect";
+import { toOpenClosedState } from "../shared/coerce";
 import type { SimpleUser } from "../shared/generated_github_client";
 import { GitHubApiClient } from "../shared/githubApi";
-import { lookupGitHubTokenByUserIdConfect } from "../shared/githubToken";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { getInstallationToken } from "../shared/githubApp";
+import { parseIsoToMsOrNull as isoToMs } from "../shared/time";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
+import { RepoPermissionContext, RepoPullByNameMiddleware } from "./security";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -58,12 +61,6 @@ class RepoNotFoundOnGitHub extends Schema.TaggedError<RepoNotFoundOnGitHub>()(
 // ---------------------------------------------------------------------------
 // ISO date string → millisecond timestamp helper
 // ---------------------------------------------------------------------------
-
-const isoToMs = (v: string | null | undefined): number | null => {
-	if (v == null) return null;
-	const ms = new Date(v).getTime();
-	return Number.isNaN(ms) ? null : ms;
-};
 
 // ---------------------------------------------------------------------------
 // Typed user collector
@@ -119,6 +116,7 @@ const ensureRepoDef = factory.internalMutation({
 				visibility: Schema.Literal("public", "private", "internal"),
 				isPrivate: Schema.Boolean,
 				fullName: Schema.String,
+				stargazersCount: Schema.optional(Schema.Number),
 			}),
 		),
 	},
@@ -198,6 +196,7 @@ ensureRepoDef.implement((args) =>
 			githubUpdatedAt: now,
 			cachedAt: now,
 			connectedByUserId: null,
+			stargazersCount: repoData.stargazersCount ?? 0,
 		});
 
 		return {
@@ -474,38 +473,36 @@ checkEntityExistsDef.implement((args) =>
 // Public action: syncPullRequest — fetch and write a single PR
 // ---------------------------------------------------------------------------
 
-const syncPullRequestDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		number: Schema.Number,
-	},
-	success: Schema.Struct({
-		synced: Schema.Boolean,
-		repositoryId: Schema.Number,
-	}),
-	error: Schema.Union(EntityNotFound, RepoNotFoundOnGitHub),
-});
+const syncPullRequestDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			number: Schema.Number,
+		},
+		success: Schema.Struct({
+			synced: Schema.Boolean,
+			repositoryId: Schema.Number,
+		}),
+		error: Schema.Union(EntityNotFound, RepoNotFoundOnGitHub),
+	})
+	.middleware(RepoPullByNameMiddleware);
 
 syncPullRequestDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectActionCtx;
+		const permissionContext = yield* RepoPermissionContext;
+		const repositoryId = permissionContext.repositoryId;
+		const installationId = permissionContext.installationId;
 
-		// Resolve the signed-in user's GitHub OAuth token
-		const identity = yield* ctx.auth.getUserIdentity();
-		if (Option.isNone(identity)) {
-			return yield* new EntityNotFound({
+		if (installationId <= 0) {
+			return yield* new RepoNotFoundOnGitHub({
 				ownerLogin: args.ownerLogin,
 				name: args.name,
-				entityType: "pull_request",
-				number: args.number,
 			});
 		}
-		const userId = identity.value.subject;
-		const token = yield* lookupGitHubTokenByUserIdConfect(
-			ctx.runQuery,
-			userId,
-		).pipe(
+
+		const token = yield* getInstallationToken(installationId).pipe(
 			Effect.mapError(
 				() =>
 					new RepoNotFoundOnGitHub({
@@ -518,11 +515,9 @@ syncPullRequestDef.implement((args) =>
 			GitHubApiClient,
 			GitHubApiClient.fromToken(token),
 		);
-
-		const fullName = `${args.ownerLogin}/${args.name}`;
 		const users = createUserCollector();
 
-		// 1. Ensure repo exists — fetch repo metadata if needed
+		// 1. Return early when the entity already exists
 		const repoCheck = yield* ctx.runQuery(
 			internal.rpc.onDemandSync.checkEntityExists,
 			{
@@ -533,79 +528,11 @@ syncPullRequestDef.implement((args) =>
 			},
 		);
 
-		// If entity already exists, just return
 		if (repoCheck === true) {
-			// Still get the repositoryId
-			const ensureResult = yield* ctx.runMutation(
-				internal.rpc.onDemandSync.ensureRepo,
-				{ ownerLogin: args.ownerLogin, name: args.name },
-			);
-			const EnsureResultSchema = Schema.NullOr(
-				Schema.Struct({
-					repositoryId: Schema.Number,
-					alreadyExists: Schema.Boolean,
-				}),
-			);
-			const decoded =
-				Schema.decodeUnknownSync(EnsureResultSchema)(ensureResult);
-			if (decoded === null) {
-				return yield* new RepoNotFoundOnGitHub({
-					ownerLogin: args.ownerLogin,
-					name: args.name,
-				});
-			}
-			return { synced: false, repositoryId: decoded.repositoryId };
+			return { synced: false, repositoryId };
 		}
 
-		// 2. Fetch repo metadata from GitHub to ensure repo record exists
-		// reposGet returns FullRepository | BasicError. Narrow via "id" (only on FullRepository).
-		const repoResult = yield* gh.client
-			.reposGet(args.ownerLogin, args.name)
-			.pipe(Effect.catchAll(() => Effect.succeed(null)));
-
-		if (repoResult === null || !("id" in repoResult)) {
-			return yield* new RepoNotFoundOnGitHub({
-				ownerLogin: args.ownerLogin,
-				name: args.name,
-			});
-		}
-
-		// Ensure repo record exists
-		const ensureResult = yield* ctx.runMutation(
-			internal.rpc.onDemandSync.ensureRepo,
-			{
-				ownerLogin: args.ownerLogin,
-				name: args.name,
-				repoData: {
-					githubRepoId: repoResult.id,
-					ownerId: repoResult.owner.id,
-					defaultBranch: repoResult.default_branch,
-					visibility: repoResult.private ? "private" : "public",
-					isPrivate: repoResult.private,
-					fullName,
-				},
-			},
-		);
-
-		const EnsureResultSchema = Schema.NullOr(
-			Schema.Struct({
-				repositoryId: Schema.Number,
-				alreadyExists: Schema.Boolean,
-			}),
-		);
-		const ensureDecoded =
-			Schema.decodeUnknownSync(EnsureResultSchema)(ensureResult);
-
-		if (ensureDecoded === null) {
-			return yield* new RepoNotFoundOnGitHub({
-				ownerLogin: args.ownerLogin,
-				name: args.name,
-			});
-		}
-
-		const repositoryId = ensureDecoded.repositoryId;
-
-		// 3. Fetch the PR from GitHub (typed client)
+		// 2. Fetch the PR from GitHub (typed client)
 		const prData = yield* gh.client
 			.pullsGet(args.ownerLogin, args.name, String(args.number))
 			.pipe(Effect.catchAll(() => Effect.succeed(null)));
@@ -624,13 +551,13 @@ syncPullRequestDef.implement((args) =>
 		const pr = {
 			githubPrId: prData.id,
 			number: prData.number,
-			state: prData.state === "open" ? ("open" as const) : ("closed" as const),
+			state: toOpenClosedState(prData.state),
 			draft: prData.draft === true,
 			title: prData.title,
 			body: prData.body ?? null,
 			authorUserId,
-			assigneeUserIds: [] as Array<number>,
-			requestedReviewerUserIds: [] as Array<number>,
+			assigneeUserIds: [],
+			requestedReviewerUserIds: [],
 			baseRefName: prData.base.ref,
 			headRefName: prData.head.ref,
 			headSha: prData.head.sha,
@@ -651,7 +578,7 @@ syncPullRequestDef.implement((args) =>
 			.issuesListComments(args.ownerLogin, args.name, String(args.number), {
 				per_page: 100,
 			})
-			.pipe(Effect.catchAll(() => Effect.succeed([] as const)));
+			.pipe(Effect.catchAll(() => Effect.succeed([])));
 
 		const comments = rawComments.map((c) => ({
 			githubCommentId: c.id,
@@ -674,7 +601,7 @@ syncPullRequestDef.implement((args) =>
 			.pullsListReviews(args.ownerLogin, args.name, String(args.number), {
 				per_page: 100,
 			})
-			.pipe(Effect.catchAll(() => Effect.succeed([] as const)));
+			.pipe(Effect.catchAll(() => Effect.succeed([])));
 
 		const reviews = rawReviews.map((r) => ({
 			githubReviewId: r.id,
@@ -700,7 +627,7 @@ syncPullRequestDef.implement((args) =>
 				String(args.number),
 				{ per_page: 100 },
 			)
-			.pipe(Effect.catchAll(() => Effect.succeed([] as const)));
+			.pipe(Effect.catchAll(() => Effect.succeed([])));
 
 		const reviewComments = rawReviewComments.map((c) => ({
 			githubReviewCommentId: c.id,
@@ -781,8 +708,7 @@ syncPullRequestDef.implement((args) =>
 					repositoryId,
 					pullRequestNumber: args.number,
 					headSha: pr.headSha,
-					connectedByUserId: userId,
-					installationId: 0,
+					installationId,
 				}),
 			);
 		}
@@ -795,37 +721,36 @@ syncPullRequestDef.implement((args) =>
 // Public action: syncIssue — fetch and write a single issue
 // ---------------------------------------------------------------------------
 
-const syncIssueDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-		number: Schema.Number,
-	},
-	success: Schema.Struct({
-		synced: Schema.Boolean,
-		repositoryId: Schema.Number,
-	}),
-	error: Schema.Union(EntityNotFound, RepoNotFoundOnGitHub),
-});
+const syncIssueDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+			number: Schema.Number,
+		},
+		success: Schema.Struct({
+			synced: Schema.Boolean,
+			repositoryId: Schema.Number,
+		}),
+		error: Schema.Union(EntityNotFound, RepoNotFoundOnGitHub),
+	})
+	.middleware(RepoPullByNameMiddleware);
 
 syncIssueDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectActionCtx;
+		const permissionContext = yield* RepoPermissionContext;
+		const repositoryId = permissionContext.repositoryId;
+		const installationId = permissionContext.installationId;
 
-		// Resolve the signed-in user's GitHub OAuth token
-		const identity = yield* ctx.auth.getUserIdentity();
-		if (Option.isNone(identity)) {
-			return yield* new EntityNotFound({
+		if (installationId <= 0) {
+			return yield* new RepoNotFoundOnGitHub({
 				ownerLogin: args.ownerLogin,
 				name: args.name,
-				entityType: "issue",
-				number: args.number,
 			});
 		}
-		const token = yield* lookupGitHubTokenByUserIdConfect(
-			ctx.runQuery,
-			identity.value.subject,
-		).pipe(
+
+		const token = yield* getInstallationToken(installationId).pipe(
 			Effect.mapError(
 				() =>
 					new RepoNotFoundOnGitHub({
@@ -838,8 +763,6 @@ syncIssueDef.implement((args) =>
 			GitHubApiClient,
 			GitHubApiClient.fromToken(token),
 		);
-
-		const fullName = `${args.ownerLogin}/${args.name}`;
 		const userCollector = createUserCollector();
 
 		// 1. Check if entity already exists
@@ -854,76 +777,10 @@ syncIssueDef.implement((args) =>
 		);
 
 		if (entityExists === true) {
-			const ensureResult = yield* ctx.runMutation(
-				internal.rpc.onDemandSync.ensureRepo,
-				{ ownerLogin: args.ownerLogin, name: args.name },
-			);
-			const EnsureResultSchema = Schema.NullOr(
-				Schema.Struct({
-					repositoryId: Schema.Number,
-					alreadyExists: Schema.Boolean,
-				}),
-			);
-			const decoded =
-				Schema.decodeUnknownSync(EnsureResultSchema)(ensureResult);
-			if (decoded === null) {
-				return yield* new RepoNotFoundOnGitHub({
-					ownerLogin: args.ownerLogin,
-					name: args.name,
-				});
-			}
-			return { synced: false, repositoryId: decoded.repositoryId };
+			return { synced: false, repositoryId };
 		}
 
-		// 2. Fetch repo metadata (typed client)
-		// reposGet returns FullRepository | BasicError. Narrow via "id".
-		const repoResult = yield* gh.client
-			.reposGet(args.ownerLogin, args.name)
-			.pipe(Effect.catchAll(() => Effect.succeed(null)));
-
-		if (repoResult === null || !("id" in repoResult)) {
-			return yield* new RepoNotFoundOnGitHub({
-				ownerLogin: args.ownerLogin,
-				name: args.name,
-			});
-		}
-
-		// Ensure repo record
-		const ensureResult = yield* ctx.runMutation(
-			internal.rpc.onDemandSync.ensureRepo,
-			{
-				ownerLogin: args.ownerLogin,
-				name: args.name,
-				repoData: {
-					githubRepoId: repoResult.id,
-					ownerId: repoResult.owner.id,
-					defaultBranch: repoResult.default_branch,
-					visibility: repoResult.private ? "private" : "public",
-					isPrivate: repoResult.private,
-					fullName,
-				},
-			},
-		);
-
-		const EnsureResultSchema = Schema.NullOr(
-			Schema.Struct({
-				repositoryId: Schema.Number,
-				alreadyExists: Schema.Boolean,
-			}),
-		);
-		const ensureDecoded =
-			Schema.decodeUnknownSync(EnsureResultSchema)(ensureResult);
-
-		if (ensureDecoded === null) {
-			return yield* new RepoNotFoundOnGitHub({
-				ownerLogin: args.ownerLogin,
-				name: args.name,
-			});
-		}
-
-		const repositoryId = ensureDecoded.repositoryId;
-
-		// 3. Fetch the issue from GitHub (typed client)
+		// 2. Fetch the issue from GitHub (typed client)
 		// issuesGet returns Issue | BasicError. Narrow via "id".
 		const issueResult = yield* gh.client
 			.issuesGet(args.ownerLogin, args.name, String(args.number))
@@ -943,19 +800,21 @@ syncIssueDef.implement((args) =>
 
 		const authorUserId = userCollector.collect(issueResult.user);
 
-		const labels = issueResult.labels
-			.map((l) => (typeof l === "string" ? l : (l.name ?? null)))
-			.filter((n): n is string => n !== null);
+		const labels = Arr.filter(
+			Arr.map(issueResult.labels, (label) =>
+				typeof label === "string" ? label : (label.name ?? null),
+			),
+			Predicate.isNotNull,
+		);
 
 		const issue = {
 			githubIssueId: issueResult.id,
 			number: issueResult.number,
-			state:
-				issueResult.state === "open" ? ("open" as const) : ("closed" as const),
+			state: toOpenClosedState(issueResult.state),
 			title: issueResult.title,
 			body: issueResult.body ?? null,
 			authorUserId,
-			assigneeUserIds: [] as Array<number>,
+			assigneeUserIds: [],
 			labelNames: labels,
 			commentCount: issueResult.comments,
 			isPullRequest,
@@ -974,7 +833,7 @@ syncIssueDef.implement((args) =>
 			.issuesListComments(args.ownerLogin, args.name, String(args.number), {
 				per_page: 100,
 			})
-			.pipe(Effect.catchAll(() => Effect.succeed([] as const)));
+			.pipe(Effect.catchAll(() => Effect.succeed([])));
 
 		const comments = rawComments.map((c) => ({
 			githubCommentId: c.id,
@@ -1024,7 +883,7 @@ const onDemandSyncModule = makeRpcModule(
 		writeAndProject: writeAndProjectDef,
 		checkEntityExists: checkEntityExistsDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const {

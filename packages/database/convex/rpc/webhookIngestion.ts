@@ -2,7 +2,7 @@ import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
 import { Effect, Option, Schema } from "effect";
 import { ConfectMutationCtx, confectSchema } from "../confect";
 import { syncWebhookInsert } from "../shared/aggregateSync";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -72,7 +72,7 @@ const webhookIngestionModule = makeRpcModule(
 	{
 		storeRawEvent: storeRawEventDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const { storeRawEvent } = webhookIngestionModule.handlers;

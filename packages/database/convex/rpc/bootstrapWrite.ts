@@ -15,7 +15,7 @@ import {
 	syncReviewInsert,
 	syncReviewReplace,
 } from "../shared/aggregateSync";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -650,7 +650,7 @@ const bootstrapWriteModule = makeRpcModule(
 		upsertUsers: upsertUsersDef,
 		updateSyncJobState: updateSyncJobStateDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const {

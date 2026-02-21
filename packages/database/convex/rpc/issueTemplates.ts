@@ -10,8 +10,8 @@
  *   2. `getCachedTemplates` (query) — reads cached templates for a repo.
  */
 import { createRpcFactory, makeRpcModule } from "@packages/confect/rpc";
-import { Effect, Option, Schema } from "effect";
-import { api, internal } from "../_generated/api";
+import { Effect, Schema } from "effect";
+import { internal } from "../_generated/api";
 import {
 	ConfectActionCtx,
 	ConfectMutationCtx,
@@ -20,12 +20,9 @@ import {
 } from "../confect";
 import { ContentFile } from "../shared/generated_github_client";
 import { GitHubApiClient } from "../shared/githubApi";
-import { lookupGitHubTokenByUserIdConfect } from "../shared/githubToken";
-import {
-	resolveRepoAccess,
-	verifyRepoPermissionForMutation,
-} from "../shared/permissions";
-import { DatabaseRpcTelemetryLayer } from "./telemetry";
+import { getInstallationToken } from "../shared/githubApp";
+import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
+import { RepoPermissionContext, RepoPullByNameMiddleware } from "./security";
 
 const factory = createRpcFactory({ schema: confectSchema });
 
@@ -148,33 +145,6 @@ function parseYamlArray(raw: string): Array<string> {
 
 const isContentFile = Schema.is(ContentFile);
 
-const resolveViewerToken = (ctx: {
-	auth: {
-		getUserIdentity: () => Effect.Effect<Option.Option<{ subject: string }>>;
-	};
-	runQuery: ConfectActionCtx["runQuery"];
-}) =>
-	Effect.gen(function* () {
-		const identity = yield* ctx.auth.getUserIdentity();
-		if (Option.isNone(identity)) {
-			return yield* new NotAuthenticated({
-				reason: "User is not signed in",
-			});
-		}
-
-		const token = yield* lookupGitHubTokenByUserIdConfect(
-			ctx.runQuery,
-			identity.value.subject,
-		).pipe(
-			Effect.catchTag(
-				"NoGitHubTokenError",
-				(e) => new NotAuthenticated({ reason: e.reason }),
-			),
-		);
-
-		return token;
-	});
-
 // ---------------------------------------------------------------------------
 // Endpoint definitions
 // ---------------------------------------------------------------------------
@@ -183,30 +153,34 @@ const resolveViewerToken = (ctx: {
  * Fetch issue templates from GitHub and cache them.
  * Returns the parsed templates.
  */
-const fetchTemplatesDef = factory.action({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-	},
-	success: Schema.Array(IssueTemplate),
-	error: Schema.Union(NotAuthenticated, RepoNotFound),
-});
+const fetchTemplatesDef = factory
+	.action({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+		},
+		success: Schema.Array(IssueTemplate),
+		error: Schema.Union(NotAuthenticated, RepoNotFound),
+	})
+	.middleware(RepoPullByNameMiddleware);
 
 /**
  * Read cached templates for a repo (no GitHub API call).
  */
-const getCachedTemplatesDef = factory.query({
-	payload: {
-		ownerLogin: Schema.String,
-		name: Schema.String,
-	},
-	success: Schema.Array(IssueTemplate),
-});
+const getCachedTemplatesDef = factory
+	.query({
+		payload: {
+			ownerLogin: Schema.String,
+			name: Schema.String,
+		},
+		success: Schema.Array(IssueTemplate),
+	})
+	.middleware(RepoPullByNameMiddleware);
 
 /**
  * Upsert template cache for a repo.
  */
-const upsertTemplateCacheDef = factory.mutation({
+const upsertTemplateCacheDef = factory.internalMutation({
 	payload: {
 		repositoryId: Schema.Number,
 		templates: Schema.Array(IssueTemplate),
@@ -221,22 +195,26 @@ const upsertTemplateCacheDef = factory.mutation({
 fetchTemplatesDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectActionCtx;
-		const token = yield* resolveViewerToken(ctx);
+		const permissionContext = yield* RepoPermissionContext;
+		const repositoryId = permissionContext.repositoryId;
+		const installationId = permissionContext.installationId;
 
-		const repositoryInfoResult = yield* ctx.runQuery(
-			internal.rpc.codeBrowse.getRepoInfo,
-			{ ownerLogin: args.ownerLogin, name: args.name },
+		if (installationId <= 0) {
+			return yield* new RepoNotFound({
+				ownerLogin: args.ownerLogin,
+				name: args.name,
+			});
+		}
+
+		const token = yield* getInstallationToken(installationId).pipe(
+			Effect.mapError(
+				() =>
+					new RepoNotFound({
+						ownerLogin: args.ownerLogin,
+						name: args.name,
+					}),
+			),
 		);
-		const RepositoryInfoSchema = Schema.Struct({
-			found: Schema.Boolean,
-			repositoryId: Schema.optional(Schema.Number),
-		});
-		const repositoryInfo =
-			Schema.decodeUnknownSync(RepositoryInfoSchema)(repositoryInfoResult);
-		const repositoryId =
-			repositoryInfo.found && repositoryInfo.repositoryId !== undefined
-				? repositoryInfo.repositoryId
-				: null;
 
 		const gh = yield* Effect.provide(
 			GitHubApiClient,
@@ -250,14 +228,12 @@ fetchTemplatesDef.implement((args) =>
 
 		if (dirContents === null || !Array.isArray(dirContents)) {
 			// No templates directory — clear cache and return empty
-			if (repositoryId !== null) {
-				yield* ctx
-					.runMutation(api.rpc.issueTemplates.upsertTemplateCache, {
-						repositoryId,
-						templates: [],
-					})
-					.pipe(Effect.catchAll(() => Effect.void));
-			}
+			yield* ctx
+				.runMutation(internal.rpc.issueTemplates.upsertTemplateCache, {
+					repositoryId,
+					templates: [],
+				})
+				.pipe(Effect.catchAll(() => Effect.void));
 			return [] satisfies Array<typeof IssueTemplate.Type>;
 		}
 
@@ -310,14 +286,12 @@ fetchTemplatesDef.implement((args) =>
 		}
 
 		// Cache results
-		if (repositoryId !== null) {
-			yield* ctx
-				.runMutation(api.rpc.issueTemplates.upsertTemplateCache, {
-					repositoryId,
-					templates,
-				})
-				.pipe(Effect.catchAll(() => Effect.void));
-		}
+		yield* ctx
+			.runMutation(internal.rpc.issueTemplates.upsertTemplateCache, {
+				repositoryId,
+				templates,
+			})
+			.pipe(Effect.catchAll(() => Effect.void));
 
 		return templates;
 	}),
@@ -326,29 +300,12 @@ fetchTemplatesDef.implement((args) =>
 getCachedTemplatesDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectQueryCtx;
-		const repo = yield* ctx.db
-			.query("github_repositories")
-			.withIndex("by_ownerLogin_and_name", (q) =>
-				q.eq("ownerLogin", args.ownerLogin).eq("name", args.name),
-			)
-			.first();
-
-		if (Option.isNone(repo)) {
-			return [] satisfies Array<typeof IssueTemplate.Type>;
-		}
-
-		const access = yield* resolveRepoAccess(
-			repo.value.githubRepoId,
-			repo.value.private,
-		).pipe(Effect.either);
-		if (access._tag === "Left") {
-			return [] satisfies Array<typeof IssueTemplate.Type>;
-		}
+		const permissionContext = yield* RepoPermissionContext;
 
 		const cached = yield* ctx.db
 			.query("github_issue_template_cache")
 			.withIndex("by_repositoryId", (q) =>
-				q.eq("repositoryId", repo.value.githubRepoId),
+				q.eq("repositoryId", permissionContext.repositoryId),
 			)
 			.collect();
 
@@ -367,29 +324,6 @@ getCachedTemplatesDef.implement((args) =>
 upsertTemplateCacheDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
-		const identity = yield* ctx.auth.getUserIdentity();
-		if (Option.isNone(identity)) {
-			return { cached: false };
-		}
-
-		const repo = yield* ctx.db
-			.query("github_repositories")
-			.withIndex("by_githubRepoId", (q) =>
-				q.eq("githubRepoId", args.repositoryId),
-			)
-			.first();
-		if (Option.isNone(repo)) {
-			return { cached: false };
-		}
-
-		const permission = yield* verifyRepoPermissionForMutation(
-			identity.value.subject,
-			args.repositoryId,
-			"pull",
-		).pipe(Effect.either);
-		if (permission._tag === "Left") {
-			return { cached: false };
-		}
 
 		const now = Date.now();
 
@@ -434,7 +368,7 @@ const issueTemplatesModule = makeRpcModule(
 		getCachedTemplates: getCachedTemplatesDef,
 		upsertTemplateCache: upsertTemplateCacheDef,
 	},
-	{ middlewares: DatabaseRpcTelemetryLayer },
+	{ middlewares: DatabaseRpcModuleMiddlewares },
 );
 
 export const { fetchTemplates, getCachedTemplates, upsertTemplateCache } =
