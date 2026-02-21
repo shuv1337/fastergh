@@ -1,20 +1,52 @@
-import { Context, Data, Effect, Option } from "effect";
+import { Context, Data, Effect, Option, Schema } from "effect";
 import { ConfectMutationCtx, ConfectQueryCtx } from "../confect";
 
 // ---------------------------------------------------------------------------
 // Permission Level
 // ---------------------------------------------------------------------------
 
+export const RepoPermissionLevelSchema = Schema.Literal(
+	"pull",
+	"triage",
+	"push",
+	"maintain",
+	"admin",
+);
+
 /**
  * GitHub permission levels, ordered from least to most privileged.
  * Each level is cumulative — e.g. "push" implies "triage" and "pull".
  */
-export type GitHubPermissionLevel =
-	| "pull"
-	| "triage"
-	| "push"
-	| "maintain"
-	| "admin";
+export type GitHubPermissionLevel = Schema.Schema.Type<
+	typeof RepoPermissionLevelSchema
+>;
+
+type RepoPermissionRowFlags = {
+	readonly pull: boolean;
+	readonly triage: boolean;
+	readonly push: boolean;
+	readonly maintain: boolean;
+	readonly admin: boolean;
+};
+
+type PermissionLookupDb = ConfectQueryCtx["db"] | ConfectMutationCtx["db"];
+
+type EvaluateRepoPermissionParams = {
+	readonly repositoryId: number;
+	readonly isPrivate: boolean;
+	readonly userId: string | null;
+	readonly required: GitHubPermissionLevel;
+	readonly requireAuthenticated?: boolean;
+};
+
+export type RepoPermissionDecision = {
+	readonly isAllowed: boolean;
+	readonly reason: "allowed" | "not_authenticated" | "insufficient_permission";
+	readonly required: GitHubPermissionLevel;
+	readonly actual: GitHubPermissionLevel | null;
+	readonly repositoryId: number;
+	readonly userId: string | null;
+};
 
 /**
  * Numeric rank for each permission level.
@@ -33,13 +65,9 @@ const PERMISSION_RANK: Record<GitHubPermissionLevel, number> = {
  * Returns the most privileged level that is `true`, or `null`
  * if none are set.
  */
-const highestPermissionFromFlags = (flags: {
-	readonly pull: boolean;
-	readonly triage: boolean;
-	readonly push: boolean;
-	readonly maintain: boolean;
-	readonly admin: boolean;
-}): GitHubPermissionLevel | null => {
+const highestPermissionFromFlags = (
+	flags: RepoPermissionRowFlags,
+): GitHubPermissionLevel | null => {
 	if (flags.admin) return "admin";
 	if (flags.maintain) return "maintain";
 	if (flags.push) return "push";
@@ -55,6 +83,136 @@ const meetsRequirement = (
 	actual: GitHubPermissionLevel,
 	required: GitHubPermissionLevel,
 ) => PERMISSION_RANK[actual] >= PERMISSION_RANK[required];
+
+const getPermissionRow = (
+	db: PermissionLookupDb,
+	userId: string,
+	repositoryId: number,
+) =>
+	db
+		.query("github_user_repo_permissions")
+		.withIndex("by_userId_and_repositoryId", (q) =>
+			q.eq("userId", userId).eq("repositoryId", repositoryId),
+		)
+		.first();
+
+const allowDecision = (
+	params: EvaluateRepoPermissionParams,
+	actual: GitHubPermissionLevel,
+): RepoPermissionDecision => ({
+	isAllowed: true,
+	reason: "allowed",
+	required: params.required,
+	actual,
+	repositoryId: params.repositoryId,
+	userId: params.userId,
+});
+
+const denyNotAuthenticatedDecision = (
+	params: EvaluateRepoPermissionParams,
+): RepoPermissionDecision => ({
+	isAllowed: false,
+	reason: "not_authenticated",
+	required: params.required,
+	actual: null,
+	repositoryId: params.repositoryId,
+	userId: params.userId,
+});
+
+const denyInsufficientPermissionDecision = (
+	params: EvaluateRepoPermissionParams,
+	actual: GitHubPermissionLevel | null,
+): RepoPermissionDecision => ({
+	isAllowed: false,
+	reason: "insufficient_permission",
+	required: params.required,
+	actual,
+	repositoryId: params.repositoryId,
+	userId: params.userId,
+});
+
+/**
+ * Canonical permission evaluator used by all repository access checks.
+ *
+ * Rules:
+ * - `requireAuthenticated` denies anonymous access even for public pull.
+ * - Public repos implicitly grant `pull`.
+ * - `triage+` always requires an authenticated user with explicit row flags.
+ */
+export const evaluateRepoPermissionWithDb = (
+	db: PermissionLookupDb,
+	params: EvaluateRepoPermissionParams,
+) =>
+	Effect.gen(function* () {
+		const requireAuthenticated = params.requireAuthenticated ?? false;
+
+		if (requireAuthenticated && params.userId === null) {
+			return denyNotAuthenticatedDecision(params);
+		}
+
+		if (params.userId === null) {
+			if (!params.isPrivate && meetsRequirement("pull", params.required)) {
+				return allowDecision(params, "pull");
+			}
+
+			return denyNotAuthenticatedDecision(params);
+		}
+
+		const permission = yield* getPermissionRow(
+			db,
+			params.userId,
+			params.repositoryId,
+		);
+
+		if (Option.isSome(permission)) {
+			const actual = highestPermissionFromFlags(permission.value);
+			if (actual !== null && meetsRequirement(actual, params.required)) {
+				return allowDecision(params, actual);
+			}
+
+			return denyInsufficientPermissionDecision(params, actual);
+		}
+
+		if (!params.isPrivate && meetsRequirement("pull", params.required)) {
+			return allowDecision(params, "pull");
+		}
+
+		return denyInsufficientPermissionDecision(params, null);
+	});
+
+export const evaluateRepoPermission = (params: EvaluateRepoPermissionParams) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectQueryCtx;
+		return yield* evaluateRepoPermissionWithDb(ctx.db, params);
+	});
+
+export const evaluateRepoPermissionForMutation = (
+	params: EvaluateRepoPermissionParams,
+) =>
+	Effect.gen(function* () {
+		const ctx = yield* ConfectMutationCtx;
+		return yield* evaluateRepoPermissionWithDb(ctx.db, params);
+	});
+
+export const hasRepositoryPermissionWithDb = (
+	db: PermissionLookupDb,
+	params: EvaluateRepoPermissionParams,
+) =>
+	evaluateRepoPermissionWithDb(db, params).pipe(
+		Effect.map((decision) => decision.isAllowed),
+	);
+
+export const hasRepositoryPermission = (params: EvaluateRepoPermissionParams) =>
+	evaluateRepoPermission(params).pipe(
+		Effect.map((decision) => decision.isAllowed),
+	);
+
+export const hasRepositoryPermissionForMutation = (
+	params: EvaluateRepoPermissionParams,
+) =>
+	evaluateRepoPermissionForMutation(params).pipe(
+		Effect.map((decision) => decision.isAllowed),
+	);
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -133,46 +291,28 @@ export const verifyRepoPermission = (
 ) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectQueryCtx;
-
-		// Look up the explicit permission row
-		const permRow = yield* ctx.db
-			.query("github_user_repo_permissions")
-			.withIndex("by_userId_and_repositoryId", (q) =>
-				q.eq("userId", userId).eq("repositoryId", repositoryId),
-			)
-			.first();
-
-		if (Option.isSome(permRow)) {
-			const level = highestPermissionFromFlags(permRow.value);
-			if (level !== null && meetsRequirement(level, required)) {
-				return level;
-			}
-			return yield* new InsufficientPermissionError({
-				userId,
-				repositoryId,
-				required,
-				actual: level,
-			});
-		}
-
-		// No explicit permission row — check if the repo is public.
-		// Public repos grant implicit "pull" access.
 		const repo = yield* ctx.db
 			.query("github_repositories")
 			.withIndex("by_githubRepoId", (q) => q.eq("githubRepoId", repositoryId))
 			.first();
 
-		if (Option.isSome(repo) && !repo.value.private) {
-			if (meetsRequirement("pull", required)) {
-				return "pull" satisfies GitHubPermissionLevel;
-			}
+		const isPrivate = Option.isSome(repo) ? repo.value.private : true;
+		const decision = yield* evaluateRepoPermissionWithDb(ctx.db, {
+			repositoryId,
+			isPrivate,
+			userId,
+			required,
+		});
+
+		if (decision.isAllowed && decision.actual !== null) {
+			return decision.actual;
 		}
 
 		return yield* new InsufficientPermissionError({
 			userId,
 			repositoryId,
 			required,
-			actual: Option.isSome(repo) && !repo.value.private ? "pull" : null,
+			actual: decision.actual,
 		});
 	});
 
@@ -240,43 +380,28 @@ export const verifyRepoPermissionForMutation = (
 ) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectMutationCtx;
-
-		const permRow = yield* ctx.db
-			.query("github_user_repo_permissions")
-			.withIndex("by_userId_and_repositoryId", (q) =>
-				q.eq("userId", userId).eq("repositoryId", repositoryId),
-			)
-			.first();
-
-		if (Option.isSome(permRow)) {
-			const level = highestPermissionFromFlags(permRow.value);
-			if (level !== null && meetsRequirement(level, required)) {
-				return level;
-			}
-			return yield* new InsufficientPermissionError({
-				userId,
-				repositoryId,
-				required,
-				actual: level,
-			});
-		}
-
 		const repo = yield* ctx.db
 			.query("github_repositories")
 			.withIndex("by_githubRepoId", (q) => q.eq("githubRepoId", repositoryId))
 			.first();
 
-		if (Option.isSome(repo) && !repo.value.private) {
-			if (meetsRequirement("pull", required)) {
-				return "pull" satisfies GitHubPermissionLevel;
-			}
+		const isPrivate = Option.isSome(repo) ? repo.value.private : true;
+		const decision = yield* evaluateRepoPermissionWithDb(ctx.db, {
+			repositoryId,
+			isPrivate,
+			userId,
+			required,
+		});
+
+		if (decision.isAllowed && decision.actual !== null) {
+			return decision.actual;
 		}
 
 		return yield* new InsufficientPermissionError({
 			userId,
 			repositoryId,
 			required,
-			actual: Option.isSome(repo) && !repo.value.private ? "pull" : null,
+			actual: decision.actual,
 		});
 	});
 
@@ -321,51 +446,41 @@ export const resolveRepoAccess = (repositoryId: number, isPrivate: boolean) =>
 		const ctx = yield* ConfectQueryCtx;
 		const identity = yield* ctx.auth.getUserIdentity();
 
-		if (Option.isNone(identity)) {
-			// Unauthenticated — only public repos are accessible
-			if (!isPrivate) {
-				return {
-					userId: "anonymous",
-					repositoryId,
-					level: "pull" satisfies GitHubPermissionLevel,
-				};
+		const userId = Option.isSome(identity) ? identity.value.subject : null;
+		const decision = yield* evaluateRepoPermissionWithDb(ctx.db, {
+			repositoryId,
+			isPrivate,
+			userId,
+			required: "pull",
+		});
+
+		if (!decision.isAllowed) {
+			if (decision.reason === "not_authenticated") {
+				return yield* new NotAuthenticatedError({
+					reason: "Authentication required to access private repositories",
+				});
 			}
-			return yield* new NotAuthenticatedError({
-				reason: "Authentication required to access private repositories",
+
+			return yield* new InsufficientPermissionError({
+				userId: decision.userId ?? "anonymous",
+				repositoryId,
+				required: "pull",
+				actual: decision.actual,
 			});
 		}
 
-		const userId = identity.value.subject;
-
-		// Look up explicit permissions
-		const permRow = yield* ctx.db
-			.query("github_user_repo_permissions")
-			.withIndex("by_userId_and_repositoryId", (q) =>
-				q.eq("userId", userId).eq("repositoryId", repositoryId),
-			)
-			.first();
-
-		if (Option.isSome(permRow)) {
-			const level = highestPermissionFromFlags(permRow.value);
-			if (level !== null) {
-				return { userId, repositoryId, level };
-			}
-		}
-
-		// No explicit permissions — public repos get implicit pull
-		if (!isPrivate) {
-			return {
-				userId,
+		if (decision.actual === null) {
+			return yield* new InsufficientPermissionError({
+				userId: decision.userId ?? "anonymous",
 				repositoryId,
-				level: "pull" satisfies GitHubPermissionLevel,
-			};
+				required: "pull",
+				actual: null,
+			});
 		}
 
-		// Private repo, no permissions
-		return yield* new InsufficientPermissionError({
-			userId,
+		return {
+			userId: decision.userId ?? "anonymous",
 			repositoryId,
-			required: "pull",
-			actual: null,
-		});
+			level: decision.actual,
+		};
 	});

@@ -25,6 +25,10 @@ import {
 } from "../shared/generated_github_client";
 import { GitHubApiClient } from "../shared/githubApi";
 import { getInstallationToken } from "../shared/githubApp";
+import {
+	hasRepositoryPermission,
+	RepoPermissionLevelSchema,
+} from "../shared/permissions";
 import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
 import {
 	ReadGitHubRepoByNameMiddleware,
@@ -94,52 +98,6 @@ const emptyTreeResult = (sha: string) => ({
 
 const parseTreeEntryType = (t: string): "blob" | "tree" | "commit" =>
 	t === "tree" ? "tree" : t === "commit" ? "commit" : "blob";
-
-const hasAnyPermission = (permission: {
-	readonly pull: boolean;
-	readonly triage: boolean;
-	readonly push: boolean;
-	readonly maintain: boolean;
-	readonly admin: boolean;
-}) =>
-	permission.pull ||
-	permission.triage ||
-	permission.push ||
-	permission.maintain ||
-	permission.admin;
-
-const RepoPermissionLevelSchema = Schema.Literal(
-	"pull",
-	"triage",
-	"push",
-	"maintain",
-	"admin",
-);
-
-type RepoPermissionLevel = Schema.Schema.Type<typeof RepoPermissionLevelSchema>;
-
-const getPermissionRank = (level: RepoPermissionLevel) => {
-	if (level === "admin") return 4;
-	if (level === "maintain") return 3;
-	if (level === "push") return 2;
-	if (level === "triage") return 1;
-	return 0;
-};
-
-const highestPermissionLevel = (permission: {
-	pull: boolean;
-	triage: boolean;
-	push: boolean;
-	maintain: boolean;
-	admin: boolean;
-}): RepoPermissionLevel | null => {
-	if (permission.admin) return "admin";
-	if (permission.maintain) return "maintain";
-	if (permission.push) return "push";
-	if (permission.triage) return "triage";
-	if (permission.pull) return "pull";
-	return null;
-};
 
 type FileContentData = {
 	path: string;
@@ -580,65 +538,25 @@ getRepoInfoByIdDef.implement((args) =>
 
 hasRepoReadAccessDef.implement((args) =>
 	Effect.gen(function* () {
-		const ctx = yield* ConfectQueryCtx;
-
-		if (!args.isPrivate) {
-			return true;
-		}
-
-		if (args.userId === null) {
-			return false;
-		}
-
-		const permission = yield* ctx.db
-			.query("github_user_repo_permissions")
-			.withIndex("by_userId_and_repositoryId", (q) =>
-				q.eq("userId", args.userId).eq("repositoryId", args.repositoryId),
-			)
-			.first();
-
-		if (Option.isNone(permission)) {
-			return false;
-		}
-
-		return hasAnyPermission(permission.value);
+		return yield* hasRepositoryPermission({
+			repositoryId: args.repositoryId,
+			isPrivate: args.isPrivate,
+			userId: args.userId,
+			required: "pull",
+			requireAuthenticated: false,
+		});
 	}),
 );
 
 hasRepoPermissionDef.implement((args) =>
 	Effect.gen(function* () {
-		const ctx = yield* ConfectQueryCtx;
-
-		const requireAuthenticated = args.requireAuthenticated ?? false;
-		if (requireAuthenticated && args.userId === null) {
-			return false;
-		}
-
-		if (!args.isPrivate && args.required === "pull") {
-			return true;
-		}
-
-		if (args.userId === null) {
-			return false;
-		}
-
-		const permission = yield* ctx.db
-			.query("github_user_repo_permissions")
-			.withIndex("by_userId_and_repositoryId", (q) =>
-				q.eq("userId", args.userId).eq("repositoryId", args.repositoryId),
-			)
-			.first();
-
-		if (Option.isNone(permission)) {
-			return false;
-		}
-
-		const highestLevel = highestPermissionLevel(permission.value);
-		if (highestLevel === null) {
-			return false;
-		}
-
-		return getPermissionRank(highestLevel) >= getPermissionRank(args.required);
+		return yield* hasRepositoryPermission({
+			repositoryId: args.repositoryId,
+			isPrivate: args.isPrivate,
+			userId: args.userId,
+			required: args.required,
+			requireAuthenticated: args.requireAuthenticated,
+		});
 	}),
 );
 

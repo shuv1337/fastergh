@@ -6,14 +6,7 @@ import {
 } from "@packages/confect/rpc";
 import { Context, Effect, Either, Schema } from "effect";
 import { internal } from "../_generated/api";
-
-const RepoPermissionLevelSchema = Schema.Literal(
-	"pull",
-	"triage",
-	"push",
-	"maintain",
-	"admin",
-);
+import { RepoPermissionLevelSchema } from "../shared/permissions";
 
 type RepoPermissionLevel = Schema.Schema.Type<typeof RepoPermissionLevelSchema>;
 
@@ -499,11 +492,6 @@ const checkReadPermission = (
 	userId: string | null,
 ) =>
 	Effect.gen(function* () {
-		// Match GitHub parity: public repositories are readable without membership.
-		if (!isPrivate) {
-			return true;
-		}
-
 		const hasPermissionRaw = yield* Effect.promise(() =>
 			options.ctx.runQuery(internal.rpc.codeBrowse.hasRepoPermission, {
 				repositoryId,
