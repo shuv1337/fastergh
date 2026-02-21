@@ -1,4 +1,7 @@
-import { HomeDashboard } from "./home-dashboard-client";
+import { connection } from "next/server";
+import { Suspense } from "react";
+import { serverQueries } from "@/lib/server-queries";
+import { DashboardSkeleton, HomeDashboard } from "./home-dashboard-client";
 
 /**
  * Root page for the @detail slot — shows the personalized launch pad at "/".
@@ -7,5 +10,17 @@ import { HomeDashboard } from "./home-dashboard-client";
  * instead of showing a stale detail panel.
  */
 export default function DetailSlot() {
-	return <HomeDashboard />;
+	return (
+		<Suspense fallback={<DashboardSkeleton />}>
+			<HomeDashboardContent />
+		</Suspense>
+	);
+}
+
+async function HomeDashboardContent() {
+	await connection();
+	const initialDashboard = await serverQueries.getHomeDashboard.queryPromise(
+		{},
+	);
+	return <HomeDashboard initialDashboard={initialDashboard} />;
 }

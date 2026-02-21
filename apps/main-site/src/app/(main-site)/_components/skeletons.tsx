@@ -33,7 +33,7 @@ export function ListSkeleton() {
 export function IssueDetailSkeleton() {
 	return (
 		<div className="h-full overflow-y-auto animate-pulse">
-			<div className="p-4 max-w-4xl space-y-3">
+			<div className="p-4 space-y-3">
 				{/* Header: state icon + title + meta */}
 				<div className="flex items-start gap-2.5">
 					<div className="size-5 rounded-full bg-muted shrink-0 mt-1" />
@@ -108,6 +108,54 @@ export function IssueDetailSkeleton() {
  * Skeleton for the PR detail view.
  * Matches the two-column layout: diff files + right sidebar with branches, checks, comments.
  */
+/**
+ * Skeleton for the workflow run detail view.
+ * Matches the single-column layout: title, status badge, metadata, jobs.
+ */
+export function WorkflowRunDetailSkeleton() {
+	return (
+		<div className="h-full overflow-y-auto animate-pulse">
+			<div className="p-4 space-y-4">
+				{/* Header: icon + title + meta */}
+				<div className="flex items-start gap-2.5">
+					<div className="size-5 rounded-full bg-muted shrink-0 mt-1" />
+					<div className="min-w-0 flex-1 space-y-1.5">
+						<div className="h-4 w-1/2 rounded bg-muted" />
+						<div className="flex items-center gap-2">
+							<div className="h-3 w-8 rounded bg-muted" />
+							<div className="h-4 w-16 rounded-full bg-muted" />
+							<div className="size-4 rounded-full bg-muted" />
+							<div className="h-3 w-20 rounded bg-muted" />
+						</div>
+					</div>
+				</div>
+
+				{/* Metadata badges */}
+				<div className="flex gap-2">
+					<div className="h-5 w-20 rounded-full bg-muted" />
+					<div className="h-5 w-16 rounded-full bg-muted" />
+					<div className="h-5 w-14 rounded-full bg-muted" />
+				</div>
+
+				{/* Jobs section */}
+				<div className="space-y-1.5">
+					<div className="h-4 w-16 rounded bg-muted" />
+					{Array.from({ length: 4 }, (_, i) => (
+						<div key={i} className="rounded-lg border p-3 space-y-0">
+							<div className="flex items-center gap-2">
+								<div className="size-4 rounded-full bg-muted" />
+								<div className="h-3.5 w-40 rounded bg-muted flex-1" />
+								<div className="h-3 w-10 rounded bg-muted" />
+								<div className="h-4 w-14 rounded-full bg-muted" />
+							</div>
+						</div>
+					))}
+				</div>
+			</div>
+		</div>
+	);
+}
+
 export function PrDetailSkeleton() {
 	return (
 		<div className="flex h-full animate-pulse">

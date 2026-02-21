@@ -1,10 +1,18 @@
+import { connection } from "next/server";
 import { Suspense } from "react";
-import { SidebarClient } from "./sidebar-client";
+import { serverQueries } from "@/lib/server-queries";
+import { SidebarClient, SidebarSkeleton } from "./sidebar-client";
 
 export default function SidebarSlot() {
 	return (
-		<Suspense>
-			<SidebarClient />
+		<Suspense fallback={<SidebarSkeleton />}>
+			<SidebarContent />
 		</Suspense>
 	);
+}
+
+async function SidebarContent() {
+	await connection();
+	const initialRepos = await serverQueries.listRepos.queryPromise({});
+	return <SidebarClient initialRepos={initialRepos} />;
 }

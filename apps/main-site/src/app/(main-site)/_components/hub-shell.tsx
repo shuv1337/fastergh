@@ -10,6 +10,7 @@ import {
 import { ArrowLeft } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { type ReactNode, Suspense } from "react";
+import { SearchCommand } from "./search-command";
 
 /**
  * Two-panel resizable shell that positions parallel route slots.
@@ -60,6 +61,9 @@ export function HubShell({
 				</Suspense>
 			</div>
 
+			<Suspense fallback={null}>
+				<SearchCommand />
+			</Suspense>
 			<KeyboardShortcutsDialog />
 		</div>
 	);

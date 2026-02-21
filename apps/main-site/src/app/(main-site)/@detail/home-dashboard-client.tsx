@@ -1,6 +1,7 @@
 "use client";
 
 import { Result, useAtomValue } from "@effect-atom/atom-react";
+import { useSubscriptionWithInitial } from "@packages/confect/rpc";
 import {
 	Avatar,
 	AvatarFallback,
@@ -8,31 +9,32 @@ import {
 } from "@packages/ui/components/avatar";
 import { Badge } from "@packages/ui/components/badge";
 import { Button } from "@packages/ui/components/button";
+import {
+	Card,
+	CardContent,
+	CardHeader,
+	CardTitle,
+} from "@packages/ui/components/card";
 import { Link } from "@packages/ui/components/link";
 import { Skeleton } from "@packages/ui/components/skeleton";
 import { GitHubIcon } from "@packages/ui/icons/index";
 import { authClient } from "@packages/ui/lib/auth-client";
 import { cn } from "@packages/ui/lib/utils";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
-import { Option } from "effect";
 import {
 	Activity,
+	AlertTriangle,
 	ArrowRight,
+	CheckCircle2,
 	CircleDot,
 	Eye,
 	GitBranch,
-	GitMerge,
 	GitPullRequest,
 	MessageCircle,
 	Rocket,
-	TriangleAlert,
 	User,
 } from "lucide-react";
-import { useMemo } from "react";
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+import { type ReactNode, useMemo, useState } from "react";
 
 function formatRelative(timestamp: number): string {
 	const diff = Math.floor((Date.now() - timestamp) / 1000);
@@ -49,312 +51,7 @@ function formatRelative(timestamp: number): string {
 
 const EmptyPayload: Record<string, never> = {};
 
-// ---------------------------------------------------------------------------
-// Main component
-// ---------------------------------------------------------------------------
-
-export function HomeDashboard() {
-	const session = authClient.useSession();
-	const client = useProjectionQueries();
-	const dashboardAtom = useMemo(
-		() => client.getHomeDashboard.subscription(EmptyPayload),
-		[client],
-	);
-	const dashboardResult = useAtomValue(dashboardAtom);
-
-	if (session.isPending || Result.isInitial(dashboardResult)) {
-		return <DashboardSkeleton />;
-	}
-
-	const valueOption = Result.value(dashboardResult);
-	if (Option.isNone(valueOption)) return <DashboardSkeleton />;
-
-	const {
-		githubLogin,
-		yourPrs,
-		needsAttentionPrs,
-		recentPrs,
-		recentActivity,
-		repos,
-	} = valueOption.value;
-
-	const isSignedIn = session.data !== null;
-
-	// Aggregate stats across all repos
-	const totalOpenPrs = repos.reduce((sum, r) => sum + r.openPrCount, 0);
-	const totalOpenIssues = repos.reduce((sum, r) => sum + r.openIssueCount, 0);
-	const totalFailing = repos.reduce((sum, r) => sum + r.failingCheckCount, 0);
-
-	return (
-		<div className="h-full overflow-y-auto">
-			<div className="mx-auto max-w-2xl px-6 py-8">
-				{/* Header */}
-				<div className="mb-8">
-					<div className="flex items-center gap-2 mb-1">
-						<Rocket className="size-4 text-muted-foreground" />
-						<h1 className="text-lg font-bold tracking-tight text-foreground">
-							{githubLogin
-								? `Hey, ${githubLogin}`
-								: isSignedIn
-									? "Launch Pad"
-									: "QuickHub"}
-						</h1>
-					</div>
-					<p className="text-xs text-muted-foreground">
-						{!isSignedIn
-							? "A real-time GitHub dashboard — sign in to personalize"
-							: repos.length === 0
-								? "Get started by adding a repository"
-								: `Your overview across ${repos.length} ${repos.length === 1 ? "repository" : "repositories"}`}
-					</p>
-				</div>
-
-				{/* Sign-in banner for unauthenticated users */}
-				{!isSignedIn && (
-					<div className="mb-8 rounded-lg border border-border/60 bg-muted/30 px-4 py-4">
-						<div className="flex items-start gap-3">
-							<div className="size-9 rounded-full bg-foreground/5 flex items-center justify-center shrink-0">
-								<GitHubIcon className="size-4 text-foreground/70" />
-							</div>
-							<div className="flex-1 min-w-0">
-								<p className="text-xs font-semibold text-foreground mb-0.5">
-									Sign in to personalize your dashboard
-								</p>
-								<p className="text-[11px] text-muted-foreground leading-relaxed mb-3">
-									See your open PRs, track CI status, and jump straight into
-									what matters. Connect your GitHub account to get started.
-								</p>
-								<Button
-									size="sm"
-									className="h-7 text-xs gap-1.5"
-									onClick={() => {
-										authClient.signIn.social({ provider: "github" });
-									}}
-								>
-									<GitHubIcon className="size-3.5" />
-									Sign in with GitHub
-								</Button>
-							</div>
-						</div>
-					</div>
-				)}
-
-				{/* Aggregate stats */}
-				{repos.length > 0 && (
-					<div className="grid grid-cols-3 gap-3 mb-8">
-						<div className="rounded-lg border px-3 py-2.5">
-							<div className="flex items-center gap-1.5 mb-1">
-								<GitPullRequest className="size-3 text-green-500" />
-								<span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-									Open PRs
-								</span>
-							</div>
-							<p className="text-xl font-bold tabular-nums text-foreground">
-								{totalOpenPrs}
-							</p>
-						</div>
-						<div className="rounded-lg border px-3 py-2.5">
-							<div className="flex items-center gap-1.5 mb-1">
-								<CircleDot className="size-3 text-blue-500" />
-								<span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-									Open Issues
-								</span>
-							</div>
-							<p className="text-xl font-bold tabular-nums text-foreground">
-								{totalOpenIssues}
-							</p>
-						</div>
-						<div
-							className={cn(
-								"rounded-lg border px-3 py-2.5",
-								totalFailing > 0 && "border-red-500/20 bg-red-500/[0.02]",
-							)}
-						>
-							<div className="flex items-center gap-1.5 mb-1">
-								<TriangleAlert
-									className={cn(
-										"size-3",
-										totalFailing > 0 ? "text-red-500" : "text-muted-foreground",
-									)}
-								/>
-								<span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-									Failing
-								</span>
-							</div>
-							<p
-								className={cn(
-									"text-xl font-bold tabular-nums",
-									totalFailing > 0 ? "text-red-500" : "text-foreground",
-								)}
-							>
-								{totalFailing}
-							</p>
-						</div>
-					</div>
-				)}
-
-				{/* Your open PRs — only shown when signed in */}
-				{yourPrs.length > 0 && (
-					<section className="mb-8">
-						<div className="flex items-center gap-1.5 mb-2">
-							<User className="size-3.5 text-green-500" />
-							<h2 className="text-xs font-semibold text-foreground">
-								Your Open Pull Requests
-							</h2>
-							<span className="ml-auto text-[10px] tabular-nums text-muted-foreground">
-								{yourPrs.length}
-							</span>
-						</div>
-						<PrList prs={yourPrs} />
-					</section>
-				)}
-
-				{/* Needs your attention — PRs where user is reviewer or assignee */}
-				{needsAttentionPrs.length > 0 && (
-					<section className="mb-8">
-						<div className="flex items-center gap-1.5 mb-2">
-							<Eye className="size-3.5 text-yellow-500" />
-							<h2 className="text-xs font-semibold text-foreground">
-								Needs Your Attention
-							</h2>
-							<span className="ml-auto text-[10px] tabular-nums text-muted-foreground">
-								{needsAttentionPrs.length}
-							</span>
-						</div>
-						<PrList prs={needsAttentionPrs} />
-					</section>
-				)}
-
-				{/* Recent PRs across all repos */}
-				{recentPrs.length > 0 && (
-					<section className="mb-8">
-						<div className="flex items-center gap-1.5 mb-2">
-							<GitPullRequest className="size-3.5 text-green-500" />
-							<h2 className="text-xs font-semibold text-foreground">
-								{yourPrs.length > 0 || needsAttentionPrs.length > 0
-									? "Other Open Pull Requests"
-									: "Open Pull Requests"}
-							</h2>
-						</div>
-						<PrList prs={recentPrs} />
-					</section>
-				)}
-
-				{/* Recent Activity */}
-				{recentActivity.length > 0 && (
-					<section className="mb-8">
-						<div className="flex items-center gap-1.5 mb-2">
-							<Activity className="size-3.5 text-blue-500" />
-							<h2 className="text-xs font-semibold text-foreground">
-								Recent Activity
-							</h2>
-						</div>
-						<div className="divide-y rounded-lg border">
-							{recentActivity.map((activity, i) => (
-								<ActivityRow
-									key={`${activity.ownerLogin}/${activity.repoName}-${activity.createdAt}-${i}`}
-									activity={activity}
-								/>
-							))}
-						</div>
-					</section>
-				)}
-
-				{/* Quick-access repo grid */}
-				{repos.length > 0 && (
-					<section>
-						<div className="flex items-center gap-1.5 mb-2">
-							<GitBranch className="size-3.5 text-muted-foreground" />
-							<h2 className="text-xs font-semibold text-foreground">
-								Repositories
-							</h2>
-						</div>
-						<div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-							{repos.map((repo) => (
-								<Link
-									key={repo.fullName}
-									href={`/${repo.ownerLogin}/${repo.name}/pulls`}
-									className="flex flex-col gap-1 rounded-lg border px-3 py-2.5 transition-colors hover:bg-muted no-underline group"
-								>
-									<div className="flex items-center gap-1.5">
-										<span className="font-semibold text-xs text-foreground truncate">
-											{repo.name}
-										</span>
-										<ArrowRight className="size-3 text-muted-foreground/0 group-hover:text-muted-foreground transition-colors ml-auto shrink-0" />
-									</div>
-									<span className="text-[10px] text-muted-foreground truncate">
-										{repo.ownerLogin}
-									</span>
-									<div className="flex items-center gap-2 text-[10px] tabular-nums text-muted-foreground mt-0.5">
-										<span className="flex items-center gap-0.5">
-											<GitPullRequest className="size-2.5 text-green-500" />
-											{repo.openPrCount}
-										</span>
-										<span className="flex items-center gap-0.5">
-											<CircleDot className="size-2.5 text-blue-500" />
-											{repo.openIssueCount}
-										</span>
-										{repo.failingCheckCount > 0 && (
-											<span className="flex items-center gap-0.5 text-red-500 font-medium">
-												<TriangleAlert className="size-2.5" />
-												{repo.failingCheckCount}
-											</span>
-										)}
-										{repo.lastPushAt && (
-											<span className="ml-auto text-muted-foreground/70">
-												{formatRelative(repo.lastPushAt)}
-											</span>
-										)}
-									</div>
-								</Link>
-							))}
-						</div>
-					</section>
-				)}
-
-				{/* Empty state — only for signed-in users with no repos */}
-				{isSignedIn && repos.length === 0 && (
-					<div className="text-center py-16">
-						<div className="mx-auto size-12 rounded-full bg-muted/40 flex items-center justify-center">
-							<Rocket className="size-5 text-muted-foreground/30" />
-						</div>
-						<p className="mt-3 text-xs font-medium text-muted-foreground">
-							No repositories connected yet
-						</p>
-						<p className="mt-1 text-[11px] text-muted-foreground/70">
-							Add a repository from the sidebar to get started
-						</p>
-					</div>
-				)}
-
-				{/* Empty state for signed-out with no data */}
-				{!isSignedIn &&
-					repos.length === 0 &&
-					recentPrs.length === 0 &&
-					recentActivity.length === 0 && (
-						<div className="text-center py-16">
-							<div className="mx-auto size-12 rounded-full bg-muted/40 flex items-center justify-center">
-								<Rocket className="size-5 text-muted-foreground/30" />
-							</div>
-							<p className="mt-3 text-xs font-medium text-muted-foreground">
-								Nothing to show yet
-							</p>
-							<p className="mt-1 text-[11px] text-muted-foreground/70 max-w-[240px] mx-auto">
-								Sign in with GitHub to connect your repositories and see your
-								personalized dashboard
-							</p>
-						</div>
-					)}
-			</div>
-		</div>
-	);
-}
-
-// ---------------------------------------------------------------------------
-// PR list
-// ---------------------------------------------------------------------------
-
-type PrItem = {
+type DashboardPrItem = {
 	ownerLogin: string;
 	repoName: string;
 	number: number;
@@ -368,92 +65,613 @@ type PrItem = {
 	githubUpdatedAt: number;
 };
 
-function PrList({ prs }: { prs: ReadonlyArray<PrItem> }) {
+type ActivityItem = {
+	ownerLogin: string;
+	repoName: string;
+	activityType: string;
+	title: string;
+	description: string | null;
+	actorLogin: string | null;
+	actorAvatarUrl: string | null;
+	entityNumber: number | null;
+	createdAt: number;
+};
+
+type RepoSummary = {
+	ownerLogin: string;
+	name: string;
+	fullName: string;
+	openPrCount: number;
+	openIssueCount: number;
+	failingCheckCount: number;
+	lastPushAt: number | null;
+};
+
+export type DashboardData = {
+	githubLogin: string | null;
+	yourPrs: ReadonlyArray<DashboardPrItem>;
+	needsAttentionPrs: ReadonlyArray<DashboardPrItem>;
+	recentPrs: ReadonlyArray<DashboardPrItem>;
+	recentActivity: ReadonlyArray<ActivityItem>;
+	repos: ReadonlyArray<RepoSummary>;
+};
+
+type AttentionItem = {
+	id: string;
+	path: string;
+	repoLabel: string;
+	title: string;
+	number: number;
+	reason: string;
+	source: "review" | "owned" | "failing";
+	priority: number;
+	githubUpdatedAt: number;
+	lastCheckConclusion: string | null;
+};
+
+type AttentionScope = "all" | "my" | "failing";
+
+function buildAttentionQueue(data: DashboardData): Array<AttentionItem> {
+	const next = new Map<string, AttentionItem>();
+
+	const upsert = (item: AttentionItem) => {
+		const existing = next.get(item.id);
+		if (existing === undefined) {
+			next.set(item.id, item);
+			return;
+		}
+		if (item.priority > existing.priority) {
+			next.set(item.id, item);
+			return;
+		}
+		if (
+			item.priority === existing.priority &&
+			item.githubUpdatedAt > existing.githubUpdatedAt
+		) {
+			next.set(item.id, item);
+		}
+	};
+
+	for (const pr of data.needsAttentionPrs) {
+		const id = `${pr.ownerLogin}/${pr.repoName}#${pr.number}`;
+		upsert({
+			id,
+			path: `/${pr.ownerLogin}/${pr.repoName}/pulls/${pr.number}`,
+			repoLabel: `${pr.ownerLogin}/${pr.repoName}`,
+			title: pr.title,
+			number: pr.number,
+			reason: "Needs your review",
+			source: "review",
+			priority: 100,
+			githubUpdatedAt: pr.githubUpdatedAt,
+			lastCheckConclusion: pr.lastCheckConclusion,
+		});
+	}
+
+	for (const pr of data.yourPrs) {
+		const id = `${pr.ownerLogin}/${pr.repoName}#${pr.number}`;
+		const hasFailingChecks = pr.lastCheckConclusion === "failure";
+		upsert({
+			id,
+			path: `/${pr.ownerLogin}/${pr.repoName}/pulls/${pr.number}`,
+			repoLabel: `${pr.ownerLogin}/${pr.repoName}`,
+			title: pr.title,
+			number: pr.number,
+			reason: hasFailingChecks
+				? "Your PR has failing checks"
+				: "Your PR needs progress",
+			source: "owned",
+			priority: hasFailingChecks ? 95 : 76,
+			githubUpdatedAt: pr.githubUpdatedAt,
+			lastCheckConclusion: pr.lastCheckConclusion,
+		});
+	}
+
+	for (const pr of data.recentPrs) {
+		if (pr.lastCheckConclusion !== "failure") continue;
+		const id = `${pr.ownerLogin}/${pr.repoName}#${pr.number}`;
+		upsert({
+			id,
+			path: `/${pr.ownerLogin}/${pr.repoName}/pulls/${pr.number}`,
+			repoLabel: `${pr.ownerLogin}/${pr.repoName}`,
+			title: pr.title,
+			number: pr.number,
+			reason: "Failing CI checks",
+			source: "failing",
+			priority: 88,
+			githubUpdatedAt: pr.githubUpdatedAt,
+			lastCheckConclusion: pr.lastCheckConclusion,
+		});
+	}
+
+	return [...next.values()].sort((a, b) => {
+		if (b.priority !== a.priority) return b.priority - a.priority;
+		return b.githubUpdatedAt - a.githubUpdatedAt;
+	});
+}
+
+export function HomeDashboard({
+	initialDashboard,
+}: {
+	initialDashboard: DashboardData;
+}) {
+	const session = authClient.useSession();
+	const client = useProjectionQueries();
+	const dashboardAtom = useMemo(
+		() => client.getHomeDashboard.subscription(EmptyPayload),
+		[client],
+	);
+	const dashboardResult = useAtomValue(dashboardAtom);
+	const data = useSubscriptionWithInitial(dashboardAtom, initialDashboard);
+	const [attentionScope, setAttentionScope] = useState<AttentionScope>("all");
+
+	if (session.isPending || Result.isInitial(dashboardResult)) {
+		return <DashboardSkeleton />;
+	}
+
+	const isSignedIn = session.data !== null;
+	const attentionQueue = buildAttentionQueue(data);
+	const visibleAttentionQueue = attentionQueue.filter((item) => {
+		if (attentionScope === "all") return true;
+		if (attentionScope === "my") {
+			return item.source === "review" || item.source === "owned";
+		}
+		return item.lastCheckConclusion === "failure";
+	});
+
+	const totalOpenPrs = data.repos.reduce(
+		(sum, repo) => sum + repo.openPrCount,
+		0,
+	);
+	const totalOpenIssues = data.repos.reduce(
+		(sum, repo) => sum + repo.openIssueCount,
+		0,
+	);
+	const totalFailing = data.repos.reduce(
+		(sum, repo) => sum + repo.failingCheckCount,
+		0,
+	);
+	const failingPrs = [
+		...data.yourPrs,
+		...data.needsAttentionPrs,
+		...data.recentPrs,
+	]
+		.filter((pr) => pr.lastCheckConclusion === "failure")
+		.slice(0, 12);
+
 	return (
-		<div className="divide-y rounded-lg border">
-			{prs.map((pr) => (
-				<Link
-					key={`${pr.ownerLogin}/${pr.repoName}#${pr.number}`}
-					href={`/${pr.ownerLogin}/${pr.repoName}/pulls/${pr.number}`}
-					className="flex items-start gap-2.5 px-3 py-2 transition-colors hover:bg-muted no-underline"
-				>
-					<PrStateIcon state={pr.state} draft={pr.draft} />
-					<div className="min-w-0 flex-1">
-						<div className="flex items-center gap-1.5">
-							<span className="font-medium text-xs truncate text-foreground">
-								{pr.title}
-							</span>
-							{pr.draft && (
-								<Badge
-									variant="outline"
-									className="text-[9px] px-1 py-0 shrink-0"
-								>
-									Draft
-								</Badge>
-							)}
+		<div className="h-full overflow-y-auto">
+			<div className="px-4 py-4 md:px-6 md:py-5">
+				<div className="mb-4 flex flex-wrap items-end justify-between gap-2">
+					<div>
+						<div className="mb-1 flex items-center gap-2">
+							<Rocket className="size-4 text-muted-foreground" />
+							<h1 className="text-lg font-semibold tracking-tight text-foreground">
+								{data.githubLogin !== null
+									? `${data.githubLogin}'s Workbench`
+									: isSignedIn
+										? "Team Workbench"
+										: "QuickHub Workbench"}
+							</h1>
 						</div>
-						<div className="flex items-center gap-1.5 text-[10px] text-muted-foreground mt-0.5">
-							<span className="font-medium text-muted-foreground/80">
-								{pr.ownerLogin}/{pr.repoName}
-							</span>
-							<span className="text-muted-foreground/40">&middot;</span>
-							<span>#{pr.number}</span>
-							{pr.authorLogin && (
-								<>
-									<span className="text-muted-foreground/40">&middot;</span>
-									<span className="flex items-center gap-1">
-										{pr.authorAvatarUrl && (
-											<Avatar className="size-3">
-												<AvatarImage
-													src={pr.authorAvatarUrl}
-													alt={pr.authorLogin}
-												/>
-												<AvatarFallback className="text-[6px]">
-													{pr.authorLogin[0]?.toUpperCase()}
-												</AvatarFallback>
-											</Avatar>
-										)}
-										{pr.authorLogin}
-									</span>
-								</>
-							)}
-							<span>{formatRelative(pr.githubUpdatedAt)}</span>
-							{pr.commentCount > 0 && (
-								<span className="flex items-center gap-0.5">
-									<MessageCircle className="size-2.5" />
-									{pr.commentCount}
-								</span>
-							)}
-						</div>
+						<p className="text-xs text-muted-foreground">
+							Cross-repo triage for what needs attention now.
+						</p>
 					</div>
-					{pr.lastCheckConclusion && (
-						<CheckDot conclusion={pr.lastCheckConclusion} />
-					)}
-				</Link>
-			))}
+					<div className="flex items-center gap-2">
+						<Button asChild size="sm" variant="outline" className="h-7 text-xs">
+							<Link href="/inbox">Inbox</Link>
+						</Button>
+					</div>
+				</div>
+
+				{!isSignedIn && (
+					<Card className="mb-4 border-border/60 bg-muted/20">
+						<CardContent className="pt-4">
+							<div className="flex items-start gap-3">
+								<div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-foreground/5">
+									<GitHubIcon className="size-4 text-foreground/70" />
+								</div>
+								<div className="min-w-0 flex-1">
+									<p className="text-xs font-semibold text-foreground">
+										Sign in to unlock personal attention queues
+									</p>
+									<p className="mt-1 text-[11px] text-muted-foreground">
+										Get your PR workload, review queue, and CI blockers in one
+										place.
+									</p>
+									<Button
+										size="sm"
+										className="mt-3 h-7 text-xs"
+										onClick={() => {
+											authClient.signIn.social({ provider: "github" });
+										}}
+									>
+										<GitHubIcon className="size-3.5" />
+										Sign in with GitHub
+									</Button>
+								</div>
+							</div>
+						</CardContent>
+					</Card>
+				)}
+
+				<div className="mb-4 grid grid-cols-2 gap-2 md:grid-cols-4">
+					<KpiCard
+						label="Attention"
+						value={visibleAttentionQueue.length}
+						icon={<Eye className="size-3 text-yellow-500" />}
+					/>
+					<KpiCard
+						label="Open PRs"
+						value={totalOpenPrs}
+						icon={<GitPullRequest className="size-3 text-green-500" />}
+					/>
+					<KpiCard
+						label="Open Issues"
+						value={totalOpenIssues}
+						icon={<CircleDot className="size-3 text-blue-500" />}
+					/>
+					<KpiCard
+						label="Failing Checks"
+						value={totalFailing}
+						icon={<AlertTriangle className="size-3 text-red-500" />}
+						alert={totalFailing > 0}
+					/>
+				</div>
+
+				<div className="grid gap-4 xl:grid-cols-12">
+					<div className="space-y-4 xl:col-span-8">
+						<AttentionQueueCard
+							items={visibleAttentionQueue}
+							scope={attentionScope}
+							onScopeChange={setAttentionScope}
+						/>
+
+						<div className="grid gap-4 lg:grid-cols-2">
+							<PrListCard
+								title="Your Pull Requests"
+								emptyLabel="No personal PRs in view"
+								icon={<User className="size-3.5 text-green-500" />}
+								prs={data.yourPrs}
+							/>
+							<PrListCard
+								title="Needs Your Attention"
+								emptyLabel="No review requests right now"
+								icon={<Eye className="size-3.5 text-yellow-500" />}
+								prs={data.needsAttentionPrs}
+							/>
+						</div>
+
+						<ActivityCard items={data.recentActivity} />
+					</div>
+
+					<div className="space-y-4 xl:col-span-4">
+						<RepoHealthCard repos={data.repos} />
+						<PrListCard
+							title="Failing PR Checks"
+							emptyLabel="No failing checks in sampled PRs"
+							icon={<AlertTriangle className="size-3.5 text-red-500" />}
+							prs={failingPrs}
+						/>
+						<PrListCard
+							title="Recently Active PRs"
+							emptyLabel="No recent pull requests"
+							icon={<GitBranch className="size-3.5 text-muted-foreground" />}
+							prs={data.recentPrs}
+						/>
+					</div>
+				</div>
+			</div>
 		</div>
 	);
 }
 
-// ---------------------------------------------------------------------------
-// Activity row
-// ---------------------------------------------------------------------------
-
-function ActivityRow({
-	activity,
+function KpiCard({
+	label,
+	value,
+	icon,
+	alert = false,
 }: {
-	activity: {
-		ownerLogin: string;
-		repoName: string;
-		activityType: string;
-		title: string;
-		description: string | null;
-		actorLogin: string | null;
-		actorAvatarUrl: string | null;
-		entityNumber: number | null;
-		createdAt: number;
-	};
+	label: string;
+	value: number;
+	icon: ReactNode;
+	alert?: boolean;
 }) {
+	return (
+		<Card
+			className={cn("border", alert && "border-red-500/30 bg-red-500/[0.03]")}
+		>
+			<CardContent className="pt-3">
+				<div className="mb-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+					{icon}
+					{label}
+				</div>
+				<p
+					className={cn(
+						"text-xl font-semibold tabular-nums",
+						alert ? "text-red-500" : "text-foreground",
+					)}
+				>
+					{value}
+				</p>
+			</CardContent>
+		</Card>
+	);
+}
+
+function AttentionQueueCard({
+	items,
+	scope,
+	onScopeChange,
+}: {
+	items: ReadonlyArray<AttentionItem>;
+	scope: AttentionScope;
+	onScopeChange: (scope: AttentionScope) => void;
+}) {
+	return (
+		<Card>
+			<CardHeader className="pb-2">
+				<div className="mb-2 flex items-center justify-between gap-2">
+					<CardTitle className="flex items-center gap-1.5 text-sm">
+						<Eye className="size-4 text-yellow-500" />
+						Attention Queue
+					</CardTitle>
+					<Badge variant="outline" className="text-[10px]">
+						{items.length}
+					</Badge>
+				</div>
+				<div className="flex flex-wrap gap-1.5">
+					<Button
+						size="sm"
+						variant={scope === "all" ? "default" : "outline"}
+						className="h-6 px-2 text-[10px]"
+						onClick={() => onScopeChange("all")}
+					>
+						All
+					</Button>
+					<Button
+						size="sm"
+						variant={scope === "my" ? "default" : "outline"}
+						className="h-6 px-2 text-[10px]"
+						onClick={() => onScopeChange("my")}
+					>
+						My work
+					</Button>
+					<Button
+						size="sm"
+						variant={scope === "failing" ? "default" : "outline"}
+						className="h-6 px-2 text-[10px]"
+						onClick={() => onScopeChange("failing")}
+					>
+						Failing checks
+					</Button>
+				</div>
+			</CardHeader>
+			<CardContent>
+				{items.length === 0 && (
+					<p className="text-xs text-muted-foreground">
+						No urgent items right now. Nice.
+					</p>
+				)}
+
+				{items.length > 0 && (
+					<div className="divide-y rounded-md border">
+						{items.slice(0, 14).map((item) => (
+							<Link
+								key={item.id}
+								href={item.path}
+								className="flex items-start gap-2 px-3 py-2 no-underline transition-colors hover:bg-muted"
+							>
+								<div
+									className={cn(
+										"mt-1 size-2.5 rounded-full shrink-0",
+										item.lastCheckConclusion === "failure"
+											? "bg-red-500"
+											: "bg-yellow-500",
+									)}
+								/>
+								<div className="min-w-0 flex-1">
+									<p className="truncate text-xs font-medium text-foreground">
+										{item.title}
+									</p>
+									<div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground">
+										<span>{item.repoLabel}</span>
+										<span>#{item.number}</span>
+										<span>{formatRelative(item.githubUpdatedAt)}</span>
+									</div>
+								</div>
+								<Badge
+									variant="outline"
+									className="text-[9px] text-muted-foreground"
+								>
+									{item.reason}
+								</Badge>
+							</Link>
+						))}
+					</div>
+				)}
+			</CardContent>
+		</Card>
+	);
+}
+
+function PrListCard({
+	title,
+	icon,
+	prs,
+	emptyLabel,
+}: {
+	title: string;
+	icon: ReactNode;
+	prs: ReadonlyArray<DashboardPrItem>;
+	emptyLabel: string;
+}) {
+	return (
+		<Card>
+			<CardHeader className="pb-2">
+				<div className="flex items-center justify-between gap-2">
+					<CardTitle className="flex items-center gap-1.5 text-sm">
+						{icon}
+						{title}
+					</CardTitle>
+					{prs.length > 0 && (
+						<Badge variant="outline" className="text-[10px]">
+							{prs.length}
+						</Badge>
+					)}
+				</div>
+			</CardHeader>
+			<CardContent>
+				{prs.length === 0 && (
+					<p className="text-xs text-muted-foreground">{emptyLabel}</p>
+				)}
+
+				{prs.length > 0 && (
+					<div className="divide-y rounded-md border">
+						{prs.slice(0, 8).map((pr) => (
+							<Link
+								key={`${pr.ownerLogin}/${pr.repoName}#${pr.number}`}
+								href={`/${pr.ownerLogin}/${pr.repoName}/pulls/${pr.number}`}
+								className="flex items-start gap-2 px-3 py-2 no-underline transition-colors hover:bg-muted"
+							>
+								<PrStateIcon state={pr.state} draft={pr.draft} />
+								<div className="min-w-0 flex-1">
+									<p className="truncate text-xs font-medium text-foreground">
+										{pr.title}
+									</p>
+									<div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+										<span className="truncate">
+											{pr.ownerLogin}/{pr.repoName}
+										</span>
+										<span>#{pr.number}</span>
+										<span>{formatRelative(pr.githubUpdatedAt)}</span>
+										{pr.commentCount > 0 && (
+											<span className="flex items-center gap-0.5">
+												<MessageCircle className="size-2.5" />
+												{pr.commentCount}
+											</span>
+										)}
+									</div>
+								</div>
+								{pr.lastCheckConclusion === "failure" && (
+									<AlertTriangle className="mt-0.5 size-3 text-red-500" />
+								)}
+							</Link>
+						))}
+					</div>
+				)}
+			</CardContent>
+		</Card>
+	);
+}
+
+function ActivityCard({ items }: { items: ReadonlyArray<ActivityItem> }) {
+	return (
+		<Card>
+			<CardHeader className="pb-2">
+				<CardTitle className="flex items-center gap-1.5 text-sm">
+					<Activity className="size-4 text-blue-500" />
+					Recent Activity
+				</CardTitle>
+			</CardHeader>
+			<CardContent>
+				{items.length === 0 && (
+					<p className="text-xs text-muted-foreground">
+						No recent activity yet.
+					</p>
+				)}
+				{items.length > 0 && (
+					<div className="divide-y rounded-md border">
+						{items.slice(0, 14).map((activity, index) => (
+							<ActivityRow
+								key={`${activity.ownerLogin}/${activity.repoName}-${activity.createdAt}-${index}`}
+								activity={activity}
+							/>
+						))}
+					</div>
+				)}
+			</CardContent>
+		</Card>
+	);
+}
+
+function RepoHealthCard({ repos }: { repos: ReadonlyArray<RepoSummary> }) {
+	const rankedRepos = [...repos].sort((a, b) => {
+		const scoreA =
+			a.failingCheckCount * 20 + a.openPrCount * 4 + a.openIssueCount;
+		const scoreB =
+			b.failingCheckCount * 20 + b.openPrCount * 4 + b.openIssueCount;
+		return scoreB - scoreA;
+	});
+
+	return (
+		<Card>
+			<CardHeader className="pb-2">
+				<div className="flex items-center justify-between gap-2">
+					<CardTitle className="flex items-center gap-1.5 text-sm">
+						<GitBranch className="size-4 text-muted-foreground" />
+						Repo Health
+					</CardTitle>
+					<Badge variant="outline" className="text-[10px]">
+						{repos.length}
+					</Badge>
+				</div>
+			</CardHeader>
+			<CardContent>
+				{repos.length === 0 && (
+					<p className="text-xs text-muted-foreground">
+						No repositories connected yet.
+					</p>
+				)}
+				{repos.length > 0 && (
+					<div className="divide-y rounded-md border">
+						{rankedRepos.slice(0, 12).map((repo) => (
+							<Link
+								key={repo.fullName}
+								href={`/${repo.ownerLogin}/${repo.name}/pulls`}
+								className="block px-3 py-2 no-underline transition-colors hover:bg-muted"
+							>
+								<div className="flex items-start justify-between gap-2">
+									<div className="min-w-0">
+										<p className="truncate text-xs font-semibold text-foreground">
+											{repo.fullName}
+										</p>
+										<div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+											<span>{repo.openPrCount} PRs</span>
+											<span>{repo.openIssueCount} issues</span>
+											{repo.lastPushAt !== null && (
+												<span>{formatRelative(repo.lastPushAt)}</span>
+											)}
+										</div>
+									</div>
+									<div className="flex items-center gap-1">
+										{repo.failingCheckCount > 0 ? (
+											<Badge variant="destructive" className="text-[9px]">
+												{repo.failingCheckCount} failing
+											</Badge>
+										) : (
+											<Badge
+												variant="outline"
+												className="text-[9px] text-green-600"
+											>
+												<CheckCircle2 className="size-2.5" />
+												healthy
+											</Badge>
+										)}
+										<ArrowRight className="size-3 text-muted-foreground" />
+									</div>
+								</div>
+							</Link>
+						))}
+					</div>
+				)}
+			</CardContent>
+		</Card>
+	);
+}
+
+function ActivityRow({ activity }: { activity: ActivityItem }) {
 	const href = (() => {
 		const base = `/${activity.ownerLogin}/${activity.repoName}`;
 		if (activity.entityNumber === null) return base;
@@ -477,9 +695,9 @@ function ActivityRow({
 	return (
 		<Link
 			href={href}
-			className="flex items-center gap-2.5 px-3 py-2 transition-colors hover:bg-muted no-underline"
+			className="flex items-center gap-2.5 px-3 py-2 no-underline transition-colors hover:bg-muted"
 		>
-			{activity.actorAvatarUrl ? (
+			{activity.actorAvatarUrl !== null ? (
 				<Avatar className="size-5">
 					<AvatarImage
 						src={activity.actorAvatarUrl}
@@ -490,29 +708,24 @@ function ActivityRow({
 					</AvatarFallback>
 				</Avatar>
 			) : (
-				<div className="size-5 rounded-full bg-muted flex items-center justify-center shrink-0">
-					<ActivityTypeIcon type={activity.activityType} />
+				<div className="flex size-5 shrink-0 items-center justify-center rounded-full bg-muted">
+					<Activity className="size-3 text-muted-foreground" />
 				</div>
 			)}
 			<div className="min-w-0 flex-1">
-				<p className="text-xs text-foreground truncate">
+				<p className="truncate text-xs text-foreground">
 					<span className="font-medium">
 						{activity.actorLogin ?? "Someone"}
 					</span>{" "}
-					<span className="text-muted-foreground">
-						{activityVerb(activity.activityType)}
-					</span>{" "}
-					<span className="font-medium">{activity.title}</span>
+					{activityVerb(activity.activityType)} {activity.title}
 				</p>
-				<div className="flex items-center gap-1.5 text-[10px] text-muted-foreground mt-0.5">
+				<div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
 					<span>
 						{activity.ownerLogin}/{activity.repoName}
 					</span>
-					<span className="text-muted-foreground/40">&middot;</span>
 					<span>{formatRelative(activity.createdAt)}</span>
 				</div>
 			</div>
-			<ActivityTypeIcon type={activity.activityType} />
 		</Link>
 	);
 }
@@ -538,31 +751,6 @@ function activityVerb(type: string): string {
 	}
 }
 
-function ActivityTypeIcon({ type }: { type: string }) {
-	switch (type) {
-		case "pr_opened":
-			return <GitPullRequest className="size-3 text-green-500 shrink-0" />;
-		case "pr_closed":
-			return <GitPullRequest className="size-3 text-red-500 shrink-0" />;
-		case "pr_merged":
-			return <GitMerge className="size-3 text-purple-500 shrink-0" />;
-		case "pr_review":
-			return <MessageCircle className="size-3 text-yellow-500 shrink-0" />;
-		case "issue_opened":
-			return <CircleDot className="size-3 text-green-500 shrink-0" />;
-		case "issue_closed":
-			return <CircleDot className="size-3 text-purple-500 shrink-0" />;
-		case "push":
-			return <GitBranch className="size-3 text-blue-500 shrink-0" />;
-		default:
-			return <Activity className="size-3 text-muted-foreground shrink-0" />;
-	}
-}
-
-// ---------------------------------------------------------------------------
-// State icons (same as repo-overview-client.tsx to avoid circular deps)
-// ---------------------------------------------------------------------------
-
 function PrStateIcon({
 	state,
 	draft,
@@ -570,120 +758,44 @@ function PrStateIcon({
 	state: "open" | "closed";
 	draft: boolean;
 }) {
-	if (draft)
+	if (draft) {
 		return (
-			<div className="mt-0.5 size-3.5 rounded-full border-2 border-muted-foreground shrink-0" />
+			<div className="mt-0.5 size-3.5 shrink-0 rounded-full border-2 border-muted-foreground" />
 		);
-	if (state === "open")
+	}
+	if (state === "open") {
 		return (
-			<svg
-				className="mt-0.5 size-3.5 text-green-600 shrink-0"
-				viewBox="0 0 16 16"
-				fill="currentColor"
-			>
-				<path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354Z" />
-			</svg>
+			<GitPullRequest className="mt-0.5 size-3.5 shrink-0 text-green-600" />
 		);
+	}
 	return (
-		<svg
-			className="mt-0.5 size-3.5 text-purple-600 shrink-0"
-			viewBox="0 0 16 16"
-			fill="currentColor"
-		>
-			<path d="M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218Z" />
-		</svg>
+		<GitPullRequest className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
 	);
 }
 
-function CheckDot({ conclusion }: { conclusion: string }) {
-	if (conclusion === "success")
-		return (
-			<svg
-				className="size-3 text-green-600 shrink-0 mt-0.5"
-				viewBox="0 0 16 16"
-				fill="currentColor"
-			>
-				<path d="M8 16A8 8 0 1 1 8 0a8 8 0 0 1 0 16Zm3.78-9.72a.751.751 0 0 0-.018-1.042.751.751 0 0 0-1.042-.018L6.75 9.19 5.28 7.72a.751.751 0 0 0-1.042.018.751.751 0 0 0-.018 1.042l2 2a.75.75 0 0 0 1.06 0Z" />
-			</svg>
-		);
-	if (conclusion === "failure")
-		return (
-			<svg
-				className="size-3 text-red-600 shrink-0 mt-0.5"
-				viewBox="0 0 16 16"
-				fill="currentColor"
-			>
-				<path d="M2.343 13.657A8 8 0 1 1 13.658 2.343 8 8 0 0 1 2.343 13.657ZM6.03 4.97a.751.751 0 0 0-1.042.018.751.751 0 0 0-.018 1.042L6.94 8 4.97 9.97a.749.749 0 0 0 .326 1.275.749.749 0 0 0 .734-.215L8 9.06l1.97 1.97a.749.749 0 0 0 1.275-.326.749.749 0 0 0-.215-.734L9.06 8l1.97-1.97a.749.749 0 0 0-.326-1.275.749.749 0 0 0-.734.215L8 6.94Z" />
-			</svg>
-		);
+export function DashboardSkeleton() {
 	return (
-		<svg
-			className="size-3 text-yellow-600 shrink-0 mt-0.5"
-			viewBox="0 0 16 16"
-			fill="currentColor"
-		>
-			<path d="M8 4a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z" />
-		</svg>
-	);
-}
-
-// ---------------------------------------------------------------------------
-// Skeleton loader
-// ---------------------------------------------------------------------------
-
-function DashboardSkeleton() {
-	return (
-		<div className="h-full overflow-y-auto">
-			<div className="mx-auto max-w-2xl px-6 py-8">
-				{/* Header */}
-				<div className="mb-8">
-					<Skeleton className="h-5 w-32 mb-1" />
-					<Skeleton className="h-3 w-44" />
-				</div>
-				{/* Stats */}
-				<div className="grid grid-cols-3 gap-3 mb-8">
-					<Skeleton className="h-16 rounded-lg" />
-					<Skeleton className="h-16 rounded-lg" />
-					<Skeleton className="h-16 rounded-lg" />
-				</div>
-				{/* PR section */}
-				<div className="mb-8">
-					<Skeleton className="h-4 w-48 mb-2" />
-					<div className="divide-y rounded-lg border">
-						{[1, 2, 3].map((i) => (
-							<div key={i} className="flex items-start gap-2.5 px-3 py-2">
-								<Skeleton className="size-3.5 rounded-full mt-0.5" />
-								<div className="flex-1 space-y-1">
-									<Skeleton className="h-3.5 w-3/4" />
-									<Skeleton className="h-2.5 w-1/2" />
-								</div>
-							</div>
-						))}
+		<div className="h-full overflow-y-auto px-4 py-4 md:px-6 md:py-5">
+			<Skeleton className="mb-4 h-6 w-48" />
+			<div className="mb-4 grid grid-cols-2 gap-2 md:grid-cols-4">
+				<Skeleton className="h-20" />
+				<Skeleton className="h-20" />
+				<Skeleton className="h-20" />
+				<Skeleton className="h-20" />
+			</div>
+			<div className="grid gap-4 xl:grid-cols-12">
+				<div className="space-y-4 xl:col-span-8">
+					<Skeleton className="h-60" />
+					<div className="grid gap-4 lg:grid-cols-2">
+						<Skeleton className="h-72" />
+						<Skeleton className="h-72" />
 					</div>
+					<Skeleton className="h-72" />
 				</div>
-				{/* Activity section */}
-				<div className="mb-8">
-					<Skeleton className="h-4 w-32 mb-2" />
-					<div className="divide-y rounded-lg border">
-						{[1, 2, 3].map((i) => (
-							<div key={i} className="flex items-center gap-2.5 px-3 py-2">
-								<Skeleton className="size-5 rounded-full" />
-								<div className="flex-1 space-y-1">
-									<Skeleton className="h-3 w-4/5" />
-									<Skeleton className="h-2.5 w-1/3" />
-								</div>
-							</div>
-						))}
-					</div>
-				</div>
-				{/* Repo grid */}
-				<div>
-					<Skeleton className="h-4 w-24 mb-2" />
-					<div className="grid grid-cols-2 gap-2">
-						{[1, 2, 3, 4].map((i) => (
-							<Skeleton key={i} className="h-20 rounded-lg" />
-						))}
-					</div>
+				<div className="space-y-4 xl:col-span-4">
+					<Skeleton className="h-72" />
+					<Skeleton className="h-72" />
+					<Skeleton className="h-72" />
 				</div>
 			</div>
 		</div>

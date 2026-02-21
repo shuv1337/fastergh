@@ -1,6 +1,7 @@
 "use client";
 
 import { Result, useAtom, useAtomValue } from "@effect-atom/atom-react";
+import { useSubscriptionWithInitial } from "@packages/confect/rpc";
 import { Button } from "@packages/ui/components/button";
 import {
 	Collapsible,
@@ -14,14 +15,17 @@ import { UserButton } from "@packages/ui/components/user-button";
 import { GitHubIcon } from "@packages/ui/icons/index";
 import { authClient } from "@packages/ui/lib/auth-client";
 import { cn } from "@packages/ui/lib/utils";
+import { useNotifications } from "@packages/ui/rpc/notifications";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
 import { useRepoOnboard } from "@packages/ui/rpc/repo-onboard";
 import { Array as Arr, Option, pipe, Record as Rec } from "effect";
 import {
+	Bell,
 	ChevronRight,
 	CircleDot,
 	Download,
 	GitPullRequest,
+	House,
 	Plus,
 	Rocket,
 	TriangleAlert,
@@ -36,7 +40,23 @@ const GITHUB_APP_INSTALL_URL = GITHUB_APP_SLUG
 	? `https://github.com/apps/${GITHUB_APP_SLUG}/installations/new`
 	: "";
 
-export function SidebarClient() {
+export type SidebarRepo = {
+	repositoryId: number;
+	fullName: string;
+	ownerLogin: string;
+	name: string;
+	openPrCount: number;
+	openIssueCount: number;
+	failingCheckCount: number;
+	lastPushAt: number | null;
+	updatedAt: number;
+};
+
+export function SidebarClient({
+	initialRepos,
+}: {
+	initialRepos: ReadonlyArray<SidebarRepo>;
+}) {
 	const session = authClient.useSession();
 
 	if (session.isPending) {
@@ -44,28 +64,34 @@ export function SidebarClient() {
 	}
 
 	if (!session.data) {
-		return <SignedOutSidebar />;
+		return <SignedOutSidebar initialRepos={initialRepos} />;
 	}
 
-	return <SignedInSidebar />;
+	return <SignedInSidebar initialRepos={initialRepos} />;
 }
 
 // ---------------------------------------------------------------------------
 // Signed-in sidebar — personalized repo list with add/manage
 // ---------------------------------------------------------------------------
 
-function SignedInSidebar() {
+function SignedInSidebar({
+	initialRepos,
+}: {
+	initialRepos: ReadonlyArray<SidebarRepo>;
+}) {
 	const pathname = usePathname();
 	const segments = pathname.split("/").filter(Boolean);
 	const activeOwner = segments[0] ?? null;
 	const activeName = segments[1] ?? null;
+	const isHome = pathname === "/";
+	const isInbox = pathname.startsWith("/inbox");
 
 	const client = useProjectionQueries();
 	const reposAtom = useMemo(
 		() => client.listRepos.subscription(EmptyPayload),
 		[client],
 	);
-	const reposResult = useAtomValue(reposAtom);
+	const repos = useSubscriptionWithInitial(reposAtom, initialRepos);
 
 	return (
 		<div className="flex h-full flex-col bg-sidebar">
@@ -73,102 +99,111 @@ function SignedInSidebar() {
 				<h2 className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground/70">
 					Repositories
 				</h2>
+				<div className="mt-2 grid grid-cols-2 gap-1">
+					<Button
+						asChild
+						size="sm"
+						variant={isHome ? "secondary" : "ghost"}
+						className="h-6 justify-start text-[10px]"
+					>
+						<Link href="/">
+							<House className="size-3" />
+							Home
+						</Link>
+					</Button>
+					<Button
+						asChild
+						size="sm"
+						variant={isInbox ? "secondary" : "ghost"}
+						className="h-6 justify-start text-[10px]"
+					>
+						<Link href="/inbox">
+							<Bell className="size-3" />
+							Inbox
+						</Link>
+					</Button>
+				</div>
 				<AddRepoSection />
 			</div>
 			<div className="flex-1 overflow-y-auto">
 				<div className="p-1.5">
-					{Result.isInitial(reposResult) && (
-						<div className="space-y-1 p-1">
-							{[1, 2, 3].map((i) => (
-								<div key={i} className="space-y-1 px-2 py-1.5">
-									<Skeleton className="h-3.5 w-28" />
-									<Skeleton className="h-2.5 w-20" />
-								</div>
-							))}
-						</div>
-					)}
+					{repos.length === 0 && <EmptyRepoState />}
 
-					{(() => {
-						const valueOption = Result.value(reposResult);
-						if (Option.isNone(valueOption)) return null;
-						const repos = valueOption.value;
-
-						if (repos.length === 0) {
-							return <EmptyRepoState />;
-						}
-
-						const grouped = pipe(
-							repos,
-							Arr.groupBy((repo) => repo.ownerLogin),
-						);
-						const entries = Rec.toEntries(grouped);
-
-						return entries.map(([owner, ownerRepos]) => {
-							const ownerHasActiveRepo = activeOwner === owner;
-							return (
-								<Collapsible
-									key={owner}
-									defaultOpen={ownerHasActiveRepo || entries.length === 1}
-								>
-									<CollapsibleTrigger className="flex w-full items-center gap-1 rounded-md px-2 py-1 text-[11px] font-bold uppercase tracking-wider text-muted-foreground/60 hover:text-muted-foreground transition-colors [&[data-state=open]>svg]:rotate-90">
-										<ChevronRight className="h-3 w-3 shrink-0 transition-transform duration-200" />
-										<span className="truncate">{owner}</span>
-										<span className="ml-auto text-[10px] font-normal tabular-nums">
-											{ownerRepos.length}
-										</span>
-									</CollapsibleTrigger>
-									<CollapsibleContent>
-										<div className="ml-2.5 border-l border-border/40 pl-0.5">
-											{ownerRepos.map((repo) => {
-												const isActive =
-													repo.ownerLogin === activeOwner &&
-													repo.name === activeName;
-												return (
-													<Link
-														key={repo.repositoryId}
-														href={`/${repo.ownerLogin}/${repo.name}/pulls`}
-														className={cn(
-															"flex flex-col gap-0.5 rounded-md px-2 py-1.5 text-sm transition-colors no-underline",
-															isActive
-																? "bg-accent text-accent-foreground"
-																: "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-														)}
-													>
-														<span className="font-semibold text-foreground truncate text-xs leading-tight">
-															{repo.name}
-														</span>
-														<div className="flex items-center gap-2 text-[10px] tabular-nums">
-															<span>{repo.openPrCount} PRs</span>
-															<span className="text-muted-foreground/50">
-																&middot;
-															</span>
-															<span>{repo.openIssueCount} issues</span>
-															{repo.failingCheckCount > 0 && (
-																<>
-																	<span className="text-muted-foreground/50">
-																		&middot;
-																	</span>
-																	<span className="text-destructive font-medium">
-																		{repo.failingCheckCount} failing
-																	</span>
-																</>
-															)}
-														</div>
-													</Link>
-												);
-											})}
-										</div>
-									</CollapsibleContent>
-								</Collapsible>
+					{repos.length > 0 &&
+						(() => {
+							const grouped = pipe(
+								repos,
+								Arr.groupBy((repo) => repo.ownerLogin),
 							);
-						});
-					})()}
+							const entries = Rec.toEntries(grouped);
+
+							return entries.map(([owner, ownerRepos]) => {
+								const ownerHasActiveRepo = activeOwner === owner;
+								return (
+									<Collapsible
+										key={owner}
+										defaultOpen={ownerHasActiveRepo || entries.length === 1}
+									>
+										<CollapsibleTrigger className="flex w-full items-center gap-1 rounded-md px-2 py-1 text-[11px] font-bold uppercase tracking-wider text-muted-foreground/60 hover:text-muted-foreground transition-colors [&[data-state=open]>svg]:rotate-90">
+											<ChevronRight className="h-3 w-3 shrink-0 transition-transform duration-200" />
+											<span className="truncate">{owner}</span>
+											<span className="ml-auto text-[10px] font-normal tabular-nums">
+												{ownerRepos.length}
+											</span>
+										</CollapsibleTrigger>
+										<CollapsibleContent>
+											<div className="ml-2.5 border-l border-border/40 pl-0.5">
+												{ownerRepos.map((repo) => {
+													const isActive =
+														repo.ownerLogin === activeOwner &&
+														repo.name === activeName;
+													return (
+														<Link
+															key={repo.repositoryId}
+															href={`/${repo.ownerLogin}/${repo.name}/pulls`}
+															className={cn(
+																"flex flex-col gap-0.5 rounded-md px-2 py-1.5 text-sm transition-colors no-underline",
+																isActive
+																	? "bg-accent text-accent-foreground"
+																	: "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+															)}
+														>
+															<span className="font-semibold text-foreground truncate text-xs leading-tight">
+																{repo.name}
+															</span>
+															<div className="flex items-center gap-2 text-[10px] tabular-nums">
+																<span>{repo.openPrCount} PRs</span>
+																<span className="text-muted-foreground/50">
+																	&middot;
+																</span>
+																<span>{repo.openIssueCount} issues</span>
+																{repo.failingCheckCount > 0 && (
+																	<>
+																		<span className="text-muted-foreground/50">
+																			&middot;
+																		</span>
+																		<span className="text-destructive font-medium">
+																			{repo.failingCheckCount} failing
+																		</span>
+																	</>
+																)}
+															</div>
+														</Link>
+													);
+												})}
+											</div>
+										</CollapsibleContent>
+									</Collapsible>
+								);
+							});
+						})()}
 				</div>
 			</div>
 
 			{/* Auth state — pinned to bottom-left */}
-			<div className="shrink-0 border-t border-sidebar-border px-3 py-2">
+			<div className="shrink-0 border-t border-sidebar-border px-3 py-2 flex items-center justify-between">
 				<UserButton />
+				<InboxButton />
 			</div>
 		</div>
 	);
@@ -178,19 +213,17 @@ function SignedInSidebar() {
 // Signed-out sidebar — overview + sign-in CTA
 // ---------------------------------------------------------------------------
 
-function SignedOutSidebar() {
+function SignedOutSidebar({
+	initialRepos,
+}: {
+	initialRepos: ReadonlyArray<SidebarRepo>;
+}) {
 	const client = useProjectionQueries();
 	const reposAtom = useMemo(
 		() => client.listRepos.subscription(EmptyPayload),
 		[client],
 	);
-	const reposResult = useAtomValue(reposAtom);
-
-	const repos = (() => {
-		const v = Result.value(reposResult);
-		if (Option.isSome(v)) return v.value;
-		return null;
-	})();
+	const repos = useSubscriptionWithInitial(reposAtom, initialRepos);
 
 	return (
 		<div className="flex h-full flex-col bg-sidebar">
@@ -210,18 +243,7 @@ function SignedOutSidebar() {
 			{/* Repo overview (read-only) */}
 			<div className="flex-1 overflow-y-auto">
 				<div className="p-1.5">
-					{Result.isInitial(reposResult) && (
-						<div className="space-y-1 p-1">
-							{[1, 2, 3].map((i) => (
-								<div key={i} className="space-y-1 px-2 py-1.5">
-									<Skeleton className="h-3.5 w-28" />
-									<Skeleton className="h-2.5 w-20" />
-								</div>
-							))}
-						</div>
-					)}
-
-					{repos !== null && repos.length > 0 && (
+					{repos.length > 0 && (
 						<>
 							<p className="px-2 py-1 text-[10px] font-medium text-muted-foreground/60 uppercase tracking-wider">
 								Active Repos
@@ -255,7 +277,7 @@ function SignedOutSidebar() {
 						</>
 					)}
 
-					{repos !== null && repos.length === 0 && (
+					{repos.length === 0 && (
 						<div className="px-3 py-8 text-center">
 							<p className="text-[11px] text-muted-foreground">
 								Sign in to connect your repositories.
@@ -289,7 +311,7 @@ function SignedOutSidebar() {
 // Shared sub-components
 // ---------------------------------------------------------------------------
 
-function SidebarSkeleton() {
+export function SidebarSkeleton() {
 	return (
 		<div className="flex h-full flex-col bg-sidebar">
 			<div className="shrink-0 px-3 pt-3 pb-2 border-b border-sidebar-border">
@@ -355,6 +377,33 @@ function AddRepoSection() {
 			{/* Secondary: Manual owner/repo input (collapsible) */}
 			<ManualAddCollapsible />
 		</div>
+	);
+}
+
+/** Notification bell button with unread badge. */
+function InboxButton() {
+	const client = useNotifications();
+	const notificationsAtom = useMemo(
+		() => client.listNotifications.subscription(EmptyPayload),
+		[client],
+	);
+	const result = useAtomValue(notificationsAtom);
+
+	const unreadCount = (() => {
+		const v = Result.value(result);
+		if (Option.isNone(v)) return 0;
+		return v.value.filter((n) => n.unread).length;
+	})();
+
+	return (
+		<Link href="/inbox" className="relative no-underline p-1">
+			<Bell className="size-4 text-muted-foreground hover:text-foreground transition-colors" />
+			{unreadCount > 0 && (
+				<span className="absolute -top-0.5 -right-0.5 flex items-center justify-center size-3.5 rounded-full bg-destructive text-destructive-foreground text-[8px] font-bold">
+					{unreadCount > 9 ? "9+" : unreadCount}
+				</span>
+			)}
+		</Link>
 	);
 }
 

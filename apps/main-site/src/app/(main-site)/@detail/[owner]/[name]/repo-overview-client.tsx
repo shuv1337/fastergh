@@ -90,7 +90,7 @@ export function RepoOverviewPanel({
 	if (Result.isInitial(overviewResult)) {
 		return (
 			<div className="h-full overflow-y-auto">
-				<div className="mx-auto max-w-xl px-6 py-8">
+				<div className="px-6 py-8">
 					<Skeleton className="h-6 w-48 mb-1" />
 					<Skeleton className="h-3 w-32 mb-6" />
 					<div className="grid grid-cols-2 gap-3 mb-6">
@@ -109,7 +109,7 @@ export function RepoOverviewPanel({
 
 	return (
 		<div className="h-full overflow-y-auto">
-			<div className="mx-auto max-w-xl px-6 py-8">
+			<div className="px-6 py-8">
 				{/* Repo header */}
 				<div className="mb-6">
 					<h1 className="text-lg font-bold tracking-tight text-foreground">
@@ -290,7 +290,7 @@ export function RepoOverviewPanel({
 }
 
 // --------------------------------------------------------------------------
-// Small icon components (duplicated from hub-layout to avoid circular deps)
+// Small icon components (kept local to avoid cross-file coupling)
 // --------------------------------------------------------------------------
 
 function PrStateIcon({

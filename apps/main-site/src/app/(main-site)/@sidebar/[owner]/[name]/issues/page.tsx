@@ -24,8 +24,17 @@ async function IssueListContent({
 		name,
 		state: "open",
 	});
+	const overview = await serverQueries.getRepoOverview.queryPromise({
+		ownerLogin: owner,
+		name,
+	});
 
 	return (
-		<IssueListClient owner={owner} name={name} initialData={initialData} />
+		<IssueListClient
+			owner={owner}
+			name={name}
+			initialData={initialData}
+			repositoryId={overview?.repositoryId ?? null}
+		/>
 	);
 }
