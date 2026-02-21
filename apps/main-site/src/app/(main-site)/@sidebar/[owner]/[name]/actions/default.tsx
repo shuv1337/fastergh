@@ -4,6 +4,7 @@ import { serverQueries } from "@/lib/server-queries";
 import { RepoListShell } from "../../../../_components/repo-list-shell";
 import { WorkflowRunListClient } from "../../../../_components/workflow-run-list-client";
 import { SidebarClient, SidebarSkeleton } from "../../../sidebar-client";
+import { SidebarRepoList } from "../../../sidebar-repo-list";
 
 export default function ActionsListDefault(props: {
 	params: Promise<{ owner: string; name: string }>;
@@ -22,12 +23,19 @@ async function Content({
 }) {
 	await connection();
 	const { owner, name } = await paramsPromise;
-	const [initialRepos, initialData] = await Promise.all([
-		serverQueries.listRepos.queryPromise({}),
-		serverQueries.listWorkflowRuns
-			.queryPromise({ ownerLogin: owner, name })
-			.catch(() => []),
-	]);
+	const initialRepos = await serverQueries.listRepos.queryPromise({});
+
+	if (!owner || !name) {
+		return (
+			<SidebarClient initialRepos={initialRepos}>
+				<SidebarRepoList initialRepos={initialRepos} />
+			</SidebarClient>
+		);
+	}
+
+	const initialData = await serverQueries.listWorkflowRuns
+		.queryPromise({ ownerLogin: owner, name })
+		.catch(() => []);
 
 	return (
 		<SidebarClient initialRepos={initialRepos}>

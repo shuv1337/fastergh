@@ -25,7 +25,7 @@ async function Content({
 	const { owner, name } = await paramsPromise;
 	const initialRepos = await serverQueries.listRepos.queryPromise({});
 
-	if (owner.length === 0 || name.length === 0) {
+	if (!owner || !name || owner.length === 0 || name.length === 0) {
 		return (
 			<SidebarClient initialRepos={initialRepos}>
 				<SidebarRepoList initialRepos={initialRepos} />

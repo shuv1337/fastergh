@@ -4,6 +4,7 @@ import { serverQueries } from "@/lib/server-queries";
 import { RepoListShell } from "../../../../_components/repo-list-shell";
 import { ListSkeleton } from "../../../../_components/skeletons";
 import { SidebarClient, SidebarSkeleton } from "../../../sidebar-client";
+import { SidebarRepoList } from "../../../sidebar-repo-list";
 import { FileTreeClient } from "./file-tree-client";
 
 export default function CodeSidebarDefault(props: {
@@ -24,6 +25,14 @@ async function Content({
 	await connection();
 	const { owner, name } = await paramsPromise;
 	const initialRepos = await serverQueries.listRepos.queryPromise({});
+
+	if (!owner || !name) {
+		return (
+			<SidebarClient initialRepos={initialRepos}>
+				<SidebarRepoList initialRepos={initialRepos} />
+			</SidebarClient>
+		);
+	}
 
 	return (
 		<SidebarClient initialRepos={initialRepos}>
