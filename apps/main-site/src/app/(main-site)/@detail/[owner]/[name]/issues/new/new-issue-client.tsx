@@ -36,11 +36,11 @@ import {
 	TabsTrigger,
 } from "@packages/ui/components/tabs";
 import { Textarea } from "@packages/ui/components/textarea";
+import { navigateQuickHubSpa } from "@packages/ui/lib/spa-navigation";
 import { useGithubWrite } from "@packages/ui/rpc/github-write";
 import { useIssueTemplates } from "@packages/ui/rpc/issue-templates";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
 import { Option } from "effect";
-import { useRouter } from "next/navigation";
 import { useId, useMemo, useState } from "react";
 import { MarkdownBody } from "@/components/markdown-body";
 
@@ -277,7 +277,6 @@ function NewIssueForm({
 	showBackToTemplates: boolean;
 	onBackToTemplates: () => void;
 }) {
-	const router = useRouter();
 	const writeClient = useGithubWrite();
 	const [createIssueResult, createIssue] = useAtom(
 		writeClient.createIssue.mutate,
@@ -305,7 +304,7 @@ function NewIssueForm({
 				body: body.trim().length > 0 ? body.trim() : undefined,
 				labels: selectedLabels.length > 0 ? [...selectedLabels] : undefined,
 			});
-			router.push(`/${owner}/${name}/issues`);
+			navigateQuickHubSpa(`/${owner}/${name}/issues`);
 		} catch {
 			// Error is captured in createIssueResult for display
 		}

@@ -34,6 +34,17 @@ const nextConfig: NextConfig = {
 	},
 	allowedDevOrigins: ["wsl-dev.tail5665af.ts.net"],
 	reactCompiler: false,
+	rewrites: async () => ({
+		beforeFiles: [
+			{
+				source:
+					"/((?!api/|_next/|static-app-shell|github/setup|favicon.ico|robots.txt|sitemap.xml|manifest.webmanifest|.*\\..*).*)",
+				destination: "/static-app-shell",
+			},
+		],
+		afterFiles: [],
+		fallback: [],
+	}),
 	experimental: {
 		turbopackFileSystemCacheForDev: true,
 	},

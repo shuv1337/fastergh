@@ -139,6 +139,11 @@ export function SidebarRepoList({
 												<Link
 													key={repo.repositoryId}
 													href={`/${repo.ownerLogin}/${repo.name}`}
+													prefetchKey="repo.overview"
+													prefetchParams={{
+														owner: repo.ownerLogin,
+														name: repo.name,
+													}}
 													className={cn(
 														"group flex items-center gap-1 pl-2 pr-2 py-0.5 no-underline transition-colors",
 														isActive

@@ -8,8 +8,8 @@ import { Skeleton } from "@packages/ui/components/skeleton";
 import { cn } from "@packages/ui/lib/utils";
 import { useCodeBrowse } from "@packages/ui/rpc/code-browse";
 import { Either, Option, Schema } from "effect";
-import { usePathname } from "next/navigation";
 import { useMemo, useState } from "react";
+import { useLocation } from "react-router";
 import { extractErrorTag } from "@/lib/rpc-error";
 
 // ---------------------------------------------------------------------------
@@ -225,7 +225,8 @@ export function FileTreeClient({
 	owner: string;
 	name: string;
 }) {
-	const pathname = usePathname();
+	const location = useLocation();
+	const pathname = location.pathname;
 	const routeRef = useMemo(() => {
 		const segments = pathname.split("/").filter(Boolean);
 		const segment = segments[2];

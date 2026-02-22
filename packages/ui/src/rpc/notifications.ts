@@ -7,4 +7,5 @@ import { createRpcModuleClientContext } from "./client-context";
 export const {
 	RpcClientProvider: NotificationsProvider,
 	useRpcClient: useNotifications,
+	getDefaultRpcClient: getNotificationsClient,
 } = createRpcModuleClientContext<NotificationsModule>(api.rpc.notifications);

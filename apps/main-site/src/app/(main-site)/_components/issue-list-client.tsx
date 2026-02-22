@@ -12,10 +12,10 @@ import { Link } from "@packages/ui/components/link";
 import { LinkButton } from "@packages/ui/components/link-button";
 import { Skeleton } from "@packages/ui/components/skeleton";
 import { useInfinitePaginationWithInitial } from "@packages/ui/hooks/use-paginated-atom";
+import { navigateQuickHubSpa } from "@packages/ui/lib/spa-navigation";
 import { cn } from "@packages/ui/lib/utils";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
 import { useHotkey } from "@tanstack/react-hotkeys";
-import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const PAGE_SIZE = 30;
@@ -77,7 +77,6 @@ export function IssueListClient({
 
 	const filteredIssues = useMemo(() => issues, [issues]);
 
-	const router = useRouter();
 	const activeNumber = activeIssueNumber;
 
 	const activeIndex = filteredIssues.findIndex(
@@ -95,22 +94,22 @@ export function IssueListClient({
 			const nextIndex = prevCountRef.current;
 			const issue = filteredIssues[nextIndex];
 			if (issue) {
-				router.push(`/${owner}/${name}/issues/${issue.number}`);
+				navigateQuickHubSpa(`/${owner}/${name}/issues/${issue.number}`);
 				scrollIssueIntoView(issue.number);
 			}
 			pendingNavRef.current = null;
 		}
 		prevCountRef.current = filteredIssues.length;
-	}, [filteredIssues.length, filteredIssues, owner, name, router]);
+	}, [filteredIssues.length, filteredIssues, owner, name]);
 
 	const navigateTo = useCallback(
 		(index: number) => {
 			const issue = filteredIssues[index];
 			if (!issue) return;
-			router.push(`/${owner}/${name}/issues/${issue.number}`);
+			navigateQuickHubSpa(`/${owner}/${name}/issues/${issue.number}`);
 			scrollIssueIntoView(issue.number);
 		},
-		[filteredIssues, owner, name, router],
+		[filteredIssues, owner, name],
 	);
 
 	useHotkey("J", (event) => {

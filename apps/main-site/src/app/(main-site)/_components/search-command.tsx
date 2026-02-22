@@ -29,8 +29,8 @@ import { cn } from "@packages/ui/lib/utils";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
 import { useHotkey } from "@tanstack/react-hotkeys";
 import { Option } from "effect";
-import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation } from "react-router";
 import {
 	buildCanonicalGitHubSearch,
 	parseSearchCommandQuery,
@@ -61,7 +61,8 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 }
 
 function useRepoFromPathname() {
-	const pathname = usePathname();
+	const location = useLocation();
+	const pathname = location.pathname;
 	return useMemo(() => {
 		const segments = pathname.split("/").filter(Boolean);
 		if (segments.length < 2) return null;
@@ -1069,6 +1070,7 @@ function isExactGoToGitHubQuery(rawQuery: string): boolean {
 }
 
 export function SearchCommand() {
+	const location = useLocation();
 	const [open, setOpen] = useState(false);
 	const [query, setQuery] = useState("");
 	const [recent, setRecent] =
@@ -1078,7 +1080,7 @@ export function SearchCommand() {
 	const lastPointerPositionRef = useRef<{ x: number; y: number } | null>(null);
 	const debouncedQuery = useDebouncedValue(query, 250);
 	const repo = useRepoFromPathname();
-	const pathname = usePathname();
+	const pathname = location.pathname;
 
 	useHotkey("Mod+K", (event) => {
 		event.preventDefault();

@@ -532,6 +532,48 @@ const createPaginatedAtom = (
 
 const noop = () => {};
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+	typeof value === "object" && value !== null && !Array.isArray(value);
+
+const mergePayload = (
+	shared: Record<string, unknown>,
+	payload: unknown,
+): Record<string, unknown> => ({
+	...shared,
+	...(isRecord(payload) ? payload : {}),
+});
+
+const normalizePayloadValue = (value: unknown): unknown => {
+	if (Array.isArray(value)) {
+		return value.map((item) => normalizePayloadValue(item));
+	}
+	if (!isRecord(value)) {
+		return value;
+	}
+
+	const sortedEntries = Object.entries(value).sort(([left], [right]) =>
+		left.localeCompare(right),
+	);
+
+	const normalized: Record<string, unknown> = {};
+	for (const [key, entryValue] of sortedEntries) {
+		normalized[key] = normalizePayloadValue(entryValue);
+	}
+
+	return normalized;
+};
+
+const serializePayloadKey = (payload: unknown): string =>
+	JSON.stringify(normalizePayloadValue(payload));
+
+const parsePayloadKey = (payloadKey: string): Record<string, unknown> => {
+	const parsed = JSON.parse(payloadKey);
+	if (isRecord(parsed)) {
+		return parsed;
+	}
+	return {};
+};
+
 export function createRpcClient<
 	TModule extends AnyRpcModule,
 	Shared extends Record<string, unknown> = {},
@@ -545,9 +587,9 @@ export function createRpcClient<
 		config.enablePayloadTelemetryFallback ?? true;
 	const runtime = Atom.runtime(baseLayer);
 
-	const queryFamilies = new Map<string, (payload: unknown) => Atom.Atom<Result.Result<unknown, unknown>>>();
-	const subscriptionFamilies = new Map<string, (payload: unknown) => Atom.Atom<Result.Result<unknown, unknown>>>();
-	const actionQueryFamilies = new Map<string, (payload: unknown) => Atom.Atom<Result.Result<unknown, unknown>>>();
+	const queryFamilies = new Map<string, (payloadKey: string) => Atom.Atom<Result.Result<unknown, unknown>>>();
+	const subscriptionFamilies = new Map<string, (payloadKey: string) => Atom.Atom<Result.Result<unknown, unknown>>>();
+	const actionQueryFamilies = new Map<string, (payloadKey: string) => Atom.Atom<Result.Result<unknown, unknown>>>();
 	const mutationFns = new Map<string, Atom.AtomResultFn<unknown, unknown, unknown>>();
 	const actionFns = new Map<string, Atom.AtomResultFn<unknown, unknown, unknown>>();
 	const paginatedFamilies = new Map<string, (numItems: number, extra: Record<string, unknown>) => Atom.Writable<Atom.PullResult<unknown, unknown>, void>>();
@@ -556,8 +598,8 @@ export function createRpcClient<
 		let family = queryFamilies.get(tag);
 		if (!family) {
 			const convexFn = convexApi[tag] as FunctionReference<"query">;
-			family = Atom.family((p: unknown) => {
-				const fullPayload = { ...getShared(), ...(p as object) };
+			family = Atom.family((payloadKey: string) => {
+				const fullPayload = mergePayload(getShared(), parsePayloadKey(payloadKey));
 				return createQueryAtom(
 					runtime,
 					tag,
@@ -575,8 +617,8 @@ export function createRpcClient<
 		let family = subscriptionFamilies.get(tag);
 		if (!family) {
 			const convexFn = convexApi[tag] as FunctionReference<"query">;
-			family = Atom.family((p: unknown) => {
-				const fullPayload = { ...getShared(), ...(p as object) };
+			family = Atom.family((payloadKey: string) => {
+				const fullPayload = mergePayload(getShared(), parsePayloadKey(payloadKey));
 				return createSubscriptionAtom(
 					runtime,
 					tag,
@@ -626,8 +668,8 @@ export function createRpcClient<
 		let family = actionQueryFamilies.get(tag);
 		if (!family) {
 			const convexFn = convexApi[tag] as FunctionReference<"action">;
-			family = Atom.family((p: unknown) => {
-				const fullPayload = { ...getShared(), ...(p as object) };
+			family = Atom.family((payloadKey: string) => {
+				const fullPayload = mergePayload(getShared(), parsePayloadKey(payloadKey));
 				return createActionQueryAtom(
 					runtime,
 					tag,
@@ -687,7 +729,7 @@ export function createRpcClient<
 			if (!endpointProxy) {
 				const queryEffect = (payload: unknown) => {
 					const convexFn = convexApi[prop] as FunctionReference<"query">;
-					const fullPayload = { ...getShared(), ...(payload as object) };
+					const fullPayload = mergePayload(getShared(), payload);
 					return createQueryEffect(
 						prop,
 						convexFn,
@@ -700,7 +742,7 @@ export function createRpcClient<
 
 				const mutateEffect = (payload: unknown) => {
 					const convexFn = convexApi[prop] as FunctionReference<"mutation">;
-					const fullPayload = { ...getShared(), ...(payload as object) };
+					const fullPayload = mergePayload(getShared(), payload);
 					return createMutationEffect(
 						prop,
 						convexFn,
@@ -713,7 +755,7 @@ export function createRpcClient<
 
 				const callEffect = (payload: unknown) => {
 					const convexFn = convexApi[prop] as FunctionReference<"action">;
-					const fullPayload = { ...getShared(), ...(payload as object) };
+					const fullPayload = mergePayload(getShared(), payload);
 					return createActionEffect(
 						prop,
 						convexFn,
@@ -725,15 +767,18 @@ export function createRpcClient<
 				};
 
 				endpointProxy = {
-					query: (payload: unknown) => getQueryFamily(prop)(payload),
+					query: (payload: unknown) =>
+						getQueryFamily(prop)(serializePayloadKey(payload)),
 					queryEffect,
 					queryPromise: (payload: unknown) => Effect.runPromise(queryEffect(payload)),
-					subscription: (payload: unknown) => getSubscriptionFamily(prop)(payload),
+					subscription: (payload: unknown) =>
+						getSubscriptionFamily(prop)(serializePayloadKey(payload)),
 					mutate: getMutationFn(prop),
 					mutateEffect,
 					mutatePromise: (payload: unknown) => Effect.runPromise(mutateEffect(payload)),
 					call: getActionFn(prop),
-					callAsQuery: (payload: unknown) => getActionQueryFamily(prop)(payload),
+					callAsQuery: (payload: unknown) =>
+						getActionQueryFamily(prop)(serializePayloadKey(payload)),
 					callEffect,
 					callPromise: (payload: unknown) => Effect.runPromise(callEffect(payload)),
 					paginated: (numItems: number, extra: Record<string, unknown> = {}) => getPaginatedFamily(prop)(numItems, extra),

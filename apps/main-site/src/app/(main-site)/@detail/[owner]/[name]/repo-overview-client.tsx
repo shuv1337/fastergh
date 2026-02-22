@@ -103,6 +103,8 @@ export function RepoOverviewHeader({
 			<div className="grid grid-cols-2 gap-3 mb-6">
 				<Link
 					href={`/${owner}/${name}/pulls`}
+					prefetchKey="repo.pulls"
+					prefetchParams={{ owner, name }}
 					className="rounded-lg border px-3 py-2.5 transition-colors hover:bg-muted no-underline group"
 				>
 					<div className="flex items-center gap-1.5 mb-1">
@@ -117,6 +119,8 @@ export function RepoOverviewHeader({
 				</Link>
 				<Link
 					href={`/${owner}/${name}/issues`}
+					prefetchKey="repo.issues"
+					prefetchParams={{ owner, name }}
 					className="rounded-lg border px-3 py-2.5 transition-colors hover:bg-muted no-underline group"
 				>
 					<div className="flex items-center gap-1.5 mb-1">
@@ -189,6 +193,8 @@ export function RecentPrsPanel({
 				</div>
 				<Link
 					href={`/${owner}/${name}/pulls`}
+					prefetchKey="repo.pulls"
+					prefetchParams={{ owner, name }}
 					className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground no-underline transition-colors"
 				>
 					View all
@@ -200,6 +206,8 @@ export function RecentPrsPanel({
 					<Link
 						key={pr.number}
 						href={`/${owner}/${name}/pull/${pr.number}`}
+						prefetchKey="repo.pull"
+						prefetchParams={{ owner, name, number: pr.number }}
 						className="flex items-start gap-2 px-3 py-2 transition-colors hover:bg-muted no-underline"
 					>
 						<PrStateIcon state={pr.state} draft={pr.draft} />
@@ -288,6 +296,8 @@ export function RecentIssuesPanel({
 				</div>
 				<Link
 					href={`/${owner}/${name}/issues`}
+					prefetchKey="repo.issues"
+					prefetchParams={{ owner, name }}
 					className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground no-underline transition-colors"
 				>
 					View all
@@ -299,6 +309,8 @@ export function RecentIssuesPanel({
 					<Link
 						key={issue.number}
 						href={`/${owner}/${name}/issues/${issue.number}`}
+						prefetchKey="repo.issue"
+						prefetchParams={{ owner, name, number: issue.number }}
 						className="flex items-start gap-2 px-3 py-2 transition-colors hover:bg-muted no-underline"
 					>
 						<IssueStateIcon state={issue.state} />

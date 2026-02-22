@@ -19,6 +19,7 @@ type ClientContextApi<TClient> = {
 		props: ClientProviderProps<TClient>,
 	) => ReactNode;
 	readonly useRpcClient: () => TClient;
+	readonly getDefaultRpcClient: () => TClient;
 };
 
 type ModuleApi<TModule extends AnyRpcModule> = Parameters<
@@ -57,6 +58,7 @@ export const createRpcClientContext = <TClient>(
 	return {
 		RpcClientProvider,
 		useRpcClient,
+		getDefaultRpcClient: getDefaultClient,
 	};
 };
 
