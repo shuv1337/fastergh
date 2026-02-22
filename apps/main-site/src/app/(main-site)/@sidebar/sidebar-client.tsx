@@ -6,10 +6,8 @@ import { Skeleton } from "@packages/ui/components/skeleton";
 import { UserButton } from "@packages/ui/components/user-button";
 import { GitHubIcon } from "@packages/ui/icons/index";
 import { authClient } from "@packages/ui/lib/auth-client";
-import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import { InstallGitHubAppButton } from "../_components/install-github-app-button";
-import { RepoNavSelector } from "../_components/repo-nav-selector";
 import { triggerOpenSearchCommand } from "../_components/search-command-events";
 
 export type SidebarRepo = {
@@ -29,7 +27,7 @@ export type SidebarRepo = {
 // Universal sidebar shell — used on every page.
 //
 //   ┌─────────────────────┐
-//   │  RepoNavSelector     │
+//   │  navSelector (slot)  │  ← Suspense-wrapped async, independent of children
 //   ├─────────────────────┤
 //   │  children (body)     │  ← swapped per route
 //   ├─────────────────────┤
@@ -40,30 +38,18 @@ export type SidebarRepo = {
 // ---------------------------------------------------------------------------
 
 export function SidebarClient({
-	initialRepos,
+	navSelector,
 	children,
 }: {
-	initialRepos: ReadonlyArray<SidebarRepo>;
+	navSelector: ReactNode;
 	children: ReactNode;
 }) {
 	const session = authClient.useSession();
-	const pathname = usePathname();
-	const segments = pathname.split("/").filter(Boolean);
-	const activeOwner = segments[0] ?? null;
-	const activeName = segments[1] ?? null;
 
 	return (
 		<div className="flex h-full flex-col bg-sidebar">
-			{/* Top: nav selector */}
-			{initialRepos.length > 0 && (
-				<div className="shrink-0 border-b border-sidebar-border">
-					<RepoNavSelector
-						owner={activeOwner}
-						name={activeName}
-						initialRepos={initialRepos}
-					/>
-				</div>
-			)}
+			{/* Top: nav selector — rendered as a slot so it streams independently */}
+			{navSelector}
 
 			{/* Mobile search trigger — opens full desktop-style command palette */}
 			<div className="md:hidden shrink-0 border-b border-sidebar-border px-2 py-2">

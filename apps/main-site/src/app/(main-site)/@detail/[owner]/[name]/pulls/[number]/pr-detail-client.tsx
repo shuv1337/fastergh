@@ -29,6 +29,11 @@ import {
 } from "@packages/ui/components/icons";
 import { Input } from "@packages/ui/components/input";
 import { Kbd } from "@packages/ui/components/kbd";
+import {
+	DiffMountQueueProvider,
+	DiffPlaceholder,
+	useLazyDiffMount,
+} from "@packages/ui/components/lazy-patch-diff";
 import { Link } from "@packages/ui/components/link";
 import { Separator } from "@packages/ui/components/separator";
 import { Skeleton } from "@packages/ui/components/skeleton";
@@ -53,6 +58,7 @@ import { useHotkey } from "@tanstack/react-hotkeys";
 import { Option } from "effect";
 import {
 	forwardRef,
+	memo,
 	type ReactElement,
 	useCallback,
 	useEffect,
@@ -861,6 +867,330 @@ function FileTreeItem({
 }
 
 // ---------------------------------------------------------------------------
+// Entry type produced by the entries useMemo in DiffPanel
+// ---------------------------------------------------------------------------
+
+type DiffEntry = {
+	readonly filename: string;
+	readonly previousFilename: string | null;
+	readonly patch: string | null;
+	readonly status:
+		| "added"
+		| "removed"
+		| "modified"
+		| "renamed"
+		| "copied"
+		| "changed"
+		| "unchanged";
+	readonly additions: number;
+	readonly deletions: number;
+	readonly reviewComments: ReadonlyArray<PrDetail["reviewComments"][number]>;
+};
+
+// ---------------------------------------------------------------------------
+// FileDiffBlock — memoized per-file diff block with lazy mounting
+// ---------------------------------------------------------------------------
+
+const FileDiffBlock = memo(function FileDiffBlock({
+	entry,
+	anchorId,
+	isFocused,
+	isCollapsed,
+	hasCollapsedContext,
+	fullContextState,
+	viewMode,
+	inlineComposerTarget,
+	inlineComposerBody,
+	isPostingInlineComment,
+	inlineCommentResult,
+	owner,
+	name,
+	repositoryId,
+	prNumber,
+	onToggleCollapse,
+	onLoadFullContext,
+	onLineSelectionEnd,
+	onLineNumberClick,
+	onSetInlineComposerTarget,
+	onSetInlineComposerBody,
+	onSetSelectionNotice,
+	onSubmitInlineComment,
+	onAddDraftReply,
+}: {
+	entry: DiffEntry;
+	anchorId: string;
+	isFocused: boolean;
+	isCollapsed: boolean;
+	hasCollapsedContext: boolean;
+	fullContextState: FullContextDiffState | undefined;
+	viewMode: "split" | "unified";
+	inlineComposerTarget: InlineReviewCommentTarget | null;
+	inlineComposerBody: string;
+	isPostingInlineComment: boolean;
+	inlineCommentResult: Result.Result<unknown, unknown>;
+	owner: string;
+	name: string;
+	repositoryId: number;
+	prNumber: number;
+	onToggleCollapse: (filename: string) => void;
+	onLoadFullContext: (filename: string) => void;
+	onLineSelectionEnd: (
+		filename: string,
+		range: {
+			start: number;
+			side?: "deletions" | "additions";
+			end: number;
+			endSide?: "deletions" | "additions";
+		},
+	) => void;
+	onLineNumberClick: (
+		filename: string,
+		lineEvent: {
+			lineNumber: number;
+			annotationSide: "deletions" | "additions";
+		},
+	) => void;
+	onSetInlineComposerTarget: (
+		updater: (
+			current: InlineReviewCommentTarget | null,
+		) => InlineReviewCommentTarget | null,
+	) => void;
+	onSetInlineComposerBody: (value: string) => void;
+	onSetSelectionNotice: (notice: string | null) => void;
+	onSubmitInlineComment: () => void;
+	onAddDraftReply: (reply: Omit<DraftReviewReply, "id" | "createdAt">) => void;
+}) {
+	const { sentinelRef, shouldMount } = useLazyDiffMount("600px");
+
+	const reviewThreads = buildReviewThreads(entry.reviewComments);
+
+	const inlineAnnotations: Array<DiffLineAnnotation<InlineDiffAnnotation>> =
+		inlineComposerTarget !== null &&
+		inlineComposerTarget.filename === entry.filename
+			? [
+					{
+						side:
+							inlineComposerTarget.side === "LEFT" ? "deletions" : "additions",
+						lineNumber: inlineComposerTarget.line,
+						metadata: {
+							kind: "composer",
+							target: inlineComposerTarget,
+						},
+					},
+				]
+			: [];
+
+	const fullContextFiles =
+		fullContextState?.status === "ready" ? fullContextState.files : null;
+	const isLoadingFullContext = fullContextState?.status === "loading";
+	const fullContextError =
+		fullContextState?.status === "error" ? fullContextState.errorMessage : null;
+
+	const totalChanges = entry.additions + entry.deletions;
+
+	const renderInlineComposer = (
+		annotation: DiffLineAnnotation<InlineDiffAnnotation>,
+	) => {
+		if (annotation.metadata.kind !== "composer") {
+			return null;
+		}
+
+		return (
+			<InlineReviewCommentComposer
+				target={annotation.metadata.target}
+				body={inlineComposerBody}
+				onBodyChange={onSetInlineComposerBody}
+				onSubmit={onSubmitInlineComment}
+				onCancel={() => {
+					onSetInlineComposerTarget(() => null);
+					onSetInlineComposerBody("");
+					onSetSelectionNotice(null);
+				}}
+				isSubmitting={isPostingInlineComment}
+				errorMessage={
+					Result.isFailure(inlineCommentResult)
+						? extractInteractionError(
+								inlineCommentResult,
+								"Could not post inline comment",
+							)
+						: null
+				}
+			/>
+		);
+	};
+
+	const diffOptions: FileDiffOptions<InlineDiffAnnotation> = {
+		diffStyle: viewMode,
+		disableFileHeader: true,
+		hunkSeparators: "line-info",
+		expansionLineCount: 10,
+		enableLineSelection: true,
+		onLineSelectionEnd: (
+			range: {
+				start: number;
+				side?: "deletions" | "additions";
+				end: number;
+				endSide?: "deletions" | "additions";
+			} | null,
+		) => {
+			if (range === null) {
+				return;
+			}
+			onLineSelectionEnd(entry.filename, range);
+		},
+		onLineNumberClick: (lineEvent: {
+			lineNumber: number;
+			annotationSide: "deletions" | "additions";
+		}) => {
+			if (lineEvent.lineNumber <= 0) return;
+			onLineNumberClick(entry.filename, lineEvent);
+		},
+	};
+
+	return (
+		<div
+			id={anchorId}
+			className={cn(
+				"min-w-0 rounded-lg border scroll-mt-36 transition-shadow duration-200",
+				isFocused && "ring-1 ring-ring/30 shadow-sm",
+			)}
+		>
+			{/* File header */}
+			<div className="flex items-center gap-2 px-3 py-2 bg-muted/30 rounded-t-lg">
+				<button
+					type="button"
+					onClick={() => onToggleCollapse(entry.filename)}
+					className="inline-flex size-5 items-center justify-center rounded hover:bg-muted transition-colors"
+				>
+					<ChevronDown
+						className={cn(
+							"size-3.5 text-muted-foreground transition-transform duration-150",
+							isCollapsed && "-rotate-90",
+						)}
+					/>
+				</button>
+				<FileStatusBadge status={entry.status} />
+				<span className="font-mono text-[12px] font-medium truncate min-w-0 text-foreground/90">
+					{entry.filename}
+				</span>
+				{entry.previousFilename && entry.status === "renamed" && (
+					<span className="text-[10px] text-muted-foreground/50 truncate">
+						(from {entry.previousFilename})
+					</span>
+				)}
+
+				{/* Right side: comment count + stats */}
+				<div className="ml-auto flex items-center gap-2.5 shrink-0">
+					{hasCollapsedContext && fullContextFiles === null && (
+						<Button
+							variant="ghost"
+							size="icon-sm"
+							className="size-5"
+							onClick={() => onLoadFullContext(entry.filename)}
+							disabled={isLoadingFullContext}
+							aria-label="Load full context"
+							title="Load full context"
+						>
+							<Loader2
+								className={cn(
+									"size-3.5",
+									isLoadingFullContext && "animate-spin",
+								)}
+							/>
+						</Button>
+					)}
+					{entry.reviewComments.length > 0 && (
+						<span className="inline-flex items-center gap-1 text-muted-foreground">
+							<MessageSquare className="size-3" />
+							<span className="text-[10px] tabular-nums">
+								{entry.reviewComments.length}
+							</span>
+						</span>
+					)}
+					{totalChanges > 0 && (
+						<>
+							<span className="text-[11px] font-mono tabular-nums text-github-open">
+								+{entry.additions}
+							</span>
+							<span className="text-[11px] font-mono tabular-nums text-github-closed">
+								-{entry.deletions}
+							</span>
+							<ChangeStatsBar
+								additions={entry.additions}
+								deletions={entry.deletions}
+							/>
+						</>
+					)}
+				</div>
+			</div>
+
+			{/* Diff content */}
+			{!isCollapsed && (
+				<>
+					{entry.patch !== null ? (
+						<div className="overflow-x-auto border-t">
+							{!shouldMount ? (
+								<DiffPlaceholder
+									sentinelRef={sentinelRef}
+									lineCount={entry.additions + entry.deletions}
+								/>
+							) : fullContextFiles !== null ? (
+								<MouseDownExpandContainer
+									disabledExpandTooltip={fullContextError ?? undefined}
+								>
+									<MultiFileDiff
+										oldFile={fullContextFiles.oldFile}
+										newFile={fullContextFiles.newFile}
+										lineAnnotations={[...inlineAnnotations]}
+										renderAnnotation={renderInlineComposer}
+										options={diffOptions}
+									/>
+								</MouseDownExpandContainer>
+							) : (
+								<MouseDownExpandContainer
+									disabledExpandTooltip={fullContextError ?? undefined}
+								>
+									<PatchDiff
+										patch={entry.patch}
+										lineAnnotations={[...inlineAnnotations]}
+										renderAnnotation={renderInlineComposer}
+										options={diffOptions}
+									/>
+								</MouseDownExpandContainer>
+							)}
+						</div>
+					) : (
+						<div className="border-t bg-muted/10 px-4 py-4 text-xs text-muted-foreground/60 text-center">
+							No inline patch available (binary file or GitHub truncation)
+						</div>
+					)}
+
+					{/* Review comment threads */}
+					{entry.reviewComments.length > 0 && (
+						<div className="border-t bg-muted/5 p-3 space-y-2">
+							<p className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/50 mb-2">
+								Review threads
+							</p>
+							{reviewThreads.map((thread) => (
+								<ReviewThreadConversation
+									key={thread.root.githubReviewCommentId}
+									thread={thread}
+									ownerLogin={owner}
+									name={name}
+									repositoryId={repositoryId}
+									prNumber={prNumber}
+									onAddDraftReply={onAddDraftReply}
+								/>
+							))}
+						</div>
+					)}
+				</>
+			)}
+		</div>
+	);
+});
+
+// ---------------------------------------------------------------------------
 // Left: Diff / Files Changed
 // ---------------------------------------------------------------------------
 
@@ -1275,6 +1605,102 @@ const DiffPanel = forwardRef<
 	]);
 
 	const isPostingInlineComment = Result.isWaiting(inlineCommentResult);
+
+	// Stable callbacks for FileDiffBlock (avoid re-creating per-file closures)
+	const handleToggleCollapse = useCallback(
+		(filename: string) =>
+			setCollapsedFiles((current) => ({
+				...current,
+				[filename]: !current[filename],
+			})),
+		[],
+	);
+
+	const handleLineSelectionEnd = useCallback(
+		(
+			filename: string,
+			range: {
+				start: number;
+				side?: "deletions" | "additions";
+				end: number;
+				endSide?: "deletions" | "additions";
+			},
+		) => {
+			const normalizedRange: DiffSelectedLineRange = {
+				start: range.start,
+				side: range.side,
+				end: range.end,
+				endSide: range.endSide,
+			};
+
+			const nextTarget = buildInlineTargetFromSelection(
+				filename,
+				normalizedRange,
+			);
+
+			if (nextTarget === null) {
+				setSelectionNotice("Could not determine line side for this selection.");
+				return;
+			}
+
+			const minLine = Math.min(normalizedRange.start, normalizedRange.end);
+			const maxLine = Math.max(normalizedRange.start, normalizedRange.end);
+			const selectedMultipleLines = minLine !== maxLine;
+
+			if (selectedMultipleLines && nextTarget.startLine !== null) {
+				setSelectionNotice(
+					`Selected ${filename}:${String(nextTarget.startLine)}-${String(nextTarget.line)} for a multi-line comment.`,
+				);
+			} else if (selectedMultipleLines) {
+				setSelectionNotice(
+					"Selection spans both diff sides. Keep the selection on one side for a true multi-line comment.",
+				);
+			} else {
+				setSelectionNotice(null);
+			}
+
+			setInlineComposerTarget((current) => {
+				if (inlineTargetsEqual(current, nextTarget)) {
+					return current;
+				}
+				setInlineComposerBody("");
+				return nextTarget;
+			});
+		},
+		[],
+	);
+
+	const handleLineNumberClick = useCallback(
+		(
+			filename: string,
+			lineEvent: {
+				lineNumber: number;
+				annotationSide: "deletions" | "additions";
+			},
+		) => {
+			if (lineEvent.lineNumber <= 0) return;
+			const nextTarget: InlineReviewCommentTarget = {
+				filename,
+				startLine: null,
+				startSide: null,
+				line: lineEvent.lineNumber,
+				side: lineEvent.annotationSide === "deletions" ? "LEFT" : "RIGHT",
+			};
+
+			setSelectionNotice(null);
+
+			setInlineComposerTarget((current) => {
+				if (inlineTargetsEqual(current, nextTarget)) {
+					setInlineComposerBody("");
+					return null;
+				}
+
+				setInlineComposerBody("");
+				return nextTarget;
+			});
+		},
+		[],
+	);
 
 	const focusedIndex = filteredEntries.findIndex(
 		(entry) => entry.filename === focusedFilename,

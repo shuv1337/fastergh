@@ -12,7 +12,6 @@ import {
 	CommandList,
 } from "@packages/ui/components/command";
 import {
-	AlertCircle,
 	CircleDot,
 	GitBranch,
 	GitPullRequest,
@@ -463,96 +462,6 @@ function DashboardCommandPalette({
 				)}
 			</Command>
 		</>
-	);
-}
-
-// ---------------------------------------------------------------------------
-// Attention banner
-// ---------------------------------------------------------------------------
-
-export function AttentionBannerClient({
-	initialData,
-	query,
-}: {
-	initialData: DashboardData;
-	query: DashboardQuery;
-}) {
-	const data = useDashboardData(initialData, query);
-	const ciFailures = useMemo(
-		() => data.blockedItems.filter((b) => b.type === "ci_failure"),
-		[data.blockedItems],
-	);
-
-	if (ciFailures.length === 0) {
-		return null;
-	}
-
-	return <AttentionBanner items={ciFailures} />;
-}
-
-function AttentionBanner({
-	items,
-}: {
-	items: ReadonlyArray<{
-		type: "ci_failure" | "stale_pr" | "review_queue";
-		ownerLogin: string;
-		repoName: string;
-		number: number;
-		title: string;
-		reason: string;
-		githubUpdatedAt: number;
-	}>;
-}) {
-	return (
-		<section className="mb-4">
-			<div className="mb-1.5 flex items-center gap-2">
-				<AlertCircle className="size-3.5 text-status-closed" />
-				<h2 className="text-[11px] font-semibold uppercase tracking-wider text-status-closed">
-					CI Failures
-				</h2>
-				<span className="font-mono text-[10px] text-status-closed/60">
-					{items.length}
-				</span>
-			</div>
-			<div className="overflow-hidden rounded-lg border border-status-closed/20 bg-status-closed/5">
-				{items.map((item, i) => (
-					<Link
-						key={`${item.ownerLogin}/${item.repoName}#${item.number}`}
-						href={`/${item.ownerLogin}/${item.repoName}/pull/${item.number}`}
-						className={cn(
-							"flex items-center gap-3 px-3 py-2 no-underline transition-colors hover:bg-status-closed/10",
-							i > 0 && "border-t border-status-closed/10",
-						)}
-					>
-						<FailureIcon className="size-3 shrink-0 text-status-closed" />
-						<div className="min-w-0 flex-1">
-							<p className="truncate text-[13px] font-medium text-foreground leading-tight">
-								{item.title}
-							</p>
-							<p className="mt-0.5 font-mono text-[10px] text-muted-foreground/60">
-								{item.ownerLogin}/{item.repoName} #{item.number} &middot;{" "}
-								{formatRelative(item.githubUpdatedAt)}
-							</p>
-						</div>
-						<Badge variant="destructive" className="shrink-0 text-[10px]">
-							failing
-						</Badge>
-					</Link>
-				))}
-			</div>
-		</section>
-	);
-}
-
-function FailureIcon({ className }: { className?: string }) {
-	return (
-		<svg
-			className={cn("size-3.5", className)}
-			viewBox="0 0 16 16"
-			fill="currentColor"
-		>
-			<path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z" />
-		</svg>
 	);
 }
 

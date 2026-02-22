@@ -6,7 +6,7 @@ import type { ReactNode } from "react";
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 
 // ---------------------------------------------------------------------------
-// Mount queue — ensures only one PatchDiff mounts per idle callback so large
+// Mount queue — ensures only one diff mounts per idle callback so large
 // PRs don't jam the main thread by mounting many diffs simultaneously.
 // ---------------------------------------------------------------------------
 
@@ -79,21 +79,16 @@ export function DiffMountQueueProvider({ children }: { children: ReactNode }) {
 }
 
 // ---------------------------------------------------------------------------
-// LazyPatchDiff — viewport-aware + staggered mounting
+// useLazyDiffMount — viewport-aware + staggered mounting hook
 // ---------------------------------------------------------------------------
 
-interface LazyPatchDiffProps<LAnnotation = undefined>
-	extends Omit<PatchDiffProps<LAnnotation>, "patch"> {
-	patch: string;
-	/** How many pixels before the element enters the viewport to start loading */
-	rootMargin?: string;
-}
-
-export function LazyPatchDiff<LAnnotation = undefined>({
-	patch,
-	rootMargin = "300px",
-	...patchDiffProps
-}: LazyPatchDiffProps<LAnnotation>) {
+/**
+ * Returns a ref to attach to a sentinel element and a boolean indicating
+ * whether the diff should be mounted. The diff only mounts when the sentinel
+ * enters the viewport (with configurable rootMargin) and is staggered through
+ * the DiffMountQueue to avoid jamming the main thread.
+ */
+export function useLazyDiffMount(rootMargin = "300px") {
 	const sentinelRef = useRef<HTMLDivElement>(null);
 	const [shouldMount, setShouldMount] = useState(false);
 	const mountQueue = useContext(DiffMountQueueContext);
@@ -127,15 +122,57 @@ export function LazyPatchDiff<LAnnotation = undefined>({
 		};
 	}, [shouldMount, rootMargin, mountQueue]);
 
+	return { sentinelRef, shouldMount };
+}
+
+// ---------------------------------------------------------------------------
+// Placeholder shown while the diff is deferred
+// ---------------------------------------------------------------------------
+
+export function DiffPlaceholder({
+	sentinelRef,
+	lineCount,
+}: {
+	sentinelRef: React.RefObject<HTMLDivElement | null>;
+	lineCount?: number;
+}) {
+	// Estimate ~20px per line for a rough placeholder height
+	const estimatedHeight = lineCount !== undefined ? lineCount * 20 : undefined;
+	return (
+		<div
+			ref={sentinelRef}
+			className="flex items-center justify-center text-xs text-muted-foreground bg-muted/10"
+			style={
+				estimatedHeight !== undefined
+					? { minHeight: `${String(estimatedHeight)}px` }
+					: { padding: "2rem 0" }
+			}
+		>
+			&nbsp;
+		</div>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// LazyPatchDiff — convenience wrapper for PatchDiff with lazy mounting
+// ---------------------------------------------------------------------------
+
+interface LazyPatchDiffProps<LAnnotation = undefined>
+	extends Omit<PatchDiffProps<LAnnotation>, "patch"> {
+	patch: string;
+	/** How many pixels before the element enters the viewport to start loading */
+	rootMargin?: string;
+}
+
+export function LazyPatchDiff<LAnnotation = undefined>({
+	patch,
+	rootMargin = "300px",
+	...patchDiffProps
+}: LazyPatchDiffProps<LAnnotation>) {
+	const { sentinelRef, shouldMount } = useLazyDiffMount(rootMargin);
+
 	if (!shouldMount) {
-		return (
-			<div
-				ref={sentinelRef}
-				className="flex items-center justify-center py-8 text-xs text-muted-foreground bg-muted/10"
-			>
-				&nbsp;
-			</div>
-		);
+		return <DiffPlaceholder sentinelRef={sentinelRef} />;
 	}
 
 	return <PatchDiff patch={patch} {...patchDiffProps} />;

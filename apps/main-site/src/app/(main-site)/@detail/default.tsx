@@ -4,7 +4,6 @@ import { Suspense } from "react";
 import { serverQueries } from "@/lib/server-queries";
 import type { DashboardData } from "./home-dashboard-client";
 import {
-	AttentionBannerClient,
 	CommandPaletteClient,
 	IssuesColumnClient,
 	PrColumnClient,
@@ -25,11 +24,6 @@ export default function DetailDefault() {
 
 				{/* Sign-in CTA — renders nothing if signed in */}
 				<SignInCta />
-
-				{/* Attention banner — CI failures */}
-				<Suspense>
-					<AttentionBannerSection />
-				</Suspense>
 
 				{/* Three-column grid */}
 				<div className="grid gap-4 lg:grid-cols-3">
@@ -60,11 +54,6 @@ async function fetchDashboard(): Promise<DashboardData> {
 async function CommandPaletteSection() {
 	const data = await fetchDashboard();
 	return <CommandPaletteClient initialData={data} query={{}} />;
-}
-
-async function AttentionBannerSection() {
-	const data = await fetchDashboard();
-	return <AttentionBannerClient initialData={data} query={{}} />;
 }
 
 async function PrColumnSection() {

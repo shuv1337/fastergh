@@ -4,7 +4,6 @@ import { Suspense } from "react";
 import { serverQueries } from "@/lib/server-queries";
 import type { DashboardData } from "../home-dashboard-client";
 import {
-	AttentionBannerClient,
 	CommandPaletteClient,
 	IssuesColumnClient,
 	PrColumnClient,
@@ -46,11 +45,6 @@ async function OrgDetailContent({
 				{/* Sign-in CTA — renders nothing if signed in */}
 				<SignInCta />
 
-				{/* Attention banner — CI failures */}
-				<Suspense>
-					<OrgAttentionBannerSection owner={owner} />
-				</Suspense>
-
 				{/* Three-column grid */}
 				<div className="grid gap-4 lg:grid-cols-3">
 					<Suspense fallback={<ColumnSkeleton />}>
@@ -81,13 +75,6 @@ async function OrgCommandPaletteSection({ owner }: { owner: string }) {
 	const data = await fetchOrgDashboard(owner);
 	return (
 		<CommandPaletteClient initialData={data} query={{ ownerLogin: owner }} />
-	);
-}
-
-async function OrgAttentionBannerSection({ owner }: { owner: string }) {
-	const data = await fetchOrgDashboard(owner);
-	return (
-		<AttentionBannerClient initialData={data} query={{ ownerLogin: owner }} />
 	);
 }
 
