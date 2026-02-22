@@ -1298,7 +1298,21 @@ const DiffPanel = forwardRef<
 		filterInputRef.current?.select();
 	});
 
+	// Stabilise reviewCommentsByPath so entries only recompute when the
+	// actual review comment data changes, not on every subscription tick that
+	// delivers a structurally identical array with a new reference.
+	const reviewCommentsByPathRef = useRef<{
+		key: string;
+		value: Record<string, Array<PrDetail["reviewComments"][number]>>;
+	} | null>(null);
 	const reviewCommentsByPath = useMemo(() => {
+		const key = JSON.stringify(pr.reviewComments);
+		if (
+			reviewCommentsByPathRef.current !== null &&
+			reviewCommentsByPathRef.current.key === key
+		) {
+			return reviewCommentsByPathRef.current.value;
+		}
 		const grouped: Record<
 			string,
 			Array<PrDetail["reviewComments"][number]>
@@ -1309,6 +1323,7 @@ const DiffPanel = forwardRef<
 			existing.push(comment);
 			grouped[comment.path] = existing;
 		}
+		reviewCommentsByPathRef.current = { key, value: grouped };
 		return grouped;
 	}, [pr.reviewComments]);
 

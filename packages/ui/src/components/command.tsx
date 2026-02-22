@@ -11,6 +11,8 @@ import { SearchIcon } from "@packages/ui/components/icons";
 import { cn } from "@packages/ui/lib/utils";
 import { Command as CommandPrimitive } from "cmdk";
 import type * as React from "react";
+import { useCallback, useRef } from "react";
+import { Link } from "./link";
 
 function Command({
 	className,
@@ -187,6 +189,72 @@ function CommandShortcut({
 	);
 }
 
+/**
+ * A CommandItem that renders a real `<Link>` underneath so users get:
+ * - Prefetching on hover / viewport entry
+ * - Real `<a>` tag (right-click → copy link, middle-click → new tab, cmd+click)
+ * - Accessible link semantics
+ *
+ * On keyboard Enter (cmdk `onSelect`), we programmatically click the link.
+ * On mouse interactions, the Link handles navigation directly.
+ *
+ * Pass `onBeforeNavigate` to run side-effects (e.g. close dialog, save recents)
+ * before navigation occurs.
+ */
+function CommandLinkItem({
+	href,
+	onBeforeNavigate,
+	className,
+	children,
+	...props
+}: Omit<React.ComponentProps<typeof CommandPrimitive.Item>, "onSelect"> & {
+	href: string;
+	onBeforeNavigate?: () => void;
+}) {
+	const linkRef = useRef<HTMLAnchorElement>(null);
+
+	const handleSelect = useCallback(() => {
+		onBeforeNavigate?.();
+		// Programmatically click the link so Next.js Link handles the navigation
+		// (this covers keyboard Enter where the mouse never touches the link)
+		linkRef.current?.click();
+	}, [onBeforeNavigate]);
+
+	return (
+		<CommandPrimitive.Item
+			data-slot="command-item"
+			className={cn(
+				"data-[selected=true]:bg-accent data-[selected=true]:text-accent-foreground [&_svg:not([class*='text-'])]:text-muted-foreground relative flex cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-hidden select-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+				className,
+			)}
+			onSelect={handleSelect}
+			{...props}
+		>
+			{/* Invisible stretched link for prefetch + real anchor semantics */}
+			<Link
+				ref={linkRef}
+				href={href}
+				className="absolute inset-0 z-0"
+				tabIndex={-1}
+				aria-hidden
+				onClick={(event) => {
+					onBeforeNavigate?.();
+					// Let the Link component handle the actual navigation —
+					// don't prevent default here so the <a> click goes through.
+					// But stop propagation so cmdk doesn't also call onSelect.
+					event.stopPropagation();
+				}}
+			>
+				<span className="sr-only">{href}</span>
+			</Link>
+			{/* Content sits above the link overlay */}
+			<div className="relative z-10 flex min-w-0 flex-1 items-center gap-2 pointer-events-none">
+				{children}
+			</div>
+		</CommandPrimitive.Item>
+	);
+}
+
 export {
 	Command,
 	CommandDialog,
@@ -195,6 +263,7 @@ export {
 	CommandEmpty,
 	CommandGroup,
 	CommandItem,
+	CommandLinkItem,
 	CommandShortcut,
 	CommandSeparator,
 };
