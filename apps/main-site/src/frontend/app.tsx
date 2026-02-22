@@ -66,67 +66,132 @@ if (typeof window !== "undefined") {
 const projectionClient = getProjectionQueriesClient();
 const notificationsClient = getNotificationsClient();
 
-const loadRepos = () => projectionClient.listRepos.queryPromise({});
+const LOADER_CACHE_TTL_MS = 20_000;
 
-const loadDashboard = (owner: string | null) =>
-	owner === null
-		? projectionClient.getHomeDashboard.queryPromise({})
-		: projectionClient.getHomeDashboard.queryPromise({ ownerLogin: owner });
+const createTimedLoader = <A extends ReadonlyArray<unknown>, R>(
+	makeKey: (...args: A) => string,
+	run: (...args: A) => Promise<R>,
+) => {
+	const cache = new Map<string, { expiresAt: number; promise: Promise<R> }>();
 
-const loadRepoOverview = (owner: string, name: string) =>
-	projectionClient.getRepoOverview.queryPromise({ ownerLogin: owner, name });
+	return (...args: A): Promise<R> => {
+		const key = makeKey(...args);
+		const now = Date.now();
+		const cached = cache.get(key);
+		if (cached !== undefined && cached.expiresAt > now) {
+			return cached.promise;
+		}
 
-const loadPulls = (owner: string, name: string) =>
-	projectionClient.listPullRequests.queryPromise({
-		ownerLogin: owner,
-		name,
-		state: "open",
-	});
+		const promise = run(...args);
+		cache.set(key, {
+			expiresAt: now + LOADER_CACHE_TTL_MS,
+			promise,
+		});
 
-const loadIssues = (owner: string, name: string) =>
-	projectionClient.listIssues.queryPromise({
-		ownerLogin: owner,
-		name,
-		state: "open",
-	});
+		void promise.catch(() => {
+			const current = cache.get(key);
+			if (current?.promise === promise) {
+				cache.delete(key);
+			}
+		});
 
-const loadPrDetail = (owner: string, name: string, number: number) =>
-	projectionClient.getPullRequestDetail.queryPromise({
-		ownerLogin: owner,
-		name,
-		number,
-	});
+		return promise;
+	};
+};
 
-const loadPrFiles = (owner: string, name: string, number: number) =>
-	projectionClient.listPrFiles.queryPromise({
-		ownerLogin: owner,
-		name,
-		number,
-	});
+const loadRepos = createTimedLoader(
+	() => "repos",
+	() => projectionClient.listRepos.queryPromise({}),
+);
 
-const loadIssueDetail = (owner: string, name: string, number: number) =>
-	projectionClient.getIssueDetail.queryPromise({
-		ownerLogin: owner,
-		name,
-		number,
-	});
+const loadDashboard = createTimedLoader(
+	(owner: string | null) => `dashboard:${owner ?? "all"}`,
+	(owner: string | null) =>
+		owner === null
+			? projectionClient.getHomeDashboard.queryPromise({})
+			: projectionClient.getHomeDashboard.queryPromise({ ownerLogin: owner }),
+);
 
-const loadWorkflowRuns = (owner: string, name: string) =>
-	projectionClient.listWorkflowRuns.queryPromise({ ownerLogin: owner, name });
+const loadRepoOverview = createTimedLoader(
+	(owner: string, name: string) => `repo-overview:${owner}/${name}`,
+	(owner: string, name: string) =>
+		projectionClient.getRepoOverview.queryPromise({ ownerLogin: owner, name }),
+);
 
-const loadWorkflowRunDetail = (
-	owner: string,
-	name: string,
-	runNumber: number,
-) =>
-	projectionClient.getWorkflowRunDetail.queryPromise({
-		ownerLogin: owner,
-		name,
-		runNumber,
-	});
+const loadPulls = createTimedLoader(
+	(owner: string, name: string) => `pulls:${owner}/${name}:open`,
+	(owner: string, name: string) =>
+		projectionClient.listPullRequests.queryPromise({
+			ownerLogin: owner,
+			name,
+			state: "open",
+		}),
+);
 
-const loadNotifications = () =>
-	notificationsClient.listNotifications.queryPromise({});
+const loadIssues = createTimedLoader(
+	(owner: string, name: string) => `issues:${owner}/${name}:open`,
+	(owner: string, name: string) =>
+		projectionClient.listIssues.queryPromise({
+			ownerLogin: owner,
+			name,
+			state: "open",
+		}),
+);
+
+const loadPrDetail = createTimedLoader(
+	(owner: string, name: string, number: number) =>
+		`pull-detail:${owner}/${name}#${String(number)}`,
+	(owner: string, name: string, number: number) =>
+		projectionClient.getPullRequestDetail.queryPromise({
+			ownerLogin: owner,
+			name,
+			number,
+		}),
+);
+
+const loadPrFiles = createTimedLoader(
+	(owner: string, name: string, number: number) =>
+		`pull-files:${owner}/${name}#${String(number)}`,
+	(owner: string, name: string, number: number) =>
+		projectionClient.listPrFiles.queryPromise({
+			ownerLogin: owner,
+			name,
+			number,
+		}),
+);
+
+const loadIssueDetail = createTimedLoader(
+	(owner: string, name: string, number: number) =>
+		`issue-detail:${owner}/${name}#${String(number)}`,
+	(owner: string, name: string, number: number) =>
+		projectionClient.getIssueDetail.queryPromise({
+			ownerLogin: owner,
+			name,
+			number,
+		}),
+);
+
+const loadWorkflowRuns = createTimedLoader(
+	(owner: string, name: string) => `workflow-runs:${owner}/${name}`,
+	(owner: string, name: string) =>
+		projectionClient.listWorkflowRuns.queryPromise({ ownerLogin: owner, name }),
+);
+
+const loadWorkflowRunDetail = createTimedLoader(
+	(owner: string, name: string, runNumber: number) =>
+		`workflow-run:${owner}/${name}#${String(runNumber)}`,
+	(owner: string, name: string, runNumber: number) =>
+		projectionClient.getWorkflowRunDetail.queryPromise({
+			ownerLogin: owner,
+			name,
+			runNumber,
+		}),
+);
+
+const loadNotifications = createTimedLoader(
+	() => "notifications",
+	() => notificationsClient.listNotifications.queryPromise({}),
+);
 
 const parseNumberParam = (value: string, name: string): number => {
 	const parsed = Number.parseInt(value, 10);
@@ -1005,7 +1070,7 @@ function NavigationPendingOverlay() {
 
 		const timeout = setTimeout(() => {
 			setIsVisible(true);
-		}, 120);
+		}, 320);
 
 		return () => {
 			clearTimeout(timeout);
@@ -1017,27 +1082,8 @@ function NavigationPendingOverlay() {
 	}
 
 	return (
-		<div className="pointer-events-none fixed inset-0 z-50 bg-background/55">
-			<div className="mx-auto flex h-full w-full max-w-[1600px] gap-3 px-3 py-3 md:px-4 md:py-4">
-				<div className="hidden md:block w-[18%] min-w-[13rem] rounded-lg border border-border/70 bg-card/80 p-3">
-					<div className="space-y-2">
-						<Skeleton className="h-8 w-full" />
-						<Skeleton className="h-7 w-full" />
-						<Skeleton className="h-7 w-full" />
-						<Skeleton className="h-7 w-full" />
-						<Skeleton className="h-7 w-full" />
-					</div>
-				</div>
-				<div className="min-w-0 flex-1 rounded-lg border border-border/70 bg-card/80 p-4">
-					<div className="space-y-3">
-						<Skeleton className="h-7 w-1/2" />
-						<Skeleton className="h-4 w-1/3" />
-						<Skeleton className="h-28 w-full" />
-						<Skeleton className="h-28 w-full" />
-						<Skeleton className="h-28 w-full" />
-					</div>
-				</div>
-			</div>
+		<div className="pointer-events-none fixed inset-x-0 top-0 z-50">
+			<Skeleton className="h-1 w-full rounded-none" />
 		</div>
 	);
 }
@@ -1054,80 +1100,96 @@ function SpaRootRoute() {
 
 const appRouter = createBrowserRouter([
 	{
+		id: "spa-root",
 		path: "/",
 		element: <SpaRootRoute />,
 		children: [
 			{
+				id: "route-root",
 				index: true,
 				loader: rootLoader,
 				element: <RootRoute />,
 			},
 			{
+				id: "route-notifications",
 				path: "notifications",
 				loader: notificationsLoader,
 				element: <NotificationsRoute />,
 			},
 			{
+				id: "route-pull-detail",
 				path: ":owner/:name/pull/:number",
 				loader: pullDetailLoader,
 				element: <PullDetailRoute />,
 			},
 			{
+				id: "route-pulls",
 				path: ":owner/:name/pulls",
 				loader: pullsLoader,
 				element: <PullsRoute />,
 			},
 			{
+				id: "route-new-issue",
 				path: ":owner/:name/issues/new",
 				loader: newIssueLoader,
 				element: <NewIssueRoute />,
 			},
 			{
+				id: "route-issue-detail",
 				path: ":owner/:name/issues/:number",
 				loader: issueDetailLoader,
 				element: <IssueDetailRoute />,
 			},
 			{
+				id: "route-issues",
 				path: ":owner/:name/issues",
 				loader: issuesLoader,
 				element: <IssuesRoute />,
 			},
 			{
+				id: "route-run-detail",
 				path: ":owner/:name/actions/runs/:runId",
 				loader: runDetailLoader,
 				element: <RunDetailRoute />,
 			},
 			{
+				id: "route-actions",
 				path: ":owner/:name/actions",
 				loader: actionsLoader,
 				element: <ActionsRoute />,
 			},
 			{
+				id: "route-tree-wildcard",
 				path: ":owner/:name/tree/:ref/*",
 				loader: codeLoader,
 				element: <TreeRoute />,
 			},
 			{
+				id: "route-tree",
 				path: ":owner/:name/tree/:ref",
 				loader: codeLoader,
 				element: <TreeRoute />,
 			},
 			{
+				id: "route-blob",
 				path: ":owner/:name/blob/:ref/*",
 				loader: blobLoader,
 				element: <BlobRoute />,
 			},
 			{
+				id: "route-repo-activity",
 				path: ":owner/:name/activity",
 				loader: repoOverviewLoader,
 				element: <RepoOverviewRoute />,
 			},
 			{
+				id: "route-repo-overview",
 				path: ":owner/:name",
 				loader: repoOverviewLoader,
 				element: <RepoOverviewRoute />,
 			},
 			{
+				id: "route-owner",
 				path: ":owner",
 				loader: ownerLoader,
 				element: <OwnerRoute />,
