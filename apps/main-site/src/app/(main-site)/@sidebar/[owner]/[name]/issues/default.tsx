@@ -3,64 +3,40 @@ import { serverQueries } from "@/lib/server-queries";
 import { IssueListClient } from "../../../../_components/issue-list-client";
 import { RepoListShell } from "../../../../_components/repo-list-shell";
 import { ListSkeleton } from "../../../../_components/skeletons";
-import { SidebarRepoList } from "../../../sidebar-repo-list";
 
+/**
+ * Sidebar for the issues list.
+ *
+ * This component is **synchronous** so it never suspends the outer sidebar
+ * boundary. The cached `RepoListShell` renders the tab bar instantly, and
+ * all async work (param resolution, data fetching) happens inside the inner
+ * `<Suspense>` so only the list content shows a skeleton during navigation.
+ */
 export default function IssueListDefault(props: {
 	params: Promise<{ owner: string; name: string }>;
-	activeIssueNumberPromise?: Promise<number | null>;
+	activeIssueNumber?: number | null;
 }) {
 	return (
-		<IssueListEntry
-			paramsPromise={props.params}
-			activeIssueNumberPromise={props.activeIssueNumberPromise}
-		/>
-	);
-}
-
-/** Entry — resolves params and routes to cached shell or fallback. */
-async function IssueListEntry({
-	paramsPromise,
-	activeIssueNumberPromise,
-}: {
-	paramsPromise: Promise<{ owner: string; name: string }>;
-	activeIssueNumberPromise?: Promise<number | null>;
-}) {
-	const { owner, name } = await paramsPromise;
-	const activeIssueNumber = activeIssueNumberPromise
-		? await activeIssueNumberPromise
-		: null;
-
-	if (!owner || !name || owner.length === 0 || name.length === 0) {
-		return <FallbackRepoList />;
-	}
-
-	return (
-		<RepoListShell paramsPromise={paramsPromise} activeTab="issues">
+		<RepoListShell paramsPromise={props.params} activeTab="issues">
 			<Suspense fallback={<ListSkeleton />}>
 				<IssueListContent
-					owner={owner}
-					name={name}
-					activeIssueNumber={activeIssueNumber ?? null}
+					paramsPromise={props.params}
+					activeIssueNumber={props.activeIssueNumber ?? null}
 				/>
 			</Suspense>
 		</RepoListShell>
 	);
 }
 
-async function FallbackRepoList() {
-	const initialRepos = await serverQueries.listRepos.queryPromise({});
-	return <SidebarRepoList initialRepos={initialRepos} />;
-}
-
 async function IssueListContent({
-	owner,
-	name,
+	paramsPromise,
 	activeIssueNumber,
 }: {
-	owner: string;
-	name: string;
+	paramsPromise: Promise<{ owner: string; name: string }>;
 	activeIssueNumber: number | null;
 }) {
+	const { owner, name } = await paramsPromise;
+
 	const [initialData, overview] = await Promise.all([
 		serverQueries.listIssues
 			.queryPromise({

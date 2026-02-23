@@ -28,10 +28,26 @@ import {
 import { cn } from "@packages/ui/lib/utils";
 import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
 import { Array as Arr, pipe, Record as Rec } from "effect";
+import { useParams, useSelectedLayoutSegments } from "next/navigation";
 import { useCallback, useMemo, useState } from "react";
 import type { SidebarRepo } from "../@sidebar/sidebar-client";
 
 const EmptyPayload: Record<string, never> = {};
+
+/**
+ * Known tab segments that map to sidebar tabs.
+ * Used to derive the active tab from the URL path.
+ */
+const TAB_SEGMENTS = new Set([
+	"pulls",
+	"pull",
+	"issues",
+	"actions",
+	"tree",
+	"blob",
+	"activity",
+	"code",
+]);
 
 /**
  * Unified org + repo picker.
@@ -39,18 +55,38 @@ const EmptyPayload: Record<string, never> = {};
  * Single dropdown that shows all repos grouped by org with search.
  * Trigger displays: [OrgIcon] [RepoName] when a repo is selected,
  * or [OrgIcon] [OrgName] when at the org level.
+ *
+ * Derives `owner`, `name`, and `activeTab` from the URL via `useParams()`
+ * and `useSelectedLayoutSegments()` so no server-side context threading
+ * is required.
  */
 export function RepoNavSelector({
-	owner,
-	name,
-	activeTab,
 	initialRepos,
 }: {
-	owner: string | null;
-	name: string | null;
-	activeTab?: string;
 	initialRepos: ReadonlyArray<SidebarRepo>;
 }) {
+	const routeParams = useParams<{
+		owner?: string;
+		name?: string;
+	}>();
+	const segments = useSelectedLayoutSegments();
+
+	const owner = routeParams.owner ?? null;
+	const name = routeParams.name ?? null;
+
+	// Derive activeTab from URL segments after [owner]/[name]
+	const activeTab = useMemo(() => {
+		if (owner === null || name === null) return undefined;
+		// segments are relative to the layout — find the first known tab segment
+		for (const seg of segments) {
+			if (TAB_SEGMENTS.has(seg)) {
+				// Normalize "pull" → "pulls" for nav selector href generation
+				if (seg === "pull") return "pulls";
+				return seg;
+			}
+		}
+		return undefined;
+	}, [owner, name, segments]);
 	const client = useProjectionQueries();
 	const reposAtom = useMemo(
 		() => client.listRepos.subscription(EmptyPayload),

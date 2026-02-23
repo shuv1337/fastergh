@@ -1,6 +1,10 @@
-import { MainSiteShell } from "./_components/main-site-shell";
-import { RootDetail, RootSidebar } from "./_components/route-shell-content";
-
+/**
+ * Default slot page — not rendered visually.
+ *
+ * All content flows through the `@sidebar` and `@detail` parallel route slots
+ * defined in layout.tsx. This file exists as a route matcher so Next.js
+ * resolves the root `/` URL correctly.
+ */
 export default function HomePage() {
-	return <MainSiteShell sidebar={<RootSidebar />} detail={<RootDetail />} />;
+	return null;
 }

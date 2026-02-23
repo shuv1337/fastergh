@@ -4,24 +4,18 @@ import { serverQueries } from "@/lib/server-queries";
 import { SidebarClient } from "../@sidebar/sidebar-client";
 import { RepoNavSelector } from "./repo-nav-selector";
 
-export type MainSiteNavContext = {
-	owner: string | null;
-	name: string | null;
-	activeTab?: string;
-};
-
-export function MainSiteSidebar({
-	children,
-	navContextPromise,
-}: {
-	children: ReactNode;
-	navContextPromise: Promise<MainSiteNavContext>;
-}) {
+/**
+ * Sidebar chrome: nav selector at the top, slot children in the body.
+ *
+ * The nav selector derives owner/name/activeTab from the URL client-side,
+ * so no context threading is required from the server.
+ */
+export function MainSiteSidebar({ children }: { children: ReactNode }) {
 	return (
 		<SidebarClient
 			navSelector={
 				<Suspense fallback={<NavSelectorFallback />}>
-					<NavSelectorContent navContextPromise={navContextPromise} />
+					<NavSelectorContent />
 				</Suspense>
 			}
 		>
@@ -30,24 +24,10 @@ export function MainSiteSidebar({
 	);
 }
 
-async function NavSelectorContent({
-	navContextPromise,
-}: {
-	navContextPromise: Promise<MainSiteNavContext>;
-}) {
-	const [navContext, initialRepos] = await Promise.all([
-		navContextPromise,
-		serverQueries.listRepos.queryPromise({}),
-	]);
+async function NavSelectorContent() {
+	const initialRepos = await serverQueries.listRepos.queryPromise({});
 
-	return (
-		<RepoNavSelector
-			owner={navContext.owner}
-			name={navContext.name}
-			activeTab={navContext.activeTab}
-			initialRepos={initialRepos}
-		/>
-	);
+	return <RepoNavSelector initialRepos={initialRepos} />;
 }
 
 function NavSelectorFallback() {
