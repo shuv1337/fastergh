@@ -102,7 +102,6 @@ type DashboardPrItem = {
 	readonly title: string;
 	readonly authorLogin: string | null;
 	readonly commentCount: number;
-	readonly lastCheckConclusion: string | null;
 	readonly githubUpdatedAt: number;
 };
 
@@ -676,11 +675,7 @@ function GlobalWorkResults({
 }) {
 	const client = useProjectionQueries();
 	const dashboardAtom = useMemo(
-		() =>
-			client.getHomeDashboard.subscription({
-				scope: "personal",
-				days: 14,
-			}),
+		() => client.getHomeDashboard.subscription({}),
 		[client],
 	);
 	const result = useAtomValue(dashboardAtom);
@@ -705,11 +700,7 @@ function GlobalWorkResults({
 	if (Option.isNone(valueOption)) return null;
 
 	const dashboard = valueOption.value;
-	const allItems: Array<DashboardPrItem> = [
-		...dashboard.needsAttentionPrs,
-		...dashboard.yourPrs,
-		...dashboard.recentPrs,
-	];
+	const allItems: Array<DashboardPrItem> = [...dashboard.recentPrs];
 
 	const deduped = new Map<string, DashboardPrItem>();
 	for (const item of allItems) {
@@ -730,17 +721,7 @@ function GlobalWorkResults({
 				numberText.includes(normalized)
 			);
 		})
-		.sort((a, b) => {
-			const scoreA =
-				(a.lastCheckConclusion === "failure" ? 10 : 0) +
-				(a.state === "open" ? 5 : 0) +
-				a.githubUpdatedAt;
-			const scoreB =
-				(b.lastCheckConclusion === "failure" ? 10 : 0) +
-				(b.state === "open" ? 5 : 0) +
-				b.githubUpdatedAt;
-			return scoreB - scoreA;
-		})
+		.sort((a, b) => b.githubUpdatedAt - a.githubUpdatedAt)
 		.slice(0, 12);
 
 	if (filtered.length === 0) return null;
@@ -773,11 +754,6 @@ function GlobalWorkResults({
 								<span>{formatRelative(item.githubUpdatedAt)}</span>
 							</div>
 						</div>
-						{item.lastCheckConclusion === "failure" && (
-							<Badge variant="destructive" className="text-[10px]">
-								failing
-							</Badge>
-						)}
 					</CommandLinkItem>
 				);
 			})}

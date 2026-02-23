@@ -15,7 +15,6 @@ import {
 	CircleDot,
 	GitBranch,
 	GitPullRequest,
-	MessageCircle,
 	Search,
 } from "@packages/ui/components/icons";
 import { Link } from "@packages/ui/components/link";
@@ -42,8 +41,6 @@ type DashboardPrItem = {
 	authorLogin: string | null;
 	authorAvatarUrl: string | null;
 	commentCount: number;
-	lastCheckConclusion: string | null;
-	failingCheckNames: readonly string[];
 	githubUpdatedAt: number;
 };
 
@@ -64,91 +61,18 @@ type RepoSummary = {
 	ownerLogin: string;
 	name: string;
 	fullName: string;
-	openPrCount: number;
-	openIssueCount: number;
-	failingCheckCount: number;
 	lastPushAt: number | null;
 };
 
 export type DashboardData = {
-	scope: "org" | "personal";
-	rangeDays: number;
-	ownerFilter: string | null;
-	repoFilter: string | null;
 	githubLogin: string | null;
-	availableOwners: ReadonlyArray<{ ownerLogin: string; repoCount: number }>;
-	availableRepos: ReadonlyArray<{
-		ownerLogin: string;
-		name: string;
-		fullName: string;
-	}>;
-	summary: {
-		repoCount: number;
-		openPrCount: number;
-		openIssueCount: number;
-		failingCheckCount: number;
-		attentionCount: number;
-		reviewQueueCount: number;
-		stalePrCount: number;
-	};
-	yourPrs: ReadonlyArray<DashboardPrItem>;
-	needsAttentionPrs: ReadonlyArray<DashboardPrItem>;
 	recentPrs: ReadonlyArray<DashboardPrItem>;
 	recentIssues: ReadonlyArray<DashboardIssueItem>;
-	portfolioPrs: ReadonlyArray<
-		DashboardPrItem & {
-			assigneeCount: number;
-			requestedReviewerCount: number;
-			attentionLevel: "critical" | "high" | "normal";
-			attentionReason: string;
-			isViewerAuthor: boolean;
-			isViewerReviewer: boolean;
-			isViewerAssignee: boolean;
-			isStale: boolean;
-		}
-	>;
-	recentActivity: ReadonlyArray<{
-		ownerLogin: string;
-		repoName: string;
-		activityType: string;
-		title: string;
-		description: string | null;
-		actorLogin: string | null;
-		actorAvatarUrl: string | null;
-		entityNumber: number | null;
-		createdAt: number;
-	}>;
-	throughput: ReadonlyArray<{
-		dayStart: number;
-		dayLabel: string;
-		closedPrCount: number;
-		closedIssueCount: number;
-		pushCount: number;
-	}>;
-	workloadByOwner: ReadonlyArray<{
-		ownerLogin: string;
-		openPrCount: number;
-		reviewRequestedCount: number;
-		failingPrCount: number;
-		stalePrCount: number;
-	}>;
-	blockedItems: ReadonlyArray<{
-		type: "ci_failure" | "stale_pr" | "review_queue";
-		ownerLogin: string;
-		repoName: string;
-		number: number;
-		title: string;
-		reason: string;
-		githubUpdatedAt: number;
-	}>;
 	repos: ReadonlyArray<RepoSummary>;
 };
 
 type DashboardQuery = {
-	readonly scope?: "org" | "personal";
 	readonly ownerLogin?: string;
-	readonly repoFullName?: string;
-	readonly days?: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -163,12 +87,9 @@ function useDashboardData(
 	const dashboardAtom = useMemo(
 		() =>
 			client.getHomeDashboard.subscription({
-				scope: query.scope,
 				ownerLogin: query.ownerLogin,
-				repoFullName: query.repoFullName,
-				days: query.days,
 			}),
-		[client, query.days, query.ownerLogin, query.repoFullName, query.scope],
+		[client, query.ownerLogin],
 	);
 	return useSubscriptionWithInitial(dashboardAtom, initialData);
 }
@@ -188,23 +109,6 @@ function formatRelative(timestamp: number): string {
 		month: "short",
 		day: "numeric",
 	});
-}
-
-function dedupePrs(data: DashboardData): Array<DashboardPrItem> {
-	const seen = new Set<string>();
-	const result: Array<DashboardPrItem> = [];
-	for (const pr of [
-		...data.yourPrs,
-		...data.needsAttentionPrs,
-		...data.recentPrs,
-	]) {
-		const key = `${pr.ownerLogin}/${pr.repoName}#${pr.number}`;
-		if (seen.has(key)) continue;
-		seen.add(key);
-		result.push(pr);
-	}
-	result.sort((a, b) => b.githubUpdatedAt - a.githubUpdatedAt);
-	return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -256,12 +160,11 @@ export function CommandPaletteClient({
 	query: DashboardQuery;
 }) {
 	const data = useDashboardData(initialData, query);
-	const allPrs = useMemo(() => dedupePrs(data), [data]);
 
 	return (
 		<DashboardCommandPalette
 			repos={data.repos}
-			prs={allPrs}
+			prs={data.recentPrs}
 			issues={data.recentIssues}
 			scopeOwnerLogin={query.ownerLogin ?? null}
 		/>
@@ -397,10 +300,6 @@ function DashboardCommandPalette({
 										<span className="flex-1 truncate text-sm">
 											{repo.fullName}
 										</span>
-										<span className="font-mono text-[10px] text-muted-foreground/60">
-											{repo.openPrCount} PRs &middot; {repo.openIssueCount}{" "}
-											issues
-										</span>
 									</CommandLinkItem>
 								))}
 							</CommandGroup>
@@ -464,21 +363,18 @@ export function PrColumnClient({
 	query: DashboardQuery;
 }) {
 	const data = useDashboardData(initialData, query);
-	const allPrs = useMemo(() => dedupePrs(data), [data]);
 
 	return (
 		<Column
 			title="Pull Requests"
 			icon={<GitPullRequest className="size-3.5" />}
-			count={allPrs.length}
+			count={data.recentPrs.length}
 		>
-			{allPrs.length === 0 && <EmptyState>No recent pull requests.</EmptyState>}
-			{allPrs.slice(0, 30).map((pr) => (
-				<PrRow
-					key={`${pr.ownerLogin}/${pr.repoName}#${pr.number}`}
-					pr={pr}
-					isOwned={pr.authorLogin === data.githubLogin}
-				/>
+			{data.recentPrs.length === 0 && (
+				<EmptyState>No recent pull requests.</EmptyState>
+			)}
+			{data.recentPrs.map((pr) => (
+				<PrRow key={`${pr.ownerLogin}/${pr.repoName}#${pr.number}`} pr={pr} />
 			))}
 		</Column>
 	);
@@ -594,7 +490,7 @@ function EmptyState({ children }: { children: ReactNode }) {
 // Pull Request Row
 // ---------------------------------------------------------------------------
 
-function PrRow({ pr, isOwned }: { pr: DashboardPrItem; isOwned: boolean }) {
+function PrRow({ pr }: { pr: DashboardPrItem }) {
 	return (
 		<Link
 			href={`/${pr.ownerLogin}/${pr.repoName}/pull/${pr.number}`}
@@ -613,23 +509,8 @@ function PrRow({ pr, isOwned }: { pr: DashboardPrItem; isOwned: boolean }) {
 					<span>#{pr.number}</span>
 					<span className="text-border">|</span>
 					<span>{formatRelative(pr.githubUpdatedAt)}</span>
-					{pr.commentCount > 0 && (
-						<>
-							<span className="text-border">|</span>
-							<span className="flex items-center gap-0.5">
-								<MessageCircle className="size-2.5" />
-								{pr.commentCount}
-							</span>
-						</>
-					)}
 				</div>
 			</div>
-			{isOwned && pr.lastCheckConclusion === "failure" && (
-				<Badge variant="destructive" className="shrink-0 text-[10px]">
-					CI
-				</Badge>
-			)}
-			{pr.lastCheckConclusion === "success" && <CheckIcon />}
 		</Link>
 	);
 }
@@ -653,18 +534,6 @@ function PrStateIcon({
 	}
 	return (
 		<GitPullRequest className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-	);
-}
-
-function CheckIcon() {
-	return (
-		<svg
-			className="size-3 shrink-0 text-status-open"
-			viewBox="0 0 16 16"
-			fill="currentColor"
-		>
-			<path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z" />
-		</svg>
 	);
 }
 
@@ -696,15 +565,6 @@ function IssueRow({ issue }: { issue: DashboardIssueItem }) {
 					<span>#{issue.number}</span>
 					<span className="text-border">|</span>
 					<span>{formatRelative(issue.githubUpdatedAt)}</span>
-					{issue.commentCount > 0 && (
-						<>
-							<span className="text-border">|</span>
-							<span className="flex items-center gap-0.5">
-								<MessageCircle className="size-2.5" />
-								{issue.commentCount}
-							</span>
-						</>
-					)}
 				</div>
 			</div>
 			{issue.labelNames.length > 0 && (
@@ -739,23 +599,12 @@ function RepoRow({ repo }: { repo: RepoSummary }) {
 				<p className="truncate text-[13px] font-medium text-foreground leading-tight">
 					{repo.fullName}
 				</p>
-				<div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-muted-foreground/60">
-					<span>{repo.openPrCount} PRs</span>
-					<span className="text-border">|</span>
-					<span>{repo.openIssueCount} issues</span>
-					{repo.lastPushAt !== null && (
-						<>
-							<span className="text-border">|</span>
-							<span>{formatRelative(repo.lastPushAt)}</span>
-						</>
-					)}
-				</div>
+				{repo.lastPushAt !== null && (
+					<div className="mt-0.5 font-mono text-[10px] text-muted-foreground/60">
+						{formatRelative(repo.lastPushAt)}
+					</div>
+				)}
 			</div>
-			{repo.failingCheckCount > 0 && (
-				<Badge variant="destructive" className="shrink-0 text-[10px]">
-					{repo.failingCheckCount} CI
-				</Badge>
-			)}
 		</Link>
 	);
 }

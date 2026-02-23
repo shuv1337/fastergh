@@ -908,6 +908,12 @@ const selectSidebarAndDashboardRepos = Effect.gen(function* () {
 listReposDef.implement(() =>
 	Effect.gen(function* () {
 		const repos = yield* selectSidebarAndDashboardRepos;
+		const githubLogin = yield* resolveViewerGitHub;
+
+		if (githubLogin === null) {
+			return [];
+		}
+
 		const results = [];
 		for (const repo of repos) {
 			const counts = yield* computeRepoCounts(repo.githubRepoId);
@@ -1574,139 +1580,30 @@ const resolveViewerGitHub = Effect.gen(function* () {
 getHomeDashboardDef.implement((args) =>
 	Effect.gen(function* () {
 		const ctx = yield* ConfectQueryCtx;
-		const now = Date.now();
-		const identity = yield* ctx.auth.getUserIdentity();
-
 		const githubLogin = yield* resolveViewerGitHub;
 
-		const normalizedDays =
-			args.days !== undefined && Number.isFinite(args.days)
-				? Math.floor(args.days)
-				: 14;
-		const rangeDays =
-			normalizedDays < 7 ? 7 : normalizedDays > 30 ? 30 : normalizedDays;
-		const rangeStart = now - rangeDays * 24 * 60 * 60 * 1000;
+		const accessibleRepos = yield* selectSidebarAndDashboardRepos;
 
-		const scope = args.scope ?? "org";
 		const ownerFilter =
 			args.ownerLogin !== undefined && args.ownerLogin.length > 0
 				? args.ownerLogin
 				: null;
-		const repoFilter =
-			args.repoFullName !== undefined && args.repoFullName.length > 0
-				? args.repoFullName
-				: null;
 
-		const accessibleRepos = yield* selectSidebarAndDashboardRepos;
-
-		// When signed in, accessibleRepos are already limited to member repos,
-		// so yourOwnerCounts is just a count of accessible repos per owner.
-		const yourOwnerCounts = new Map<string, number>();
-		if (Option.isSome(identity)) {
-			for (const repo of accessibleRepos) {
-				yourOwnerCounts.set(
-					repo.ownerLogin,
-					(yourOwnerCounts.get(repo.ownerLogin) ?? 0) + 1,
-				);
-			}
-		}
-
-		const yourOwners = [...yourOwnerCounts.entries()]
-			.map(([ownerLogin, repoCount]) => ({ ownerLogin, repoCount }))
-			.sort((a, b) => {
-				if (a.repoCount !== b.repoCount) return b.repoCount - a.repoCount;
-				return a.ownerLogin.localeCompare(b.ownerLogin);
-			});
-
-		const ownerCounts = new Map<string, number>();
-		for (const repo of accessibleRepos) {
-			ownerCounts.set(
-				repo.ownerLogin,
-				(ownerCounts.get(repo.ownerLogin) ?? 0) + 1,
-			);
-		}
-
-		const availableOwners = [...ownerCounts.entries()]
-			.map(([ownerLogin, repoCount]) => ({ ownerLogin, repoCount }))
-			.sort((a, b) => {
-				if (a.repoCount !== b.repoCount) return b.repoCount - a.repoCount;
-				return a.ownerLogin.localeCompare(b.ownerLogin);
-			});
-
-		const availableRepos = accessibleRepos
-			.map((repo) => ({
-				ownerLogin: repo.ownerLogin,
-				name: repo.name,
-				fullName: repo.fullName,
-			}))
-			.sort((a, b) => a.fullName.localeCompare(b.fullName));
-
-		const ownerScopedRepos =
+		const filteredRepos =
 			ownerFilter === null
 				? accessibleRepos
 				: accessibleRepos.filter((repo) => repo.ownerLogin === ownerFilter);
 
-		const scopedRepos =
-			repoFilter === null
-				? ownerScopedRepos
-				: ownerScopedRepos.filter((repo) => repo.fullName === repoFilter);
+		const repos = filteredRepos.map((repo) => ({
+			ownerLogin: repo.ownerLogin,
+			name: repo.name,
+			fullName: repo.fullName,
+			lastPushAt: repo.pushedAt,
+		}));
 
-		// Cap the repos we fetch detailed PR/issue/activity data for to stay
-		// within the Convex 1s query budget. The repos are already sorted by
-		// recent activity from selectSidebarAndDashboardRepos, so the top N
-		// are the most active.
-		const detailRepos = scopedRepos.slice(0, DASHBOARD_DETAIL_REPO_LIMIT);
-
-		const repoOverviews = yield* Effect.all(
-			detailRepos.map((repo) =>
-				Effect.gen(function* () {
-					const counts = yield* computeRepoCounts(repo.githubRepoId);
-					return {
-						repositoryId: repo.githubRepoId,
-						ownerLogin: repo.ownerLogin,
-						name: repo.name,
-						fullName: repo.fullName,
-						openPrCount: counts.openPrCount,
-						openIssueCount: counts.openIssueCount,
-						failingCheckCount: counts.failingCheckCount,
-						lastPushAt: repo.pushedAt,
-					};
-				}),
-			),
-			{ concurrency: "unbounded" },
-		);
-
-		const repos = [...repoOverviews]
-			.sort((a, b) => (b.lastPushAt ?? 0) - (a.lastPushAt ?? 0))
-			.map((overview) => ({
-				ownerLogin: overview.ownerLogin,
-				name: overview.name,
-				fullName: overview.fullName,
-				openPrCount: overview.openPrCount,
-				openIssueCount: overview.openIssueCount,
-				failingCheckCount: overview.failingCheckCount,
-				lastPushAt: overview.lastPushAt,
-			}));
-
-		const userCache = new Map<
-			number,
-			{ login: string | null; avatarUrl: string | null }
-		>();
-
-		const resolveCachedUser = (userId: number | null) =>
-			Effect.gen(function* () {
-				if (userId === null) return { login: null, avatarUrl: null };
-				const cached = userCache.get(userId);
-				if (cached !== undefined) return cached;
-				const resolved = yield* resolveUser(userId);
-				userCache.set(userId, resolved);
-				return resolved;
-			});
-
-		const staleThresholdMs = 3 * 24 * 60 * 60 * 1000;
-
+		// Fetch 10 most recent open PRs across all filtered repos
 		const allPrsByRepo = yield* Effect.all(
-			detailRepos.map((repo) =>
+			filteredRepos.slice(0, DASHBOARD_DETAIL_REPO_LIMIT).map((repo) =>
 				Effect.gen(function* () {
 					const prs = yield* ctx.db
 						.query("github_pull_requests")
@@ -1719,119 +1616,7 @@ getHomeDashboardDef.implement((args) =>
 					return yield* Effect.all(
 						prs.map((pr) =>
 							Effect.gen(function* () {
-								const author = yield* resolveCachedUser(pr.authorUserId);
-
-								const assigneeLogins = yield* Effect.all(
-									pr.assigneeUserIds.map((userId) =>
-										Effect.map(resolveCachedUser(userId), (u) => u.login),
-									),
-									{ concurrency: "unbounded" },
-								);
-
-								const requestedReviewerLogins = yield* Effect.all(
-									pr.requestedReviewerUserIds.map((userId) =>
-										Effect.map(resolveCachedUser(userId), (u) => u.login),
-									),
-									{ concurrency: "unbounded" },
-								);
-
-								const resolvedAssigneeLogins = assigneeLogins.filter(
-									(login): login is string => login !== null,
-								);
-								const resolvedRequestedReviewerLogins =
-									requestedReviewerLogins.filter(
-										(login): login is string => login !== null,
-									);
-
-								const raw = ctx.rawCtx;
-								const commentCount = yield* tryAggregateCount(
-									() =>
-										commentsByIssueNumber.count(raw, {
-											namespace: `${pr.repositoryId}:${pr.number}`,
-										}),
-									Effect.gen(function* () {
-										const comments = yield* ctx.db
-											.query("github_issue_comments")
-											.withIndex("by_repositoryId_and_issueNumber", (q) =>
-												q
-													.eq("repositoryId", pr.repositoryId)
-													.eq("issueNumber", pr.number),
-											)
-											.collect();
-										return comments.length;
-									}),
-								);
-
-								const checkRuns = yield* ctx.db
-									.query("github_check_runs")
-									.withIndex("by_repositoryId_and_headSha", (q) =>
-										q
-											.eq("repositoryId", pr.repositoryId)
-											.eq("headSha", pr.headSha),
-									)
-									.take(200);
-
-								let lastCheckConclusion: string | null = null;
-								if (checkRuns.length > 0) {
-									const hasFailure = checkRuns.some(
-										(checkRun) =>
-											checkRun.conclusion === "failure" ||
-											checkRun.conclusion === "timed_out" ||
-											checkRun.conclusion === "action_required",
-									);
-									const hasPending = checkRuns.some(
-										(checkRun) => checkRun.status !== "completed",
-									);
-									if (hasFailure) {
-										lastCheckConclusion = "failure";
-									} else if (hasPending) {
-										lastCheckConclusion = null;
-									} else {
-										lastCheckConclusion = "success";
-									}
-								}
-
-								const failingCheckNames = checkRuns
-									.filter(
-										(cr) =>
-											cr.conclusion === "failure" ||
-											cr.conclusion === "timed_out" ||
-											cr.conclusion === "action_required",
-									)
-									.map((cr) => cr.name);
-
-								const isViewerAuthor =
-									githubLogin !== null && author.login === githubLogin;
-								const isViewerReviewer =
-									githubLogin !== null &&
-									resolvedRequestedReviewerLogins.includes(githubLogin);
-								const isViewerAssignee =
-									githubLogin !== null &&
-									resolvedAssigneeLogins.includes(githubLogin);
-								const isStale = now - pr.githubUpdatedAt >= staleThresholdMs;
-
-								const attentionLevel: "critical" | "high" | "normal" =
-									lastCheckConclusion === "failure"
-										? "critical"
-										: isViewerReviewer || isViewerAssignee || isStale
-											? "high"
-											: "normal";
-
-								let attentionReason = "Active";
-								if (lastCheckConclusion === "failure") {
-									attentionReason = "CI failing";
-								} else if (isViewerReviewer) {
-									attentionReason = "Review requested";
-								} else if (isViewerAssignee) {
-									attentionReason = "Assigned to you";
-								} else if (isViewerAuthor) {
-									attentionReason = "Your PR";
-								} else if (resolvedRequestedReviewerLogins.length > 0) {
-									attentionReason = "Needs review";
-								} else if (isStale) {
-									attentionReason = "No updates in 3+ days";
-								}
-
+								const author = yield* resolveUser(pr.authorUserId);
 								return {
 									ownerLogin: repo.ownerLogin,
 									repoName: repo.name,
@@ -1841,21 +1626,8 @@ getHomeDashboardDef.implement((args) =>
 									title: pr.title,
 									authorLogin: author.login,
 									authorAvatarUrl: author.avatarUrl,
-									assigneeLogins: resolvedAssigneeLogins,
-									requestedReviewerLogins: resolvedRequestedReviewerLogins,
-									commentCount,
-									lastCheckConclusion,
-									failingCheckNames,
+									commentCount: 0,
 									githubUpdatedAt: pr.githubUpdatedAt,
-									assigneeCount: resolvedAssigneeLogins.length,
-									requestedReviewerCount:
-										resolvedRequestedReviewerLogins.length,
-									attentionLevel,
-									attentionReason,
-									isViewerAuthor,
-									isViewerReviewer,
-									isViewerAssignee,
-									isStale,
 								};
 							}),
 						),
@@ -1866,78 +1638,14 @@ getHomeDashboardDef.implement((args) =>
 			{ concurrency: "unbounded" },
 		);
 
-		const allPrs = allPrsByRepo
+		const recentPrs = allPrsByRepo
 			.flat()
-			.sort((a, b) => b.githubUpdatedAt - a.githubUpdatedAt);
+			.sort((a, b) => b.githubUpdatedAt - a.githubUpdatedAt)
+			.slice(0, 10);
 
-		const attentionWeight = (item: (typeof allPrs)[number]) => {
-			if (item.attentionLevel === "critical") return 3;
-			if (item.attentionLevel === "high") return 2;
-			return 1;
-		};
-
-		const yourPrsAll =
-			githubLogin === null
-				? []
-				: allPrs.filter((pr) => pr.authorLogin === githubLogin);
-
-		const reviewQueuePrs =
-			scope === "personal" && githubLogin !== null
-				? allPrs.filter((pr) => pr.isViewerReviewer || pr.isViewerAssignee)
-				: allPrs.filter((pr) => pr.requestedReviewerCount > 0);
-
-		const failingPrs = allPrs.filter(
-			(pr) => pr.lastCheckConclusion === "failure",
-		);
-
-		const stalePrs = allPrs.filter((pr) => pr.isStale);
-
-		const attentionCandidates =
-			scope === "personal" && githubLogin !== null
-				? allPrs.filter(
-						(pr) =>
-							pr.lastCheckConclusion === "failure" ||
-							pr.isViewerReviewer ||
-							pr.isViewerAssignee ||
-							(pr.isViewerAuthor && pr.isStale),
-					)
-				: allPrs.filter(
-						(pr) =>
-							pr.lastCheckConclusion === "failure" ||
-							pr.requestedReviewerCount > 0 ||
-							pr.isStale,
-					);
-
-		const prioritizedAttention = [...attentionCandidates].sort((a, b) => {
-			const levelDelta = attentionWeight(b) - attentionWeight(a);
-			if (levelDelta !== 0) return levelDelta;
-			return b.githubUpdatedAt - a.githubUpdatedAt;
-		});
-
-		const needsAttentionPrs =
-			scope === "personal" && githubLogin !== null
-				? prioritizedAttention.filter((pr) => !pr.isViewerAuthor).slice(0, 12)
-				: prioritizedAttention.slice(0, 12);
-
-		const yourPrs = yourPrsAll.slice(0, 12);
-
-		const excludedPrKeys = new Set([
-			...yourPrs.map((pr) => `${pr.ownerLogin}/${pr.repoName}#${pr.number}`),
-			...needsAttentionPrs.map(
-				(pr) => `${pr.ownerLogin}/${pr.repoName}#${pr.number}`,
-			),
-		]);
-
-		const recentPrs = allPrs
-			.filter(
-				(pr) =>
-					!excludedPrKeys.has(`${pr.ownerLogin}/${pr.repoName}#${pr.number}`),
-			)
-			.slice(0, 12);
-
-		// Fetch recent issues across detail repos
+		// Fetch 10 most recent open issues across all filtered repos
 		const allIssuesByRepo = yield* Effect.all(
-			detailRepos.map((repo) =>
+			filteredRepos.slice(0, DASHBOARD_DETAIL_REPO_LIMIT).map((repo) =>
 				Effect.gen(function* () {
 					const issues = yield* ctx.db
 						.query("github_issues")
@@ -1952,7 +1660,7 @@ getHomeDashboardDef.implement((args) =>
 							.filter((issue) => !issue.isPullRequest)
 							.map((issue) =>
 								Effect.gen(function* () {
-									const author = yield* resolveCachedUser(issue.authorUserId);
+									const author = yield* resolveUser(issue.authorUserId);
 									return {
 										ownerLogin: repo.ownerLogin,
 										repoName: repo.name,
@@ -1977,253 +1685,12 @@ getHomeDashboardDef.implement((args) =>
 		const recentIssues = allIssuesByRepo
 			.flat()
 			.sort((a, b) => b.githubUpdatedAt - a.githubUpdatedAt)
-			.slice(0, 20);
-
-		const allRecentActivityByRepo = yield* Effect.all(
-			detailRepos.map((repo) =>
-				Effect.gen(function* () {
-					const activities = yield* ctx.db
-						.query("view_activity_feed")
-						.withIndex("by_repositoryId_and_createdAt", (q) =>
-							q.eq("repositoryId", repo.githubRepoId),
-						)
-						.order("desc")
-						.take(20);
-
-					return activities.map((activity) => ({
-						ownerLogin: repo.ownerLogin,
-						repoName: repo.name,
-						activityType: activity.activityType,
-						title: activity.title,
-						description: activity.description,
-						actorLogin: activity.actorLogin,
-						actorAvatarUrl: activity.actorAvatarUrl,
-						entityNumber: activity.entityNumber,
-						createdAt: activity.createdAt,
-					}));
-				}),
-			),
-			{ concurrency: "unbounded" },
-		);
-
-		const rangedActivity = allRecentActivityByRepo
-			.flat()
-			.filter((activity) => activity.createdAt >= rangeStart)
-			.sort((a, b) => b.createdAt - a.createdAt);
-
-		const recentActivity = rangedActivity.slice(0, 24);
-
-		const dayBuckets = new Map<
-			number,
-			{
-				dayStart: number;
-				dayLabel: string;
-				closedPrCount: number;
-				closedIssueCount: number;
-				pushCount: number;
-			}
-		>();
-
-		for (let dayOffset = rangeDays - 1; dayOffset >= 0; dayOffset -= 1) {
-			const date = new Date(now - dayOffset * 24 * 60 * 60 * 1000);
-			date.setHours(0, 0, 0, 0);
-			const dayStart = date.getTime();
-			dayBuckets.set(dayStart, {
-				dayStart,
-				dayLabel: date.toLocaleDateString(undefined, {
-					month: "short",
-					day: "numeric",
-				}),
-				closedPrCount: 0,
-				closedIssueCount: 0,
-				pushCount: 0,
-			});
-		}
-
-		for (const activity of rangedActivity) {
-			const date = new Date(activity.createdAt);
-			date.setHours(0, 0, 0, 0);
-			const dayStart = date.getTime();
-			const bucket = dayBuckets.get(dayStart);
-			if (bucket === undefined) continue;
-			if (activity.activityType === "pr.closed") {
-				bucket.closedPrCount += 1;
-			}
-			if (activity.activityType === "issue.closed") {
-				bucket.closedIssueCount += 1;
-			}
-			if (activity.activityType === "push") {
-				bucket.pushCount += 1;
-			}
-		}
-
-		const throughput = [...dayBuckets.values()].sort(
-			(a, b) => a.dayStart - b.dayStart,
-		);
-
-		const workloadByOwnerMap = new Map<
-			string,
-			{
-				ownerLogin: string;
-				openPrCount: number;
-				reviewRequestedCount: number;
-				failingPrCount: number;
-				stalePrCount: number;
-			}
-		>();
-
-		for (const pr of allPrs) {
-			const existing = workloadByOwnerMap.get(pr.ownerLogin);
-			if (existing !== undefined) {
-				existing.openPrCount += 1;
-				existing.reviewRequestedCount += pr.requestedReviewerCount > 0 ? 1 : 0;
-				existing.failingPrCount += pr.lastCheckConclusion === "failure" ? 1 : 0;
-				existing.stalePrCount += pr.isStale ? 1 : 0;
-				continue;
-			}
-
-			workloadByOwnerMap.set(pr.ownerLogin, {
-				ownerLogin: pr.ownerLogin,
-				openPrCount: 1,
-				reviewRequestedCount: pr.requestedReviewerCount > 0 ? 1 : 0,
-				failingPrCount: pr.lastCheckConclusion === "failure" ? 1 : 0,
-				stalePrCount: pr.isStale ? 1 : 0,
-			});
-		}
-
-		const workloadByOwner = [...workloadByOwnerMap.values()].sort((a, b) => {
-			if (a.failingPrCount !== b.failingPrCount) {
-				return b.failingPrCount - a.failingPrCount;
-			}
-			if (a.reviewRequestedCount !== b.reviewRequestedCount) {
-				return b.reviewRequestedCount - a.reviewRequestedCount;
-			}
-			if (a.openPrCount !== b.openPrCount) {
-				return b.openPrCount - a.openPrCount;
-			}
-			return a.ownerLogin.localeCompare(b.ownerLogin);
-		});
-
-		const blockedItems: Array<{
-			type: "ci_failure" | "stale_pr" | "review_queue";
-			ownerLogin: string;
-			repoName: string;
-			number: number;
-			title: string;
-			reason: string;
-			githubUpdatedAt: number;
-		}> = [];
-		const blockedItemKeys = new Set<string>();
-
-		const addBlocked = (
-			type: "ci_failure" | "stale_pr" | "review_queue",
-			reason: string,
-			prs: ReadonlyArray<(typeof allPrs)[number]>,
-		) => {
-			for (const pr of prs) {
-				const key = `${pr.ownerLogin}/${pr.repoName}#${pr.number}`;
-				if (blockedItemKeys.has(key)) continue;
-				blockedItemKeys.add(key);
-				blockedItems.push({
-					type,
-					ownerLogin: pr.ownerLogin,
-					repoName: pr.repoName,
-					number: pr.number,
-					title: pr.title,
-					reason,
-					githubUpdatedAt: pr.githubUpdatedAt,
-				});
-				if (blockedItems.length >= 24) return;
-			}
-		};
-
-		addBlocked("ci_failure", "Check suite is failing", failingPrs.slice(0, 12));
-		addBlocked(
-			"review_queue",
-			"Waiting for review",
-			reviewQueuePrs.slice(0, 12),
-		);
-		addBlocked("stale_pr", "No updates in 3+ days", stalePrs.slice(0, 12));
-
-		blockedItems.sort((a, b) => b.githubUpdatedAt - a.githubUpdatedAt);
-
-		const portfolioPrs = [...allPrs]
-			.sort((a, b) => {
-				const levelDelta = attentionWeight(b) - attentionWeight(a);
-				if (levelDelta !== 0) return levelDelta;
-				return b.githubUpdatedAt - a.githubUpdatedAt;
-			})
-			.slice(0, 120)
-			.map((pr) => ({
-				ownerLogin: pr.ownerLogin,
-				repoName: pr.repoName,
-				number: pr.number,
-				state: pr.state,
-				draft: pr.draft,
-				title: pr.title,
-				authorLogin: pr.authorLogin,
-				authorAvatarUrl: pr.authorAvatarUrl,
-				commentCount: pr.commentCount,
-				lastCheckConclusion: pr.lastCheckConclusion,
-				failingCheckNames: pr.failingCheckNames,
-				githubUpdatedAt: pr.githubUpdatedAt,
-				assigneeCount: pr.assigneeCount,
-				requestedReviewerCount: pr.requestedReviewerCount,
-				attentionLevel: pr.attentionLevel,
-				attentionReason: pr.attentionReason,
-				isViewerAuthor: pr.isViewerAuthor,
-				isViewerReviewer: pr.isViewerReviewer,
-				isViewerAssignee: pr.isViewerAssignee,
-				isStale: pr.isStale,
-			}));
-
-		const toDashboardPr = (pr: (typeof allPrs)[number]) => ({
-			ownerLogin: pr.ownerLogin,
-			repoName: pr.repoName,
-			number: pr.number,
-			state: pr.state,
-			draft: pr.draft,
-			title: pr.title,
-			authorLogin: pr.authorLogin,
-			authorAvatarUrl: pr.authorAvatarUrl,
-			commentCount: pr.commentCount,
-			lastCheckConclusion: pr.lastCheckConclusion,
-			failingCheckNames: pr.failingCheckNames,
-			githubUpdatedAt: pr.githubUpdatedAt,
-		});
-
-		const summary = {
-			repoCount: repos.length,
-			openPrCount: repos.reduce((sum, repo) => sum + repo.openPrCount, 0),
-			openIssueCount: repos.reduce((sum, repo) => sum + repo.openIssueCount, 0),
-			failingCheckCount: repos.reduce(
-				(sum, repo) => sum + repo.failingCheckCount,
-				0,
-			),
-			attentionCount: prioritizedAttention.length,
-			reviewQueueCount: reviewQueuePrs.length,
-			stalePrCount: stalePrs.length,
-		};
+			.slice(0, 10);
 
 		return {
-			scope,
-			rangeDays,
-			ownerFilter,
-			repoFilter,
 			githubLogin,
-			yourOwners,
-			availableOwners,
-			availableRepos,
-			summary,
-			yourPrs: yourPrs.map(toDashboardPr),
-			needsAttentionPrs: needsAttentionPrs.map(toDashboardPr),
-			recentPrs: recentPrs.map(toDashboardPr),
+			recentPrs,
 			recentIssues,
-			portfolioPrs,
-			recentActivity,
-			throughput,
-			workloadByOwner,
-			blockedItems,
 			repos,
 		};
 	}),
