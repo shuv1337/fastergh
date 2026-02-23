@@ -268,12 +268,14 @@ const ensureNextRequestDataAccess = async () => {
 		return;
 	}
 
-	try {
-		const { headers } = await import("next/headers");
-		await headers();
-	} catch {
+	// `next/headers` request APIs only exist in Next.js server runtime.
+	// Skip this check in tests and non-Next environments.
+	if (process.env.NEXT_RUNTIME === undefined) {
 		return;
 	}
+
+	const { headers } = await import("next/headers");
+	await headers();
 };
 
 const withRpcClientSpan = <A>(
