@@ -69,6 +69,7 @@ import { PrDetailSkeleton } from "@/app/(main-site)/_components/skeletons";
 import { MarkdownBody } from "@/components/markdown-body";
 import {
 	extractErrorMessage,
+	extractErrorReason,
 	extractErrorTag,
 	extractRpcDefectMessage,
 } from "@/lib/rpc-error";
@@ -96,12 +97,19 @@ function extractInteractionError(
 	const message = extractErrorMessage(err);
 	if (message !== null) return message;
 
+	const reason = extractErrorReason(err);
+	if (reason !== null) return reason;
+
 	if (extractErrorTag(err) === "RpcDefectError") {
 		const defectMessage = extractRpcDefectMessage(err);
 		if (defectMessage !== null) return defectMessage;
 	}
 
 	return fallback;
+}
+
+function normalizeReviewState(state: string): string {
+	return state.trim().replaceAll(" ", "_").toUpperCase();
 }
 
 type PrDetail = {
@@ -2479,10 +2487,10 @@ function InfoSidebar({
 	onClearDraftReplies: () => void;
 }) {
 	const approvedCount = pr.reviews.filter(
-		(review) => review.state === "APPROVED",
+		(review) => normalizeReviewState(review.state) === "APPROVED",
 	).length;
 	const changesRequestedCount = pr.reviews.filter(
-		(review) => review.state === "CHANGES_REQUESTED",
+		(review) => normalizeReviewState(review.state) === "CHANGES_REQUESTED",
 	).length;
 
 	const failingChecksCount = pr.checkRuns.filter(
@@ -2970,12 +2978,12 @@ function PrActionBar({
 	headSha: string;
 }) {
 	const writeClient = useGithubWrite();
-	const [mergeResult, doMerge] = useAtom(writeClient.mergePullRequest.mutate);
+	const [mergeResult, doMerge] = useAtom(writeClient.mergePullRequest.call);
 	const [branchUpdateResult, doUpdateBranch] = useAtom(
-		writeClient.updatePullRequestBranch.mutate,
+		writeClient.updatePullRequestBranch.call,
 	);
 	const [stateResult, doUpdateState] = useAtom(
-		writeClient.updateIssueState.mutate,
+		writeClient.updateIssueState.call,
 	);
 	const correlationPrefix = useId();
 	const isMerging = Result.isWaiting(mergeResult);
@@ -3116,7 +3124,7 @@ function ReviewSubmitSection({
 }) {
 	const writeClient = useGithubWrite();
 	const [reviewResult, submitReview] = useAtom(
-		writeClient.submitPrReview.mutate,
+		writeClient.submitPrReview.call,
 		{ mode: "promise" },
 	);
 	const [body, setBody] = useState("");
@@ -3281,13 +3289,11 @@ function ReviewSubmitSection({
 			</Button>
 			{Result.isFailure(reviewResult) && (
 				<p className="mt-1.5 text-[11px] text-destructive">
-					{extractInteractionError(reviewResult, "Could not queue review")}
+					{extractInteractionError(reviewResult, "Could not submit review")}
 				</p>
 			)}
 			{isSuccess && (
-				<p className="mt-1.5 text-[11px] text-github-open">
-					Review queued. Syncing with GitHub...
-				</p>
+				<p className="mt-1.5 text-[11px] text-github-open">Review submitted.</p>
 			)}
 		</div>
 	);
@@ -3437,7 +3443,8 @@ function ReviewerChip({
 			label: "Pending",
 		},
 	};
-	const config = stateConfig[review.state] ?? {
+	const normalizedState = normalizeReviewState(review.state);
+	const config = stateConfig[normalizedState] ?? {
 		dotClass: "bg-muted-foreground",
 		label: review.state,
 	};
@@ -3504,7 +3511,11 @@ function ReviewStateBadge({ state }: { state: string }) {
 		},
 		PENDING: { label: "Pending", variant: "outline" },
 	};
-	const c = config[state] ?? { label: state, variant: "outline" as const };
+	const normalizedState = normalizeReviewState(state);
+	const c = config[normalizedState] ?? {
+		label: state,
+		variant: "outline" as const,
+	};
 	return (
 		<Badge variant={c.variant} className={cn("text-xs", c.className)}>
 			{c.label}

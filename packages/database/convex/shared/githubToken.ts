@@ -17,7 +17,7 @@ import type {
 	GenericActionCtx,
 	GenericDataModel,
 } from "convex/server";
-import { Data, Effect, Either, Schema } from "effect";
+import { Data, Effect, Either, Option as Opt, Schema } from "effect";
 import { components } from "../_generated/api";
 import { authComponent } from "../auth";
 import {
@@ -282,6 +282,10 @@ const resolveAccountAccessToken = (
 		refreshTokenExpiresAt: number | null;
 		scope: string | null;
 	}) => Effect.Effect<void>,
+	reloadLatestAccount: () => Effect.Effect<
+		Schema.Schema.Type<typeof OAuthAccountSchema>,
+		NoGitHubTokenError
+	>,
 ): Effect.Effect<string, NoGitHubTokenError> =>
 	Effect.gen(function* () {
 		const accessToken = account.accessToken ?? null;
@@ -307,21 +311,71 @@ const resolveAccountAccessToken = (
 			});
 		}
 
-		const refreshed = yield* refreshGitHubOAuthToken(
+		const refreshedEither = yield* refreshGitHubOAuthToken(
 			providerId,
 			refreshToken,
-		).pipe(
-			Effect.catchTag("NoGitHubTokenError", (error) => {
-				if (!isTokenExpired(accessTokenExpiresAt)) {
-					return Effect.succeed(null);
-				}
-				return Effect.fail(error);
-			}),
-		);
+		).pipe(Effect.either);
 
-		if (refreshed === null) {
-			return accessToken;
+		if (Either.isLeft(refreshedEither)) {
+			if (!isTokenExpired(accessTokenExpiresAt)) {
+				return accessToken;
+			}
+
+			const latestAccountOption = yield* reloadLatestAccount().pipe(
+				Effect.option,
+			);
+			if (Opt.isSome(latestAccountOption)) {
+				const latestAccount = latestAccountOption.value;
+				const latestAccessToken = latestAccount.accessToken ?? null;
+				const latestAccessTokenExpiresAt =
+					latestAccount.accessTokenExpiresAt ?? null;
+
+				if (
+					latestAccessToken !== null &&
+					!isTokenExpired(latestAccessTokenExpiresAt)
+				) {
+					return latestAccessToken;
+				}
+
+				const latestRefreshToken = latestAccount.refreshToken ?? null;
+				if (
+					latestRefreshToken !== null &&
+					latestRefreshToken !== refreshToken
+				) {
+					const retriedRefresh = yield* refreshGitHubOAuthToken(
+						providerId,
+						latestRefreshToken,
+					).pipe(Effect.either);
+
+					if (Either.isRight(retriedRefresh)) {
+						const refreshed = retriedRefresh.right;
+						const nextRefreshToken =
+							refreshed.refreshToken ?? latestRefreshToken;
+
+						yield* persistTokenUpdate({
+							accessToken: refreshed.accessToken,
+							refreshToken: nextRefreshToken,
+							accessTokenExpiresAt: refreshed.accessTokenExpiresAt,
+							refreshTokenExpiresAt: refreshed.refreshTokenExpiresAt,
+							scope: refreshed.scope,
+						}).pipe(
+							Effect.catchAll(
+								(error) =>
+									new NoGitHubTokenError({
+										reason: `Refreshed ${providerId} OAuth token but failed to persist account update for userId ${account.userId}: ${String(error)}`,
+									}),
+							),
+						);
+
+						return refreshed.accessToken;
+					}
+				}
+			}
+
+			return yield* refreshedEither.left;
 		}
+
+		const refreshed = refreshedEither.right;
 
 		const nextRefreshToken = refreshed.refreshToken ?? refreshToken;
 		yield* persistTokenUpdate({
@@ -330,7 +384,14 @@ const resolveAccountAccessToken = (
 			accessTokenExpiresAt: refreshed.accessTokenExpiresAt,
 			refreshTokenExpiresAt: refreshed.refreshTokenExpiresAt,
 			scope: refreshed.scope,
-		}).pipe(Effect.catchAll(() => Effect.void));
+		}).pipe(
+			Effect.catchAll(
+				(error) =>
+					new NoGitHubTokenError({
+						reason: `Refreshed ${providerId} OAuth token but failed to persist account update for userId ${account.userId}: ${String(error)}`,
+					}),
+			),
+		);
 
 		return refreshed.accessToken;
 	});
@@ -354,26 +415,42 @@ const lookupTokenViaRunQuery = (
 
 		const decoded = yield* decodeAccount(account, providerId, userId);
 
-		return yield* resolveAccountAccessToken(decoded, providerId, (update) =>
-			Effect.promise(() =>
-				runMutation(components.betterAuth.adapter.updateOne, {
-					input: {
-						model: "account",
-						where: [
-							{ field: "providerId", value: providerId },
-							{ field: "userId", value: userId },
-						],
-						update: {
-							accessToken: update.accessToken,
-							refreshToken: update.refreshToken,
-							accessTokenExpiresAt: update.accessTokenExpiresAt,
-							refreshTokenExpiresAt: update.refreshTokenExpiresAt,
-							scope: update.scope,
-							updatedAt: Date.now(),
+		return yield* resolveAccountAccessToken(
+			decoded,
+			providerId,
+			(update) =>
+				Effect.promise(() =>
+					runMutation(components.betterAuth.adapter.updateOne, {
+						input: {
+							model: "account",
+							where: [
+								{ field: "providerId", value: providerId },
+								{ field: "userId", value: userId },
+							],
+							update: {
+								accessToken: update.accessToken,
+								refreshToken: update.refreshToken,
+								accessTokenExpiresAt: update.accessTokenExpiresAt,
+								refreshTokenExpiresAt: update.refreshTokenExpiresAt,
+								scope: update.scope,
+								updatedAt: Date.now(),
+							},
 						},
-					},
+					}),
+				).pipe(Effect.asVoid),
+			() =>
+				Effect.gen(function* () {
+					const latestAccount = yield* Effect.promise(() =>
+						runQuery(components.betterAuth.adapter.findOne, {
+							model: "account" as const,
+							where: [
+								{ field: "providerId", value: providerId },
+								{ field: "userId", value: userId },
+							],
+						}),
+					);
+					return yield* decodeAccount(latestAccount, providerId, userId);
 				}),
-			).pipe(Effect.asVoid),
 		);
 	});
 
@@ -434,24 +511,41 @@ export const lookupGitHubTokenByUserIdConfect = (
 
 		const decoded = yield* decodeAccount(account, "github", userId);
 
-		return yield* resolveAccountAccessToken(decoded, "github", (update) =>
-			runMutation(components.betterAuth.adapter.updateOne, {
-				input: {
-					model: "account",
-					where: [
-						{ field: "providerId", value: "github" },
-						{ field: "userId", value: userId },
-					],
-					update: {
-						accessToken: update.accessToken,
-						refreshToken: update.refreshToken,
-						accessTokenExpiresAt: update.accessTokenExpiresAt,
-						refreshTokenExpiresAt: update.refreshTokenExpiresAt,
-						scope: update.scope,
-						updatedAt: Date.now(),
+		return yield* resolveAccountAccessToken(
+			decoded,
+			"github",
+			(update) =>
+				runMutation(components.betterAuth.adapter.updateOne, {
+					input: {
+						model: "account",
+						where: [
+							{ field: "providerId", value: "github" },
+							{ field: "userId", value: userId },
+						],
+						update: {
+							accessToken: update.accessToken,
+							refreshToken: update.refreshToken,
+							accessTokenExpiresAt: update.accessTokenExpiresAt,
+							refreshTokenExpiresAt: update.refreshTokenExpiresAt,
+							scope: update.scope,
+							updatedAt: Date.now(),
+						},
 					},
-				},
-			}).pipe(Effect.asVoid),
+				}).pipe(Effect.asVoid),
+			() =>
+				Effect.gen(function* () {
+					const latestAccount = yield* runQuery(
+						components.betterAuth.adapter.findOne,
+						{
+							model: "account" as const,
+							where: [
+								{ field: "providerId", value: "github" },
+								{ field: "userId", value: userId },
+							],
+						},
+					);
+					return yield* decodeAccount(latestAccount, "github", userId);
+				}),
 		);
 	});
 
@@ -476,24 +570,41 @@ export const lookupTokenByProviderConfect = (
 
 		const decoded = yield* decodeAccount(account, providerId, userId);
 
-		return yield* resolveAccountAccessToken(decoded, providerId, (update) =>
-			runMutation(components.betterAuth.adapter.updateOne, {
-				input: {
-					model: "account",
-					where: [
-						{ field: "providerId", value: providerId },
-						{ field: "userId", value: userId },
-					],
-					update: {
-						accessToken: update.accessToken,
-						refreshToken: update.refreshToken,
-						accessTokenExpiresAt: update.accessTokenExpiresAt,
-						refreshTokenExpiresAt: update.refreshTokenExpiresAt,
-						scope: update.scope,
-						updatedAt: Date.now(),
+		return yield* resolveAccountAccessToken(
+			decoded,
+			providerId,
+			(update) =>
+				runMutation(components.betterAuth.adapter.updateOne, {
+					input: {
+						model: "account",
+						where: [
+							{ field: "providerId", value: providerId },
+							{ field: "userId", value: userId },
+						],
+						update: {
+							accessToken: update.accessToken,
+							refreshToken: update.refreshToken,
+							accessTokenExpiresAt: update.accessTokenExpiresAt,
+							refreshTokenExpiresAt: update.refreshTokenExpiresAt,
+							scope: update.scope,
+							updatedAt: Date.now(),
+						},
 					},
-				},
-			}).pipe(Effect.asVoid),
+				}).pipe(Effect.asVoid),
+			() =>
+				Effect.gen(function* () {
+					const latestAccount = yield* runQuery(
+						components.betterAuth.adapter.findOne,
+						{
+							model: "account" as const,
+							where: [
+								{ field: "providerId", value: providerId },
+								{ field: "userId", value: userId },
+							],
+						},
+					);
+					return yield* decodeAccount(latestAccount, providerId, userId);
+				}),
 		);
 	});
 
