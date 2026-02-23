@@ -11,7 +11,11 @@ import {
 	confectSchema,
 } from "../confect";
 import { toStringOrNull as str, toNumberOrNull } from "../shared/coerce";
-import { GitHubApiClient, type GitHubApiError } from "../shared/githubApi";
+import {
+	fetchArrayLenient,
+	GitHubApiClient,
+	type GitHubApiError,
+} from "../shared/githubApi";
 import { getInstallationToken } from "../shared/githubApp";
 import { lookupGitHubTokenByUserIdConfect } from "../shared/githubToken";
 import { DatabaseRpcModuleMiddlewares } from "./moduleMiddlewares";
@@ -107,6 +111,16 @@ const toPrFileStatus = (v: unknown): PrFileStatus => {
 	if (isPrFileStatus(s)) return s;
 	return "changed";
 };
+
+const PullRequestFileForSyncSchema = Schema.Struct({
+	filename: Schema.String,
+	status: Schema.String,
+	additions: Schema.Number,
+	deletions: Schema.Number,
+	changes: Schema.Number,
+	patch: Schema.optional(Schema.NullOr(Schema.String)),
+	previous_filename: Schema.optional(Schema.NullOr(Schema.String)),
+});
 
 const num = (v: unknown): number => toNumberOrNull(v) ?? 0;
 
@@ -1323,10 +1337,7 @@ syncPrFilesDef.implement((args) =>
 		}
 
 		const token = yield* getInstallationToken(args.installationId);
-		const gh = yield* Effect.provide(
-			GitHubApiClient,
-			GitHubApiClient.fromToken(token),
-		);
+		const ghLayer = GitHubApiClient.fromToken(token);
 
 		// Paginated fetch of PR files
 		const allFiles: Array<{
@@ -1343,27 +1354,30 @@ syncPrFilesDef.implement((args) =>
 		let page = 1;
 		let hasMore = true;
 		while (hasMore && allFiles.length < MAX_FILES_PER_PR) {
-			const filesPage = yield* gh.client.pullsListFiles(
-				args.ownerLogin,
-				args.name,
-				String(args.pullRequestNumber),
-				{
-					per_page: 100,
-					page,
-				},
-			);
-			for (const file of filesPage) {
+			const filesPage = yield* fetchArrayLenient(
+				PullRequestFileForSyncSchema,
+				HttpClientRequest.get(
+					`/repos/${args.ownerLogin}/${args.name}/pulls/${String(args.pullRequestNumber)}/files`,
+				).pipe(
+					HttpClientRequest.setUrlParams({
+						per_page: 100,
+						page,
+					}),
+				),
+			).pipe(Effect.provide(ghLayer));
+
+			for (const file of filesPage.items) {
 				allFiles.push({
 					filename: file.filename,
 					status: file.status,
 					additions: file.additions,
 					deletions: file.deletions,
 					changes: file.changes,
-					patch: file.patch,
-					previous_filename: file.previous_filename,
+					patch: file.patch ?? null,
+					previous_filename: file.previous_filename ?? null,
 				});
 			}
-			hasMore = filesPage.length === 100;
+			hasMore = filesPage.items.length === 100;
 			page += 1;
 		}
 

@@ -55,36 +55,6 @@ const WebhookUserSchema = Schema.Struct({
 
 const decodeWebhookUser = Schema.decodeUnknownEither(WebhookUserSchema);
 
-const InstallationRepositorySchema = Schema.Struct({
-	id: Schema.Number,
-	full_name: Schema.String,
-	private: Schema.Boolean,
-	default_branch: Schema.optional(Schema.String),
-	stargazers_count: Schema.optional(Schema.Number),
-});
-
-const decodeInstallationRepository = Schema.decodeUnknownEither(
-	InstallationRepositorySchema,
-);
-
-type InstallationRepository = Schema.Schema.Type<
-	typeof InstallationRepositorySchema
->;
-
-const parseInstallationRepositories = <A>(
-	value: A,
-): Array<InstallationRepository> => {
-	if (!Array.isArray(value)) return [];
-	const parsed: Array<InstallationRepository> = [];
-	for (const entry of value) {
-		const decoded = decodeInstallationRepository(entry);
-		if (Either.isRight(decoded)) {
-			parsed.push(decoded.right);
-		}
-	}
-	return parsed;
-};
-
 /**
  * Extract a GitHub user object from a payload field.
  * Returns { githubUserId, login, avatarUrl, siteAdmin, type } or null.
@@ -981,343 +951,6 @@ const handleDeleteEvent = (
 	});
 
 // ---------------------------------------------------------------------------
-// Installation lifecycle handler
-// ---------------------------------------------------------------------------
-
-/**
- * Handle GitHub App installation and installation_repositories events.
- *
- * - `installation.created` → upsert the installation record
- * - `installation.deleted` / `installation.suspended` → update state
- * - `installation_repositories.added` / `removed` → sync repo list
- */
-const handleInstallationEvent = (
-	eventName: string,
-	action: string | null,
-	payload: Record<string, unknown>,
-	installationId: number | null,
-) =>
-	Effect.gen(function* () {
-		if (installationId === null) return;
-
-		const ctx = yield* ConfectMutationCtx;
-		const now = Date.now();
-		const installation = obj(payload.installation);
-		const account = obj(installation.account);
-		const accountLogin = str(account.login) ?? "unknown";
-		const accountId = num(account.id) ?? 0;
-		const accountType =
-			str(account.type) === "Organization" ? "Organization" : "User";
-
-		const upsertInstallationRepositories = (
-			repositories: Array<InstallationRepository>,
-		) =>
-			Effect.gen(function* () {
-				let newRepoCount = 0;
-
-				for (const repo of repositories) {
-					const githubRepoId = repo.id;
-					const fullName = repo.full_name;
-					const stargazersCount = repo.stargazers_count;
-					const parts = fullName.split("/");
-					if (parts.length !== 2) continue;
-
-					const repoName = parts[1];
-					if (repoName === undefined) continue;
-
-					const existingRepo = yield* ctx.db
-						.query("github_repositories")
-						.withIndex("by_githubRepoId", (q) =>
-							q.eq("githubRepoId", githubRepoId),
-						)
-						.first();
-
-					const isNewRepo = Option.isNone(existingRepo);
-
-					if (isNewRepo) {
-						newRepoCount += 1;
-						yield* ctx.db.insert("github_repositories", {
-							githubRepoId,
-							installationId,
-							ownerId: accountId,
-							ownerLogin: accountLogin,
-							name: repoName,
-							fullName,
-							private: repo.private,
-							visibility: repo.private ? "private" : "public",
-							defaultBranch: repo.default_branch ?? "main",
-							archived: false,
-							disabled: false,
-							fork: false,
-							pushedAt: null,
-							githubUpdatedAt: now,
-							cachedAt: now,
-							connectedByUserId: null,
-							stargazersCount: stargazersCount ?? 0,
-						});
-
-						// Create sync job + start bootstrap workflow for the new repo.
-						// Uses the installation token (no user session available from webhooks).
-						const lockKey = `repo-bootstrap:${installationId}:${githubRepoId}`;
-						const existingJob = yield* ctx.db
-							.query("github_sync_jobs")
-							.withIndex("by_lockKey", (q) => q.eq("lockKey", lockKey))
-							.first();
-
-						if (Option.isNone(existingJob)) {
-							yield* ctx.db.insert("github_sync_jobs", {
-								jobType: "backfill",
-								scopeType: "repository",
-								triggerReason: "install",
-								lockKey,
-								installationId,
-								repositoryId: githubRepoId,
-								entityType: null,
-								state: "pending",
-								attemptCount: 0,
-								nextRunAt: now,
-								lastError: null,
-								currentStep: null,
-								completedSteps: [],
-								itemsFetched: 0,
-								createdAt: now,
-								updatedAt: now,
-							});
-
-							yield* ctx.runMutation(
-								internal.rpc.bootstrapWorkflow.startBootstrap,
-								{
-									repositoryId: githubRepoId,
-									fullName,
-									lockKey,
-									connectedByUserId: null,
-									installationId,
-								},
-							);
-						}
-					} else if (stargazersCount === undefined) {
-						yield* ctx.db.patch(existingRepo.value._id, {
-							installationId,
-							cachedAt: now,
-						});
-					} else {
-						yield* ctx.db.patch(existingRepo.value._id, {
-							installationId,
-							cachedAt: now,
-							stargazersCount,
-						});
-					}
-				}
-
-				return newRepoCount;
-			});
-
-		if (eventName === "installation") {
-			const existing = yield* ctx.db
-				.query("github_installations")
-				.withIndex("by_installationId", (q) =>
-					q.eq("installationId", installationId),
-				)
-				.first();
-
-			if (action === "created") {
-				// Check for a placeholder installation (installationId: 0) for this owner
-				// created by manual repo-add. If found, upgrade it to the real installation.
-				const placeholder = yield* ctx.db
-					.query("github_installations")
-					.withIndex("by_accountLogin", (q) =>
-						q.eq("accountLogin", accountLogin),
-					)
-					.first();
-
-				if (
-					Option.isSome(placeholder) &&
-					placeholder.value.installationId === 0
-				) {
-					// Upgrade the placeholder to a real installation
-					yield* ctx.db.patch(placeholder.value._id, {
-						installationId,
-						accountId,
-						accountType,
-						suspendedAt: null,
-						permissionsDigest: JSON.stringify(obj(installation.permissions)),
-						eventsDigest: JSON.stringify(installation.events ?? []),
-						updatedAt: now,
-					});
-
-					// Also upgrade all repos that have installationId: 0 for this owner
-					const placeholderRepos = yield* ctx.db
-						.query("github_repositories")
-						.withIndex("by_ownerLogin_and_name", (q) =>
-							q.eq("ownerLogin", accountLogin),
-						)
-						.collect();
-
-					for (const repo of placeholderRepos) {
-						if (repo.installationId === 0) {
-							yield* ctx.db.patch(repo._id, {
-								installationId,
-							});
-						}
-					}
-
-					console.info(
-						`[webhookProcessor] Upgraded placeholder installation for ${accountLogin} -> ${installationId}`,
-					);
-
-					// Placeholder repos were upgraded — sync permissions for the
-					// installer so they appear in the sidebar immediately.
-					yield* scheduleInstallationPermissionSync(payload).pipe(
-						Effect.ignoreLogged,
-					);
-				} else if (Option.isNone(existing)) {
-					yield* ctx.db.insert("github_installations", {
-						installationId,
-						accountId,
-						accountLogin,
-						accountType,
-						suspendedAt: null,
-						permissionsDigest: JSON.stringify(obj(installation.permissions)),
-						eventsDigest: JSON.stringify(installation.events ?? []),
-						updatedAt: now,
-					});
-				} else {
-					yield* ctx.db.patch(existing.value._id, {
-						accountLogin,
-						accountType,
-						suspendedAt: null,
-						permissionsDigest: JSON.stringify(obj(installation.permissions)),
-						eventsDigest: JSON.stringify(installation.events ?? []),
-						updatedAt: now,
-					});
-				}
-				console.info(
-					`[webhookProcessor] Installation created: ${installationId} (${accountLogin})`,
-				);
-
-				const createdRepos = parseInstallationRepositories(
-					payload.repositories,
-				);
-				const createdRepoCount =
-					yield* upsertInstallationRepositories(createdRepos);
-
-				if (createdRepoCount > 0) {
-					yield* scheduleInstallationPermissionSync(payload).pipe(
-						Effect.ignoreLogged,
-					);
-				}
-			} else if (action === "deleted" && Option.isSome(existing)) {
-				const reposForInstallation = yield* ctx.db
-					.query("github_repositories")
-					.withIndex("by_installationId_and_githubUpdatedAt", (q) =>
-						q.eq("installationId", installationId),
-					)
-					.collect();
-
-				let deletedRepoCount = 0;
-				let deletedPermissionCount = 0;
-				for (const repoDoc of reposForInstallation) {
-					const permissions = yield* ctx.db
-						.query("github_user_repo_permissions")
-						.withIndex("by_repositoryId", (q) =>
-							q.eq("repositoryId", repoDoc.githubRepoId),
-						)
-						.collect();
-
-					for (const permission of permissions) {
-						yield* ctx.db.delete(permission._id);
-						deletedPermissionCount += 1;
-					}
-
-					yield* ctx.db.delete(repoDoc._id);
-					deletedRepoCount += 1;
-				}
-
-				const scopeTypes: ReadonlyArray<
-					"installation" | "repository" | "entity"
-				> = ["installation", "repository", "entity"];
-				let deletedSyncJobCount = 0;
-				for (const scopeType of scopeTypes) {
-					const jobs = yield* ctx.db
-						.query("github_sync_jobs")
-						.withIndex("by_scopeType_and_installationId", (q) =>
-							q.eq("scopeType", scopeType).eq("installationId", installationId),
-						)
-						.collect();
-
-					for (const job of jobs) {
-						yield* ctx.db.delete(job._id);
-						deletedSyncJobCount += 1;
-					}
-				}
-
-				yield* ctx.db.delete(existing.value._id);
-				console.info(
-					`[webhookProcessor] Installation deleted: ${installationId} (${accountLogin}) repos=${deletedRepoCount} permissions=${deletedPermissionCount} jobs=${deletedSyncJobCount}`,
-				);
-			} else if (action === "suspend" && Option.isSome(existing)) {
-				yield* ctx.db.patch(existing.value._id, {
-					suspendedAt: now,
-					updatedAt: now,
-				});
-			} else if (action === "unsuspend" && Option.isSome(existing)) {
-				yield* ctx.db.patch(existing.value._id, {
-					suspendedAt: null,
-					updatedAt: now,
-				});
-			}
-		}
-
-		if (eventName === "installation_repositories") {
-			// Repos added to the installation
-			const added = parseInstallationRepositories(payload.repositories_added);
-			const newRepoCount = yield* upsertInstallationRepositories(added);
-
-			// When new repos are added, sync permissions for the user who
-			// triggered the installation so their sidebar updates immediately.
-			if (newRepoCount > 0) {
-				yield* scheduleInstallationPermissionSync(payload).pipe(
-					Effect.ignoreLogged,
-				);
-			}
-
-			// Repos removed from the installation
-			const removed = parseInstallationRepositories(
-				payload.repositories_removed,
-			);
-			for (const repo of removed) {
-				const githubRepoId = num(repo.id);
-				if (githubRepoId === null) continue;
-
-				const permissions = yield* ctx.db
-					.query("github_user_repo_permissions")
-					.withIndex("by_repositoryId", (q) =>
-						q.eq("repositoryId", githubRepoId),
-					)
-					.collect();
-				for (const permission of permissions) {
-					yield* ctx.db.delete(permission._id);
-				}
-
-				const existingRepo = yield* ctx.db
-					.query("github_repositories")
-					.withIndex("by_githubRepoId", (q) =>
-						q.eq("githubRepoId", githubRepoId),
-					)
-					.first();
-
-				if (Option.isSome(existingRepo)) {
-					yield* ctx.db.delete(existingRepo.value._id);
-				}
-			}
-
-			console.info(
-				`[webhookProcessor] installation_repositories: +${added.length} -${removed.length} for installation ${installationId}`,
-			);
-		}
-	});
-
-// ---------------------------------------------------------------------------
 // Shared dispatcher — used by both single-event and batch processors
 // ---------------------------------------------------------------------------
 
@@ -1536,8 +1169,8 @@ const extractActivityInfo = (
 // ---------------------------------------------------------------------------
 
 /** Maximum events to process per batch invocation (stay within mutation budget).
- *  Each event requires multiple index lookups across ~10 tables plus aggregate
- *  B-tree syncs, so keep this low to stay inside the 1-second mutation timeout. */
+ *  Each event requires JSON parsing plus multiple index lookups and aggregate
+ *  B-tree syncs (~40-55 document reads per event). The cron fires every 2s. */
 const BATCH_SIZE = 5;
 
 /** Maximum processing attempts before dead-lettering */
@@ -1701,49 +1334,6 @@ const scheduleMemberPermissionSync = (
 		}
 	});
 
-/**
- * After repos are added via an installation webhook, sync permissions for the
- * user who triggered the installation (the `sender` in the webhook payload).
- *
- * This closes the race condition where a user signs in *before* installing the
- * GitHub App: their initial permission sync finds no repos, and without this
- * trigger there is nothing to re-sync once the repos are created.
- */
-const scheduleInstallationPermissionSync = (payload: Record<string, unknown>) =>
-	Effect.gen(function* () {
-		const sender = extractUser(payload.sender);
-		if (sender === null) return;
-
-		const ctx = yield* ConfectMutationCtx;
-		const account = yield* ctx.runQuery(components.betterAuth.adapter.findOne, {
-			model: "account",
-			where: [
-				{ field: "providerId", value: "github" },
-				{ field: "accountId", value: String(sender.githubUserId) },
-			],
-		});
-
-		if (
-			account !== null &&
-			typeof account === "object" &&
-			"userId" in account &&
-			typeof account.userId === "string"
-		) {
-			yield* Effect.promise(() =>
-				ctx.scheduler.runAfter(
-					0,
-					internal.rpc.githubActions.syncUserPermissions,
-					{
-						userId: account.userId,
-					},
-				),
-			);
-			console.info(
-				`[webhookProcessor] Scheduled permission sync for user ${account.userId} after installation change`,
-			);
-		}
-	});
-
 // ---------------------------------------------------------------------------
 // Processor — dispatches raw webhook events to appropriate handlers
 // ---------------------------------------------------------------------------
@@ -1836,17 +1426,21 @@ processWebhookEventDef.implement((args) =>
 		const payload: Record<string, unknown> = JSON.parse(event.payloadJson);
 		const repositoryId = event.repositoryId;
 
-		// Events without a repository — handle installation lifecycle, skip others
+		// Events without a repository — schedule action for installation events, skip others
 		if (repositoryId === null) {
 			if (
 				event.eventName === "installation" ||
 				event.eventName === "installation_repositories"
 			) {
-				yield* handleInstallationEvent(
-					event.eventName,
-					event.action,
-					payload,
-					event.installationId,
+				// Schedule the action-based handler (10-minute timeout) instead
+				// of running inline — large payloads can exceed the 1-second
+				// mutation CPU budget.
+				yield* Effect.promise(() =>
+					ctx.scheduler.runAfter(
+						0,
+						internal.rpc.installationProcessor.processInstallationEvent,
+						{ deliveryId: event.deliveryId },
+					),
 				);
 			}
 			yield* ctx.db.patch(event._id, { processState: "processed" });
@@ -1936,22 +1530,39 @@ processAllPendingDef.implement(() =>
 			.take(BATCH_SIZE);
 
 		for (const event of pendingEvents) {
-			const payload: Record<string, unknown> = JSON.parse(event.payloadJson);
 			const repositoryId = event.repositoryId;
 
-			// Events without a repo — handle installation lifecycle, skip others
-			if (repositoryId === null) {
-				if (
-					event.eventName === "installation" ||
-					event.eventName === "installation_repositories"
-				) {
-					yield* handleInstallationEvent(
-						event.eventName,
-						event.action,
-						payload,
-						event.installationId,
-					);
+			// Installation/installation_repositories events carry very large
+			// payloads (full repo list). Parsing + processing exceeds the
+			// 1-second mutation CPU budget. Schedule an internalAction which
+			// has a 10-minute timeout to handle the heavy lifting.
+			if (
+				repositoryId === null &&
+				(event.eventName === "installation" ||
+					event.eventName === "installation_repositories")
+			) {
+				yield* Effect.promise(() =>
+					ctx.scheduler.runAfter(
+						0,
+						internal.rpc.installationProcessor.processInstallationEvent,
+						{ deliveryId: event.deliveryId },
+					),
+				);
+				console.info(
+					`[webhookProcessor] Scheduled installation action: ${event.eventName}/${event.action} installationId=${event.installationId} deliveryId=${event.deliveryId}`,
+				);
+				yield* ctx.db.patch(event._id, { processState: "processed" });
+				const updatedEvent = yield* ctx.db.get(event._id);
+				if (Option.isSome(updatedEvent)) {
+					yield* syncWebhookReplace(ctx.rawCtx, event, updatedEvent.value);
 				}
+				processed++;
+				continue;
+			}
+
+			const payload: Record<string, unknown> = JSON.parse(event.payloadJson);
+			// Other events without a repo — mark processed
+			if (repositoryId === null) {
 				yield* ctx.db.patch(event._id, { processState: "processed" });
 				const updatedEvent = yield* ctx.db.get(event._id);
 				if (Option.isSome(updatedEvent)) {

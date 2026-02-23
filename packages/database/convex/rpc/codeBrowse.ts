@@ -90,12 +90,6 @@ type TreeEntryData = {
 	size: number | null;
 };
 
-const emptyTreeResult = (sha: string) => ({
-	sha,
-	truncated: false,
-	tree: [] satisfies Array<TreeEntryData>,
-});
-
 const parseTreeEntryType = (t: string): "blob" | "tree" | "commit" =>
 	t === "tree" ? "tree" : t === "commit" ? "commit" : "blob";
 
@@ -205,6 +199,7 @@ const upsertTreeCacheDef = factory.internalMutation({
 	payload: {
 		repositoryId: Schema.Number,
 		sha: Schema.String,
+		resolvedTreeSha: Schema.optional(Schema.String),
 		treeJson: Schema.String,
 		truncated: Schema.Boolean,
 	},
@@ -238,6 +233,7 @@ const getCachedTreeDef = factory.internalQuery({
 		Schema.Struct({
 			treeJson: Schema.String,
 			truncated: Schema.Boolean,
+			resolvedTreeSha: Schema.optional(Schema.String),
 		}),
 	),
 });
@@ -588,6 +584,7 @@ getFileTreeDef.implement((args) =>
 			Schema.Struct({
 				treeJson: Schema.String,
 				truncated: Schema.Boolean,
+				resolvedTreeSha: Schema.optional(Schema.String),
 			}),
 		);
 		const cached = Schema.decodeUnknownSync(CachedTreeSchema)(cachedResult);
@@ -613,7 +610,7 @@ getFileTreeDef.implement((args) =>
 				};
 			});
 			return {
-				sha: args.sha,
+				sha: cached.resolvedTreeSha ?? args.sha,
 				truncated: cached.truncated,
 				tree: treeData,
 			};
@@ -633,7 +630,7 @@ getFileTreeDef.implement((args) =>
 			GitHubApiClient.fromToken(token),
 		);
 
-		const result = yield* gh.client
+		const treeEffect = gh.client
 			.gitGetTree(args.ownerLogin, args.name, args.sha, {
 				recursive: "1",
 			})
@@ -649,19 +646,35 @@ getFileTreeDef.implement((args) =>
 						size: entry.size ?? null,
 					})),
 				})),
-				Effect.catchAll(() => Effect.succeed(emptyTreeResult(args.sha))),
+				Effect.catchAll((error) => Effect.die(error)),
 			);
+		const result = yield* treeEffect;
 
-		// Cache the result
+		// Cache the result under both the input ref and the resolved tree SHA
+		// so lookups by branch name ("HEAD", "main") and by tree SHA both hit cache.
 		if (result.tree.length > 0) {
+			const treeJson = JSON.stringify(result.tree);
+			const cacheEntry = {
+				repositoryId,
+				sha: result.sha,
+				resolvedTreeSha: result.sha,
+				treeJson,
+				truncated: result.truncated,
+			};
+
 			yield* ctx
-				.runMutation(internal.rpc.codeBrowse.upsertTreeCache, {
-					repositoryId,
-					sha: result.sha,
-					treeJson: JSON.stringify(result.tree),
-					truncated: result.truncated,
-				})
+				.runMutation(internal.rpc.codeBrowse.upsertTreeCache, cacheEntry)
 				.pipe(Effect.catchAll(() => Effect.void));
+
+			// Also cache under the input ref if it differs from the resolved SHA
+			if (args.sha !== result.sha) {
+				yield* ctx
+					.runMutation(internal.rpc.codeBrowse.upsertTreeCache, {
+						...cacheEntry,
+						sha: args.sha,
+					})
+					.pipe(Effect.catchAll(() => Effect.void));
+			}
 		}
 
 		return result;
@@ -743,12 +756,14 @@ upsertTreeCacheDef.implement((args) =>
 			yield* ctx.db.patch(existing.value._id, {
 				treeJson: args.treeJson,
 				truncated: args.truncated,
+				resolvedTreeSha: args.resolvedTreeSha,
 				cachedAt: Date.now(),
 			});
 		} else {
 			yield* ctx.db.insert("github_tree_cache", {
 				repositoryId: args.repositoryId,
 				sha: args.sha,
+				resolvedTreeSha: args.resolvedTreeSha,
 				treeJson: args.treeJson,
 				truncated: args.truncated,
 				cachedAt: Date.now(),
@@ -813,6 +828,7 @@ getCachedTreeDef.implement((args) =>
 		return {
 			treeJson: cached.value.treeJson,
 			truncated: cached.value.truncated,
+			resolvedTreeSha: cached.value.resolvedTreeSha,
 		};
 	}),
 );

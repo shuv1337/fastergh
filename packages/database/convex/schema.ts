@@ -453,8 +453,10 @@ const GitHubNotificationSchema = Schema.Struct({
 
 const GitHubTreeCacheSchema = Schema.Struct({
 	repositoryId: Schema.Number,
-	/** Git tree SHA (typically the commit SHA) */
+	/** Cache key: the ref or SHA used to look up this tree (e.g. "HEAD", "main", or tree SHA) */
 	sha: Schema.String,
+	/** The actual tree object SHA resolved by GitHub — may differ from `sha` when cached by ref */
+	resolvedTreeSha: Schema.optional(Schema.String),
 	/** JSON-serialized tree array from GitHub API */
 	treeJson: Schema.String,
 	/** Whether the tree was truncated by GitHub */

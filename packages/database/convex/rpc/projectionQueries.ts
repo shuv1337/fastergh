@@ -911,7 +911,7 @@ const REPOSITORY_SCAN_LIMIT = 400;
 const INSTALLATION_SCAN_LIMIT = 200;
 
 /** Maximum repos to fetch detailed PR/issue/activity data for on the dashboard. */
-const DASHBOARD_DETAIL_REPO_LIMIT = 20;
+const DASHBOARD_DETAIL_REPO_LIMIT = 15;
 
 const sortByRecentActivity = <
 	T extends {

@@ -803,7 +803,19 @@ function RepoResults({
 	const result = useAtomValue(reposAtom);
 
 	if (Result.isInitial(result)) {
-		return null;
+		return (
+			<div className="px-2 py-3 space-y-2">
+				{Array.from({ length: Math.min(limit, 4) }, (_, i) => (
+					<div key={i} className="flex items-center gap-2 px-2">
+						<Skeleton className="size-4 rounded shrink-0" />
+						<div className="flex-1 space-y-1">
+							<Skeleton className="h-3.5 w-2/3" />
+							<Skeleton className="h-2.5 w-1/3" />
+						</div>
+					</div>
+				))}
+			</div>
+		);
 	}
 
 	const valueOption = Result.value(result);

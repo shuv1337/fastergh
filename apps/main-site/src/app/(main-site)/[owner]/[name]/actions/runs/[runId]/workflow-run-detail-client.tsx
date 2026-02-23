@@ -49,6 +49,7 @@ import {
 	useMemo,
 	useState,
 } from "react";
+import { WorkflowRunDetailSkeleton } from "@/app/(main-site)/_components/skeletons";
 
 type WorkflowJob = {
 	readonly githubJobId: number;
@@ -132,12 +133,7 @@ export function WorkflowRunDetailClient({
 	const run = useSubscriptionWithInitial(runAtom, initialRun);
 
 	if (run === null) {
-		return (
-			<div className="py-8 text-center">
-				<h2 className="text-base font-semibold">Run #{runNumber}</h2>
-				<p className="mt-1 text-xs text-muted-foreground">Not synced yet.</p>
-			</div>
-		);
+		return <WorkflowRunDetailSkeleton />;
 	}
 
 	return (

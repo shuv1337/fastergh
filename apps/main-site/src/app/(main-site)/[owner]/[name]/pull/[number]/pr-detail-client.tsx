@@ -65,6 +65,7 @@ import {
 } from "react";
 import { AssigneesCombobox } from "@/app/(main-site)/_components/assignees-combobox";
 import { LabelsCombobox } from "@/app/(main-site)/_components/labels-combobox";
+import { PrDetailSkeleton } from "@/app/(main-site)/_components/skeletons";
 import { MarkdownBody } from "@/components/markdown-body";
 import {
 	extractErrorMessage,
@@ -589,18 +590,7 @@ export function PrDetailClient({
 	});
 
 	if (pr === null) {
-		return (
-			<div className="flex h-full items-center justify-center">
-				<div className="text-center space-y-2">
-					<div className="mx-auto size-10 rounded-full border-2 border-dashed border-muted-foreground/20 flex items-center justify-center">
-						<span className="text-sm font-mono text-muted-foreground/40">
-							#{prNumber}
-						</span>
-					</div>
-					<p className="text-xs text-muted-foreground/60">Not synced yet</p>
-				</div>
-			</div>
-		);
+		return <PrDetailSkeleton />;
 	}
 
 	return (

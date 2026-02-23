@@ -19,6 +19,7 @@ import { useProjectionQueries } from "@packages/ui/rpc/projection-queries";
 import { useId, useMemo, useState } from "react";
 import { AssigneesCombobox } from "@/app/(main-site)/_components/assignees-combobox";
 import { LabelsCombobox } from "@/app/(main-site)/_components/labels-combobox";
+import { IssueDetailSkeleton } from "@/app/(main-site)/_components/skeletons";
 import { MarkdownBody } from "@/components/markdown-body";
 
 type IssueDetail = {
@@ -104,12 +105,7 @@ export function IssueDetailClient({
 	}, [issue, normalizedCommentQuery, commentSort]);
 
 	if (issue === null) {
-		return (
-			<div className="py-8 text-center">
-				<h2 className="text-base font-semibold">Issue #{issueNumber}</h2>
-				<p className="mt-1 text-xs text-muted-foreground">Not synced yet.</p>
-			</div>
-		);
+		return <IssueDetailSkeleton />;
 	}
 
 	return (
