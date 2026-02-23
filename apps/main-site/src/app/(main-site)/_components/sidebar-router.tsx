@@ -2,7 +2,6 @@
 
 import { useParams, usePathname } from "next/navigation";
 import { useMemo } from "react";
-import { FileTreeClient } from "./file-tree-client";
 import { IssueListClient } from "./issue-list-client";
 import { PrListClient } from "./pr-list-client";
 import { RepoTabBar } from "./repo-tab-bar";
@@ -81,13 +80,7 @@ export function SidebarRouter() {
 				</>
 			);
 
-		case "code":
-			return (
-				<>
-					<RepoTabBar owner={owner} name={name} activeTab="code" />
-					<FileTreeClient owner={owner} name={name} />
-				</>
-			);
+		// Code tab disabled — falls through to default (pulls)
 
 		default:
 			return (
@@ -104,7 +97,7 @@ export function SidebarRouter() {
 }
 
 type RepoRoute = {
-	tab: "pulls" | "issues" | "actions" | "code";
+	tab: "pulls" | "issues" | "actions";
 	activeNumber: number | null;
 };
 
@@ -156,10 +149,10 @@ function parseRepoRoute(rest: string): RepoRoute {
 		return { tab: "actions", activeNumber: null };
 	}
 
-	// /tree/... or /blob/... → code tab
-	if (rest.startsWith("/tree/") || rest.startsWith("/blob/")) {
-		return { tab: "code", activeNumber: null };
-	}
+	// /tree/... or /blob/... → code tab (disabled, fall through to pulls)
+	// if (rest.startsWith("/tree/") || rest.startsWith("/blob/")) {
+	// 	return { tab: "code", activeNumber: null };
+	// }
 
 	// /activity → falls through to pulls (default)
 	return { tab: "pulls", activeNumber: null };

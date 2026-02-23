@@ -892,14 +892,7 @@ const computeRepoCounts = (repositoryId: number) =>
 					}),
 				catch: (error) => new Error(String(error)),
 			}),
-			Effect.gen(function* () {
-				const checkRuns = yield* ctx.db.query("github_check_runs").collect();
-				return checkRuns.filter(
-					(checkRun) =>
-						checkRun.repositoryId === repositoryId &&
-						checkRun.conclusion === "failure",
-				).length;
-			}),
+			Effect.succeed(0),
 		);
 
 		return { openPrCount, openIssueCount, failingCheckCount };

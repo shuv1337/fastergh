@@ -1,7 +1,6 @@
 "use client";
 
 import {
-	FileCode2,
 	GitPullRequest,
 	Play,
 	TriangleAlert,
@@ -9,7 +8,7 @@ import {
 import { Link } from "@packages/ui/components/link";
 import { cn } from "@packages/ui/lib/utils";
 
-type RepoTab = "pulls" | "issues" | "actions" | "code";
+type RepoTab = "pulls" | "issues" | "actions";
 
 /**
  * Client-side tab bar for repo sidebar pages.
@@ -67,19 +66,7 @@ export function RepoTabBar({
 					<Play className="size-2.5" />
 					<span>CI</span>
 				</Link>
-				<Link
-					href={`/${owner}/${name}/tree/HEAD`}
-					className={cn(
-						"flex h-6 items-center gap-1 px-2 text-[10px] font-medium border-b-2 -mb-px transition-colors no-underline",
-						activeTab === "code"
-							? "border-foreground text-foreground"
-							: "border-transparent text-muted-foreground hover:text-foreground",
-					)}
-					aria-label="Code"
-				>
-					<FileCode2 className="size-2.5" />
-					<span>Code</span>
-				</Link>
+				{/* Code tab hidden — re-enable when code browsing is ready */}
 			</div>
 		</div>
 	);

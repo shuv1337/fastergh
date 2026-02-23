@@ -14,11 +14,12 @@ import { Effect, Option, Schema } from "effect";
 import { internal } from "../_generated/api";
 import {
 	ConfectActionCtx,
-	ConfectMutationCtx,
+	type ConfectMutationCtx,
 	ConfectQueryCtx,
 	confectSchema,
 } from "../confect";
-import { toNumberOrNull as num, toStringOrNull as str } from "../shared/coerce";
+// toNumberOrNull/toStringOrNull unused while code browsing is disabled
+// import { toNumberOrNull as num, toStringOrNull as str } from "../shared/coerce";
 import {
 	ContentFile,
 	type ReposGetContent200,
@@ -82,7 +83,7 @@ class RepoNotFound extends Schema.TaggedError<RepoNotFound>()("RepoNotFound", {
 // Helpers
 // ---------------------------------------------------------------------------
 
-type TreeEntryData = {
+type _TreeEntryData = {
 	path: string;
 	mode: string;
 	type: "blob" | "tree" | "commit";
@@ -90,7 +91,7 @@ type TreeEntryData = {
 	size: number | null;
 };
 
-const parseTreeEntryType = (t: string): "blob" | "tree" | "commit" =>
+const _parseTreeEntryType = (t: string): "blob" | "tree" | "commit" =>
 	t === "tree" ? "tree" : t === "commit" ? "commit" : "blob";
 
 type FileContentData = {
@@ -322,7 +323,7 @@ const resolveReadableRepo = (
 		};
 	});
 
-const resolveReadableRepoForState = (
+const _resolveReadableRepoForState = (
 	ownerLogin: string,
 	name: string,
 	permission: {
@@ -369,7 +370,7 @@ const ensureInstallationConnected = (
 /**
  * Resolve acting user from authenticated session.
  */
-const getActingUserId = (ctx: {
+const _getActingUserId = (ctx: {
 	auth: {
 		getUserIdentity: () => Effect.Effect<Option.Option<{ subject: string }>>;
 	};
@@ -416,7 +417,7 @@ const findRepositoryByOwnerAndName = (
 		return normalizedRepo ?? null;
 	});
 
-const resolveRepositoryByOwnerAndName = (
+const _resolveRepositoryByOwnerAndName = (
 	ctx: {
 		db: ConfectQueryCtx["db"] | ConfectMutationCtx["db"];
 	},
@@ -560,125 +561,9 @@ hasRepoPermissionDef.implement((args) =>
 // Implementations
 // ---------------------------------------------------------------------------
 
-getFileTreeDef.implement((args) =>
-	Effect.gen(function* () {
-		const ctx = yield* ConfectActionCtx;
-		const permission = yield* ReadGitHubRepoPermission;
-		const { repositoryId, installationId } = yield* resolveReadableRepo(
-			args.ownerLogin,
-			args.name,
-			permission,
-		);
-		yield* ensureInstallationConnected(
-			args.ownerLogin,
-			args.name,
-			installationId,
-		);
-
-		// Check cache
-		const cachedResult = yield* ctx.runQuery(
-			internal.rpc.codeBrowse.getCachedTree,
-			{ repositoryId, sha: args.sha },
-		);
-		const CachedTreeSchema = Schema.NullOr(
-			Schema.Struct({
-				treeJson: Schema.String,
-				truncated: Schema.Boolean,
-				resolvedTreeSha: Schema.optional(Schema.String),
-			}),
-		);
-		const cached = Schema.decodeUnknownSync(CachedTreeSchema)(cachedResult);
-
-		if (cached !== null) {
-			const parsed: Array<unknown> = JSON.parse(cached.treeJson);
-			const treeData = parsed.map((entry) => {
-				const e =
-					entry !== null && typeof entry === "object"
-						? Object.fromEntries(Object.entries(entry))
-						: {};
-				return {
-					path: str(e.path) ?? "",
-					mode: str(e.mode) ?? "100644",
-					type:
-						e.type === "tree"
-							? ("tree" as const)
-							: e.type === "commit"
-								? ("commit" as const)
-								: ("blob" as const),
-					sha: str(e.sha) ?? "",
-					size: num(e.size),
-				};
-			});
-			return {
-				sha: cached.resolvedTreeSha ?? args.sha,
-				truncated: cached.truncated,
-				tree: treeData,
-			};
-		}
-
-		// Fetch from GitHub
-		const token = yield* getInstallationToken(installationId).pipe(
-			Effect.mapError(
-				() =>
-					new NotAuthenticated({
-						reason: "GitHub App token is unavailable for this repository",
-					}),
-			),
-		);
-		const gh = yield* Effect.provide(
-			GitHubApiClient,
-			GitHubApiClient.fromToken(token),
-		);
-
-		const treeEffect = gh.client
-			.gitGetTree(args.ownerLogin, args.name, args.sha, {
-				recursive: "1",
-			})
-			.pipe(
-				Effect.map((data) => ({
-					sha: data.sha,
-					truncated: data.truncated,
-					tree: data.tree.map((entry) => ({
-						path: entry.path,
-						mode: entry.mode,
-						type: parseTreeEntryType(entry.type),
-						sha: entry.sha,
-						size: entry.size ?? null,
-					})),
-				})),
-				Effect.catchAll((error) => Effect.die(error)),
-			);
-		const result = yield* treeEffect;
-
-		// Cache the result under both the input ref and the resolved tree SHA
-		// so lookups by branch name ("HEAD", "main") and by tree SHA both hit cache.
-		if (result.tree.length > 0) {
-			const treeJson = JSON.stringify(result.tree);
-			const cacheEntry = {
-				repositoryId,
-				sha: result.sha,
-				resolvedTreeSha: result.sha,
-				treeJson,
-				truncated: result.truncated,
-			};
-
-			yield* ctx
-				.runMutation(internal.rpc.codeBrowse.upsertTreeCache, cacheEntry)
-				.pipe(Effect.catchAll(() => Effect.void));
-
-			// Also cache under the input ref if it differs from the resolved SHA
-			if (args.sha !== result.sha) {
-				yield* ctx
-					.runMutation(internal.rpc.codeBrowse.upsertTreeCache, {
-						...cacheEntry,
-						sha: args.sha,
-					})
-					.pipe(Effect.catchAll(() => Effect.void));
-			}
-		}
-
-		return result;
-	}),
+// --- Code browsing disabled: no-op implementation ---
+getFileTreeDef.implement(() =>
+	Effect.succeed({ sha: "", truncated: false, tree: [] }),
 );
 
 getFileContentDef.implement((args) =>
@@ -741,97 +626,17 @@ getFileContentDef.implement((args) =>
 // Internal mutation implementations
 // ---------------------------------------------------------------------------
 
-upsertTreeCacheDef.implement((args) =>
-	Effect.gen(function* () {
-		const ctx = yield* ConfectMutationCtx;
-
-		const existing = yield* ctx.db
-			.query("github_tree_cache")
-			.withIndex("by_repositoryId_and_sha", (q) =>
-				q.eq("repositoryId", args.repositoryId).eq("sha", args.sha),
-			)
-			.first();
-
-		if (Option.isSome(existing)) {
-			yield* ctx.db.patch(existing.value._id, {
-				treeJson: args.treeJson,
-				truncated: args.truncated,
-				resolvedTreeSha: args.resolvedTreeSha,
-				cachedAt: Date.now(),
-			});
-		} else {
-			yield* ctx.db.insert("github_tree_cache", {
-				repositoryId: args.repositoryId,
-				sha: args.sha,
-				resolvedTreeSha: args.resolvedTreeSha,
-				treeJson: args.treeJson,
-				truncated: args.truncated,
-				cachedAt: Date.now(),
-			});
-		}
-
-		return { cached: true };
-	}),
-);
-
-upsertFileCacheDef.implement((args) =>
-	Effect.gen(function* () {
-		const ctx = yield* ConfectMutationCtx;
-
-		const existing = yield* ctx.db
-			.query("github_file_cache")
-			.withIndex("by_repositoryId_and_sha", (q) =>
-				q.eq("repositoryId", args.repositoryId).eq("sha", args.sha),
-			)
-			.first();
-
-		if (Option.isSome(existing)) {
-			yield* ctx.db.patch(existing.value._id, {
-				path: args.path,
-				content: args.content,
-				size: args.size,
-				encoding: args.encoding,
-				cachedAt: Date.now(),
-			});
-		} else {
-			yield* ctx.db.insert("github_file_cache", {
-				repositoryId: args.repositoryId,
-				sha: args.sha,
-				path: args.path,
-				content: args.content,
-				size: args.size,
-				encoding: args.encoding,
-				cachedAt: Date.now(),
-			});
-		}
-
-		return { cached: true };
-	}),
-);
+// --- Code browsing disabled: no-op implementations ---
+upsertTreeCacheDef.implement(() => Effect.succeed({ cached: false }));
+upsertFileCacheDef.implement(() => Effect.succeed({ cached: false }));
 
 // ---------------------------------------------------------------------------
 // Internal query implementations
 // ---------------------------------------------------------------------------
 
-getCachedTreeDef.implement((args) =>
-	Effect.gen(function* () {
-		const ctx = yield* ConfectQueryCtx;
-		const cached = yield* ctx.db
-			.query("github_tree_cache")
-			.withIndex("by_repositoryId_and_sha", (q) =>
-				q.eq("repositoryId", args.repositoryId).eq("sha", args.sha),
-			)
-			.first();
-
-		if (Option.isNone(cached)) return null;
-
-		return {
-			treeJson: cached.value.treeJson,
-			truncated: cached.value.truncated,
-			resolvedTreeSha: cached.value.resolvedTreeSha,
-		};
-	}),
-);
+// --- Code browsing disabled: no-op implementations ---
+getCachedTreeDef.implement(() => Effect.succeed(null));
+getCachedFileDef.implement(() => Effect.succeed(null));
 
 getCachedFileDef.implement((args) =>
 	Effect.gen(function* () {
@@ -855,82 +660,9 @@ getCachedFileDef.implement((args) =>
 	}),
 );
 
-getFileReadStateDef.implement((args) =>
-	Effect.gen(function* () {
-		const ctx = yield* ConfectQueryCtx;
-		const userId = yield* getActingUserId(ctx);
-		const permission = yield* ReadGitHubRepoPermission;
-		const repositoryId = yield* resolveReadableRepoForState(
-			args.ownerLogin,
-			args.name,
-			permission,
-		);
-
-		const states = yield* ctx.db
-			.query("github_file_read_state")
-			.withIndex("by_userId_and_repositoryId_and_treeSha", (q) =>
-				q
-					.eq("userId", userId)
-					.eq("repositoryId", repositoryId)
-					.eq("treeSha", args.treeSha),
-			)
-			.collect();
-
-		return states.map((state) => ({
-			path: state.path,
-			fileSha: state.fileSha,
-			readAt: state.readAt,
-		}));
-	}),
-);
-
-markFileReadDef.implement((args) =>
-	Effect.gen(function* () {
-		const ctx = yield* ConfectMutationCtx;
-		const userId = yield* getActingUserId(ctx);
-		const permission = yield* ReadGitHubRepoPermission;
-		const repositoryId = yield* resolveReadableRepoForState(
-			args.ownerLogin,
-			args.name,
-			permission,
-		);
-
-		const rows = yield* ctx.db
-			.query("github_file_read_state")
-			.withIndex("by_userId_and_repositoryId_and_treeSha", (q) =>
-				q
-					.eq("userId", userId)
-					.eq("repositoryId", repositoryId)
-					.eq("treeSha", args.treeSha),
-			)
-			.collect();
-
-		const existing = rows.find(
-			(state) => state.path === args.path && state.fileSha === args.fileSha,
-		);
-
-		const now = Date.now();
-		if (existing) {
-			yield* ctx.db.patch(existing._id, {
-				readAt: now,
-				path: args.path,
-				fileSha: args.fileSha,
-			});
-			return { marked: false };
-		}
-
-		yield* ctx.db.insert("github_file_read_state", {
-			userId,
-			repositoryId,
-			treeSha: args.treeSha,
-			path: args.path,
-			fileSha: args.fileSha,
-			readAt: now,
-		});
-
-		return { marked: true };
-	}),
-);
+// --- Code browsing disabled: no-op implementations ---
+getFileReadStateDef.implement(() => Effect.succeed([]));
+markFileReadDef.implement(() => Effect.succeed({ marked: false }));
 
 // ---------------------------------------------------------------------------
 // Module

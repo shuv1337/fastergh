@@ -1,5 +1,4 @@
 import {
-	FileCode2,
 	GitPullRequest,
 	Play,
 	TriangleAlert,
@@ -9,7 +8,7 @@ import { cn } from "@packages/ui/lib/utils";
 import { cacheLife } from "next/cache";
 import type { ReactNode } from "react";
 
-type RepoTab = "pulls" | "issues" | "actions" | "code";
+type RepoTab = "pulls" | "issues" | "actions";
 
 /**
  * Tab bar + body content for repo detail sidebar pages.
@@ -75,19 +74,7 @@ export async function RepoListShell({
 						<Play className="size-2.5" />
 						<span>CI</span>
 					</Link>
-					<Link
-						href={`/${owner}/${name}/tree/HEAD`}
-						className={cn(
-							"flex items-center gap-1 px-1.5 py-1 text-[10px] font-semibold border-b-2 -mb-px transition-colors no-underline",
-							activeTab === "code"
-								? "border-foreground text-foreground"
-								: "border-transparent text-muted-foreground hover:text-foreground",
-						)}
-						aria-label="Code"
-					>
-						<FileCode2 className="size-2.5" />
-						<span>Code</span>
-					</Link>
+					{/* Code tab hidden — re-enable when code browsing is ready */}
 				</div>
 			</div>
 			{children}

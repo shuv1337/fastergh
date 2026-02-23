@@ -498,7 +498,7 @@ export const fetchCommits = internalAction({
 						// GitHub returns 409 for empty repos ("Git Repository is empty.")
 						// Treat as zero commits rather than crashing.
 						Effect.catchIf(
-							(e) => e.response.status === 409,
+							(e) => e._tag === "BasicError" && e.response.status === 409,
 							() => Effect.succeed([]),
 						),
 						Effect.orDie,
