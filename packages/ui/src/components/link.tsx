@@ -125,10 +125,10 @@ function InternalLink({
 
 	const sharedProps = {
 		scroll: true,
+		...rest,
 		prefetch: false,
 		onPointerEnter: handlePointerEnter,
 		onMouseDown: handleMouseDown,
-		...rest,
 	};
 
 	if (icon) {
@@ -192,7 +192,5 @@ export function Link(
 		);
 	}
 
-	return (
-		<InternalLink icon={icon} className={className} prefetch={true} {...rest} />
-	);
+	return <InternalLink icon={icon} className={className} {...rest} />;
 }

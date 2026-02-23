@@ -355,7 +355,7 @@ function DashboardCommandPalette({
 				<Search className="size-4 shrink-0 text-muted-foreground" />
 				<div className="min-w-0 flex-1">
 					<div className="truncate text-[13px] font-medium text-foreground">
-						Search QuickHub
+						Search FasterGH
 					</div>
 					<div className="truncate text-[11px] text-muted-foreground">
 						Repos, pull requests, issues, and actions

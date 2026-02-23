@@ -5,7 +5,7 @@ import { HubShell } from "./_components/hub-shell";
 import { MainSiteSidebar } from "./_components/main-site-sidebar";
 
 export const metadata: Metadata = {
-	title: "QuickHub — GitHub Mirror",
+	title: "FasterGH — GitHub Mirror",
 	description: "Fast GitHub browsing backed by Convex real-time projections",
 };
 

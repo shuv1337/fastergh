@@ -140,7 +140,7 @@ export function HubShell({
 							<SheetHeader className="sr-only">
 								<SheetTitle>Sidebar</SheetTitle>
 								<SheetDescription>
-									Displays the QuickHub sidebar.
+									Displays the FasterGH sidebar.
 								</SheetDescription>
 							</SheetHeader>
 							<div className="h-full">{sidebar}</div>

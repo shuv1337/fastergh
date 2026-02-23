@@ -131,7 +131,7 @@ type RecentEntry = {
 	readonly updatedAt: number;
 };
 
-const RECENT_KEY = "quickhub.recent.navigation";
+const RECENT_KEY = "fastergh.recent.navigation";
 const MAX_RECENT = 8;
 
 const DEFAULT_RECENT: ReadonlyArray<RecentEntry> = [];
@@ -1204,7 +1204,7 @@ export function SearchCommand() {
 		<CommandDialog
 			open={open}
 			onOpenChange={setOpen}
-			title="QuickHub Command Palette"
+			title="FasterGH Command Palette"
 			description="Navigate, search issues and PRs, and run quick repo actions"
 			className="max-w-3xl border border-border/70 bg-card/95 shadow-2xl backdrop-blur-xl"
 			commandProps={{ shouldFilter: false, loop: true }}
