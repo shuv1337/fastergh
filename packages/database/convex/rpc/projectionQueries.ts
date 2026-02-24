@@ -785,7 +785,6 @@ const computeRepoCounts = (repositoryId: number) =>
 	});
 
 const ANONYMOUS_FEATURED_REPO_LIMIT = 10;
-const PERSONALIZED_REPO_LIMIT = 50;
 const REPOSITORY_SCAN_LIMIT = 400;
 const INSTALLATION_SCAN_LIMIT = 200;
 
@@ -899,7 +898,7 @@ const selectSidebarAndDashboardRepos = Effect.gen(function* () {
 			: sortedMemberPersonalRepos;
 
 	if (personalizedRepos.length > 0) {
-		return personalizedRepos.slice(0, PERSONALIZED_REPO_LIMIT);
+		return personalizedRepos;
 	}
 
 	return featuredPublicRepos;
@@ -914,28 +913,30 @@ listReposDef.implement(() =>
 			return [];
 		}
 
-		const results = [];
-		for (const repo of repos) {
-			const counts = yield* computeRepoCounts(repo.githubRepoId);
+		return yield* Effect.all(
+			repos.map((repo) =>
+				Effect.gen(function* () {
+					const counts = yield* computeRepoCounts(repo.githubRepoId);
 
-			// Resolve owner avatar — check github_users first, then github_organizations
-			const ownerAvatarUrl = yield* resolveOwnerAvatarUrl(repo.ownerId);
+					// Resolve owner avatar — check github_users first, then github_organizations
+					const ownerAvatarUrl = yield* resolveOwnerAvatarUrl(repo.ownerId);
 
-			results.push({
-				repositoryId: repo.githubRepoId,
-				fullName: repo.fullName,
-				ownerLogin: repo.ownerLogin,
-				ownerAvatarUrl,
-				name: repo.name,
-				openPrCount: counts.openPrCount,
-				openIssueCount: counts.openIssueCount,
-				failingCheckCount: counts.failingCheckCount,
-				lastPushAt: repo.pushedAt,
-				updatedAt: repo.githubUpdatedAt,
-			});
-		}
-
-		return results;
+					return {
+						repositoryId: repo.githubRepoId,
+						fullName: repo.fullName,
+						ownerLogin: repo.ownerLogin,
+						ownerAvatarUrl,
+						name: repo.name,
+						openPrCount: counts.openPrCount,
+						openIssueCount: counts.openIssueCount,
+						failingCheckCount: counts.failingCheckCount,
+						lastPushAt: repo.pushedAt,
+						updatedAt: repo.githubUpdatedAt,
+					};
+				}),
+			),
+			{ concurrency: 16 },
+		);
 	}),
 );
 
