@@ -6,11 +6,10 @@ import {
 	type ConvexClientService,
 	type ConvexRequestMetadata,
 } from "@packages/confect/client";
-import { createOtelLayer } from "@packages/observability/effect-otel";
 import { authClient } from "@packages/ui/lib/auth-client";
 import { ConvexClient as ConvexBrowserClient } from "convex/browser";
 import type { FunctionReference, FunctionReturnType } from "convex/server";
-import { Duration, Effect, Layer, Stream } from "effect";
+import { Effect, Layer, Stream } from "effect";
 import {
 	createContext,
 	type ReactNode,
@@ -69,15 +68,6 @@ const convexClientService: ConvexClientService = {
 		}),
 };
 
-const FrontendOtelLayer =
-	process.env.NEXT_PUBLIC_OTEL_EXPORTER_OTLP_ENDPOINT === undefined
-		? Layer.empty
-		: createOtelLayer(
-				"main-site",
-				process.env.NEXT_PUBLIC_OTEL_EXPORTER_OTLP_ENDPOINT,
-				Duration.seconds(1),
-			);
-
 /**
  * Shared ConvexClient layer — one instance used by the provider AND all RPC modules.
  */
@@ -86,12 +76,7 @@ export const sharedConvexClientLayer = Layer.succeed(
 	convexClientService,
 );
 
-const AppConvexClientLayer = Layer.mergeAll(
-	FrontendOtelLayer,
-	sharedConvexClientLayer,
-);
-
-export const atomRuntime = Atom.runtime(AppConvexClientLayer);
+export const atomRuntime = Atom.runtime(sharedConvexClientLayer);
 
 /**
  * Query gating state for Convex-backed atoms.

@@ -1,8 +1,4 @@
-import { withSentryConfig } from "@sentry/nextjs";
-import createWithVercelToolbar from "@vercel/toolbar/plugins/next";
 import type { NextConfig } from "next";
-
-const withVercelToolbar = createWithVercelToolbar();
 
 // Public production defaults — these are safe to hard-code because they are
 // already shipped in the client-side JS bundle (public Convex URLs, GitHub
@@ -49,17 +45,4 @@ const nextConfig: NextConfig = {
 	},
 };
 
-export default withSentryConfig(withVercelToolbar(nextConfig), {
-	org: process.env.SENTRY_ORG,
-	project: process.env.SENTRY_PROJECT,
-	silent: !process.env.CI,
-	widenClientFileUpload: true,
-	disableLogger: true,
-	automaticVercelMonitors: true,
-	sourcemaps: {
-		deleteSourcemapsAfterUpload: false,
-	},
-	reactComponentAnnotation: {
-		enabled: true,
-	},
-});
+export default nextConfig;
