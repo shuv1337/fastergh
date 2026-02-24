@@ -80,12 +80,39 @@ export const { onCreate, onUpdate, onDelete } = authComponent.triggersApi();
 // Auth options factory
 // ---------------------------------------------------------------------------
 
-const siteUrl = process.env.SITE_URL;
+const getForwardedOrigin = (request?: Request): string | null => {
+	if (!request) {
+		return null;
+	}
+
+	const forwardedHost = request.headers.get("x-forwarded-host");
+	const forwardedProto = request.headers.get("x-forwarded-proto");
+
+	if (forwardedHost === null || forwardedProto === null) {
+		return null;
+	}
+
+	if (forwardedProto !== "http" && forwardedProto !== "https") {
+		return null;
+	}
+
+	try {
+		return new URL(`${forwardedProto}://${forwardedHost}`).origin;
+	} catch {
+		return null;
+	}
+};
 
 export const createAuthOptions = (ctx: GenericCtx) => {
 	return {
-		baseURL: siteUrl,
 		database: authComponent.adapter(ctx),
+		trustedOrigins: (request) => {
+			const forwardedOrigin = getForwardedOrigin(request);
+			return forwardedOrigin === null ? [] : [forwardedOrigin];
+		},
+		advanced: {
+			trustedProxyHeaders: true,
+		},
 		account: {
 			accountLinking: {
 				enabled: true,

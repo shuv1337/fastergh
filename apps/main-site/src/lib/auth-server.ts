@@ -6,15 +6,42 @@ const CONVEX_URL =
 const CONVEX_SITE_URL =
 	process.env.CONVEX_SITE_URL ?? "https://descriptive-caiman-974.convex.site";
 
+const convexBetterAuth = convexBetterAuthNextJs({
+	convexUrl: CONVEX_URL,
+	convexSiteUrl: CONVEX_SITE_URL,
+});
+
+const convexSiteHost = new URL(CONVEX_SITE_URL).host;
+
+const forwardAuthRequest = (request: Request) => {
+	const requestUrl = new URL(request.url);
+	const convexAuthUrl = `${CONVEX_SITE_URL}${requestUrl.pathname}${requestUrl.search}`;
+	const proxiedRequest = new Request(convexAuthUrl, request);
+
+	proxiedRequest.headers.set("accept-encoding", "application/json");
+	proxiedRequest.headers.set("host", convexSiteHost);
+	proxiedRequest.headers.set("x-forwarded-host", requestUrl.host);
+	proxiedRequest.headers.set(
+		"x-forwarded-proto",
+		requestUrl.protocol.replace(":", ""),
+	);
+
+	return fetch(proxiedRequest, {
+		method: request.method,
+		redirect: "manual",
+	});
+};
+
+export const handler = {
+	GET: forwardAuthRequest,
+	POST: forwardAuthRequest,
+};
+
 export const {
-	handler,
 	preloadAuthQuery,
 	isAuthenticated,
 	getToken,
 	fetchAuthQuery,
 	fetchAuthMutation,
 	fetchAuthAction,
-} = convexBetterAuthNextJs({
-	convexUrl: CONVEX_URL,
-	convexSiteUrl: CONVEX_SITE_URL,
-});
+} = convexBetterAuth;
