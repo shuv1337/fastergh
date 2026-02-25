@@ -159,6 +159,12 @@ bun lint         # Lint with Biome
 bun lint:fix     # Fix lint issues
 ```
 
+## Local systemd service
+
+For local production hosting via systemd user units, see:
+
+- [`guides/systemd-service.md`](guides/systemd-service.md)
+
 ## License
 
 [FSL-1.1-MIT](LICENSE.md) - Functional Source License with MIT future license.
